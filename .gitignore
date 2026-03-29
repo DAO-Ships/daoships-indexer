@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment files (secrets)
+.env
+.env.e2e
+.env.local
+.env.*.local
+
+# Keep example env files
+!.env.example
+!.env.testnet.example
+!.env.mainnet.example
+
+# Claude Code
+.claude/
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Debug artifacts
+warn.txt
+
+# Coverage
+coverage/

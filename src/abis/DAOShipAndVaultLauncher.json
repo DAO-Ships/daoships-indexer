@@ -1,0 +1,307 @@
+[
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "_daoShipLauncher",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "_quaiVaultFactory",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "_multisendCallOnly",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "constructor"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "daoShip",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "vault",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "address",
+        "name": "shares",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "address",
+        "name": "loot",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "bool",
+        "name": "newVault",
+        "type": "bool"
+      },
+      {
+        "indexed": false,
+        "internalType": "address",
+        "name": "launcher",
+        "type": "address"
+      }
+    ],
+    "name": "LaunchDAOShipAndVault",
+    "type": "event"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "sender",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "sharesSalt",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "lootSalt",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "daoShipSalt",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "vaultSalt",
+        "type": "uint256"
+      },
+      {
+        "internalType": "address[]",
+        "name": "vaultOwners",
+        "type": "address[]"
+      },
+      {
+        "internalType": "uint256",
+        "name": "vaultThreshold",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint32",
+        "name": "minExecutionDelay",
+        "type": "uint32"
+      }
+    ],
+    "name": "calculateAllAddresses",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "daoShip",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "shares",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "loot",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "vault",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "daoShipLauncher",
+    "outputs": [
+      {
+        "internalType": "contract IDAOShipLauncher",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes",
+        "name": "initializationParamsTemplate",
+        "type": "bytes"
+      },
+      {
+        "internalType": "string",
+        "name": "shareTokenName",
+        "type": "string"
+      },
+      {
+        "internalType": "string",
+        "name": "shareTokenSymbol",
+        "type": "string"
+      },
+      {
+        "internalType": "string",
+        "name": "lootTokenName",
+        "type": "string"
+      },
+      {
+        "internalType": "string",
+        "name": "lootTokenSymbol",
+        "type": "string"
+      },
+      {
+        "internalType": "address[]",
+        "name": "vaultOwners",
+        "type": "address[]"
+      },
+      {
+        "internalType": "uint256",
+        "name": "vaultThreshold",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "vaultSalt",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "sharesSalt",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "lootSalt",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "daoShipSalt",
+        "type": "uint256"
+      }
+    ],
+    "name": "launchDAOShipAndVault",
+    "outputs": [
+      {
+        "internalType": "address payable",
+        "name": "daoShip",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "vault",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes",
+        "name": "initializationParamsTemplate",
+        "type": "bytes"
+      },
+      {
+        "internalType": "string",
+        "name": "shareTokenName",
+        "type": "string"
+      },
+      {
+        "internalType": "string",
+        "name": "shareTokenSymbol",
+        "type": "string"
+      },
+      {
+        "internalType": "string",
+        "name": "lootTokenName",
+        "type": "string"
+      },
+      {
+        "internalType": "string",
+        "name": "lootTokenSymbol",
+        "type": "string"
+      },
+      {
+        "internalType": "address",
+        "name": "existingVault",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "sharesSalt",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "lootSalt",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "daoShipSalt",
+        "type": "uint256"
+      }
+    ],
+    "name": "launchDAOShipWithVault",
+    "outputs": [
+      {
+        "internalType": "address payable",
+        "name": "daoShip",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "multisendCallOnly",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "quaiVaultFactory",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  }
+]

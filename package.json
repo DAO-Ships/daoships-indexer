@@ -1,0 +1,36 @@
+{
+  "name": "daoships-indexer",
+  "version": "0.1.0",
+  "description": "DAO Ships blockchain event indexer",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "backfill": "tsx src/backfill.ts",
+    "lint": "eslint src/",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:e2e": "vitest run test/e2e/ --testTimeout 2400000 --no-file-parallelism",
+    "db:migrate": "npx supabase db push",
+    "db:reset": "npx supabase db reset",
+    "db:types": "npx supabase gen types typescript --project-id $SUPABASE_PROJECT_ID > src/types/database.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.0",
+    "dotenv": "^16.4.0",
+    "pino": "^9.0.0",
+    "quais": "^1.0.0-alpha.53"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "pino-pretty": "^11.0.0",
+    "bs58": "^6.0.0",
+    "cbor-x": "^1.6.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.1.0"
+  }
+}

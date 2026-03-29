@@ -1,0 +1,228 @@
+[
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "_daoShipSingleton",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "_sharesSingleton",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "_lootSingleton",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "constructor"
+  },
+  {
+    "inputs": [],
+    "name": "FailedDeployment",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "balance",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "needed",
+        "type": "uint256"
+      }
+    ],
+    "name": "InsufficientBalance",
+    "type": "error"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "daoShip",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "shares",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "loot",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "address",
+        "name": "avatar",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "address",
+        "name": "launcher",
+        "type": "address"
+      }
+    ],
+    "name": "LaunchDAOShip",
+    "type": "event"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "sender",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "sharesSalt",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "lootSalt",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "daoShipSalt",
+        "type": "uint256"
+      }
+    ],
+    "name": "calculateAddresses",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "daoShip",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "shares",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "loot",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "daoShipSingleton",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes",
+        "name": "initializationParams",
+        "type": "bytes"
+      },
+      {
+        "internalType": "string",
+        "name": "shareTokenName",
+        "type": "string"
+      },
+      {
+        "internalType": "string",
+        "name": "shareTokenSymbol",
+        "type": "string"
+      },
+      {
+        "internalType": "string",
+        "name": "lootTokenName",
+        "type": "string"
+      },
+      {
+        "internalType": "string",
+        "name": "lootTokenSymbol",
+        "type": "string"
+      },
+      {
+        "internalType": "uint256",
+        "name": "sharesSalt",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "lootSalt",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "daoShipSalt",
+        "type": "uint256"
+      }
+    ],
+    "name": "launchDAOShip",
+    "outputs": [
+      {
+        "internalType": "address payable",
+        "name": "daoShip",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "shares",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "loot",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "lootSingleton",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "sharesSingleton",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  }
+]
