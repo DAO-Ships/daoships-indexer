@@ -336,6 +336,7 @@ describe('handleRagequit', () => {
   it('creates stub member if member not found', async () => {
     const db = makeMockDb();
     db.getMember.mockResolvedValue(null); // trigger stub
+    db.getDao.mockResolvedValue(MOCK_DAO);
     const ctx = makeCtx({ db, log: { address: DAOSHIP } });
 
     await handleRagequit(ctx, {
@@ -346,6 +347,37 @@ describe('handleRagequit', () => {
       member_address: MEMBER1,
       shares: '0',
     }));
+  });
+
+  it('decrements DAO total_shares and total_loot on ragequit', async () => {
+    const db = makeMockDb();
+    db.getMember.mockResolvedValue({ id: `${DAOSHIP}-${MEMBER1}` });
+    db.getDao.mockResolvedValue({ ...MOCK_DAO, total_shares: '500', total_loot: '200' });
+    const ctx = makeCtx({ db, log: { address: DAOSHIP } });
+
+    await handleRagequit(ctx, {
+      member: MEMBER1, to: MEMBER2, lootToBurn: 50n, sharesToBurn: 100n, tokens: [], amounts: [],
+    });
+
+    expect(db.updateDao).toHaveBeenCalledWith(DAOSHIP, {
+      total_shares: '400',
+      total_loot: '150',
+    });
+  });
+
+  it('only updates total_shares when lootToBurn is zero', async () => {
+    const db = makeMockDb();
+    db.getMember.mockResolvedValue({ id: `${DAOSHIP}-${MEMBER1}` });
+    db.getDao.mockResolvedValue({ ...MOCK_DAO, total_shares: '500', total_loot: '200' });
+    const ctx = makeCtx({ db, log: { address: DAOSHIP } });
+
+    await handleRagequit(ctx, {
+      member: MEMBER1, to: MEMBER2, lootToBurn: 0n, sharesToBurn: 100n, tokens: [], amounts: [],
+    });
+
+    expect(db.updateDao).toHaveBeenCalledWith(DAOSHIP, {
+      total_shares: '400',
+    });
   });
 });
 

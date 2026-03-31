@@ -756,28 +756,137 @@ describe('content_json schema validation', () => {
     });
   });
 
-  // ── treasury.label ─────────────────────────────────────────────
+  // ── navigator.allowlist ────────────────────────────────────────
 
-  it('treasury.label with valid labels — accepted', async () => {
+  it('navigator.allowlist with valid data — accepted', async () => {
+    const navigatorAddr = '0x0000000000000000000000000000000000000007';
+    const root = '0x' + 'ab'.repeat(32);
     const { db } = await postAndGetContentJson({
-      tag: 'daoships.treasury.label',
-      user: AVATAR,
+      tag: 'daoships.navigator.allowlist',
+      user: MEMBER1,
       content: {
         schemaVersion: '1.0',
         daoAddress: DAOSHIP,
-        labels: [
-          { address: '0x0000000000000000000000000000000000000042', label: 'Treasury', purpose: 'Main fund' },
-        ],
+        navigatorAddress: navigatorAddr,
+        root,
+        addresses: ['0x0000000000000000000000000000000000000001', '0x0000000000000000000000000000000000000002'],
+        treeDump: { format: 'standard-v1', values: [] },
       },
     });
     const json = getContentJson(db);
     expect(json).toEqual({
       daoAddress: DAOSHIP,
-      labels: [
-        { address: '0x0000000000000000000000000000000000000042', label: 'Treasury', purpose: 'Main fund' },
-      ],
+      navigatorAddress: navigatorAddr,
+      root,
+      addresses: ['0x0000000000000000000000000000000000000001', '0x0000000000000000000000000000000000000002'],
+      treeDump: { format: 'standard-v1', values: [] },
       schemaVersion: '1.0',
     });
+  });
+
+  it('navigator.allowlist rejects missing root', async () => {
+    const { db } = await postAndGetContentJson({
+      tag: 'daoships.navigator.allowlist',
+      user: MEMBER1,
+      content: {
+        schemaVersion: '1.0',
+        daoAddress: DAOSHIP,
+        navigatorAddress: '0x0000000000000000000000000000000000000007',
+        addresses: ['0x0000000000000000000000000000000000000001'],
+        treeDump: { format: 'standard-v1' },
+      },
+    });
+    const json = getContentJson(db);
+    expect(json).toBeNull();
+  });
+
+  it('navigator.allowlist rejects invalid root format', async () => {
+    const { db } = await postAndGetContentJson({
+      tag: 'daoships.navigator.allowlist',
+      user: MEMBER1,
+      content: {
+        schemaVersion: '1.0',
+        daoAddress: DAOSHIP,
+        navigatorAddress: '0x0000000000000000000000000000000000000007',
+        root: 'not-a-hex-root',
+        addresses: ['0x0000000000000000000000000000000000000001'],
+        treeDump: { format: 'standard-v1' },
+      },
+    });
+    const json = getContentJson(db);
+    expect(json).toBeNull();
+  });
+
+  it('navigator.allowlist rejects empty addresses array', async () => {
+    const { db } = await postAndGetContentJson({
+      tag: 'daoships.navigator.allowlist',
+      user: MEMBER1,
+      content: {
+        schemaVersion: '1.0',
+        daoAddress: DAOSHIP,
+        navigatorAddress: '0x0000000000000000000000000000000000000007',
+        root: '0x' + 'ab'.repeat(32),
+        addresses: [],
+        treeDump: { format: 'standard-v1' },
+      },
+    });
+    const json = getContentJson(db);
+    expect(json).toBeNull();
+  });
+
+  it('navigator.allowlist rejects missing treeDump', async () => {
+    const { db } = await postAndGetContentJson({
+      tag: 'daoships.navigator.allowlist',
+      user: MEMBER1,
+      content: {
+        schemaVersion: '1.0',
+        daoAddress: DAOSHIP,
+        navigatorAddress: '0x0000000000000000000000000000000000000007',
+        root: '0x' + 'ab'.repeat(32),
+        addresses: ['0x0000000000000000000000000000000000000001'],
+      },
+    });
+    const json = getContentJson(db);
+    expect(json).toBeNull();
+  });
+
+  it('navigator.allowlist filters invalid addresses from array', async () => {
+    const root = '0x' + 'ab'.repeat(32);
+    const { db } = await postAndGetContentJson({
+      tag: 'daoships.navigator.allowlist',
+      user: MEMBER1,
+      content: {
+        schemaVersion: '1.0',
+        daoAddress: DAOSHIP,
+        navigatorAddress: '0x0000000000000000000000000000000000000007',
+        root,
+        addresses: ['0x0000000000000000000000000000000000000001', 'not-an-address', 12345],
+        treeDump: { values: [] },
+      },
+    });
+    const json = getContentJson(db);
+    expect(json!.addresses).toEqual(['0x0000000000000000000000000000000000000001']);
+  });
+
+  it('navigator.allowlist strips unrecognized fields', async () => {
+    const root = '0x' + 'ab'.repeat(32);
+    const { db } = await postAndGetContentJson({
+      tag: 'daoships.navigator.allowlist',
+      user: MEMBER1,
+      content: {
+        schemaVersion: '1.0',
+        daoAddress: DAOSHIP,
+        navigatorAddress: '0x0000000000000000000000000000000000000007',
+        root,
+        addresses: ['0x0000000000000000000000000000000000000001'],
+        treeDump: { values: [] },
+        extraField: 'should be stripped',
+        malicious: '<script>alert(1)</script>',
+      },
+    });
+    const json = getContentJson(db);
+    expect(json).not.toHaveProperty('extraField');
+    expect(json).not.toHaveProperty('malicious');
   });
 
   // ── String limit enforcement (tightened) ───────────────────────

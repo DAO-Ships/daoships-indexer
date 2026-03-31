@@ -458,8 +458,23 @@ export const handleRagequit: EventHandler = async (
     block_number: ctx.log.blockNumber,
   });
 
-  // DAO totals (total_shares, total_loot) are updated by BurnShares/BurnLoot
-  // via handleMintOrBurn — not duplicated here.
+  // Update DAO totals. ragequit() burns shares/loot directly via
+  // sharesToken.burn() / lootToken.burn() but does NOT emit BurnShares /
+  // BurnLoot events — only Transfer + Ragequit. So this handler is the
+  // sole owner of the DAO total adjustment for ragequit operations.
+  const dao = await ctx.db.getDao(daoId);
+  if (dao) {
+    const updates: Record<string, unknown> = {};
+    if (sharesToBurn > 0n) {
+      updates.total_shares = subtractNumericStringsFloored(dao.total_shares || '0', sharesToBurn.toString());
+    }
+    if (lootToBurn > 0n) {
+      updates.total_loot = subtractNumericStringsFloored(dao.total_loot || '0', lootToBurn.toString());
+    }
+    if (Object.keys(updates).length > 0) {
+      await ctx.db.updateDao(daoId, updates);
+    }
+  }
 };
 
 // ---------------------------------------------------------------------------

@@ -62,8 +62,8 @@ const TAG_DEFINITIONS: TagDefinition[] = [
   { tag: 'daoships.dao.announcement', minTrust: 'VERIFIED', updatesDao: false },
   { tag: 'daoships.member.profile', minTrust: 'MEMBER', updatesDao: false },
   { tag: 'daoships.proposal.vote.reason', minTrust: 'MEMBER', updatesDao: false },
-  { tag: 'daoships.treasury.label', minTrust: 'VERIFIED', updatesDao: false },
   { tag: 'daoships.navigator.metadata', minTrust: 'SEMI_TRUSTED', updatesDao: false },
+  { tag: 'daoships.navigator.allowlist', minTrust: 'MEMBER', updatesDao: false },
 ];
 
 for (const def of TAG_DEFINITIONS) {
@@ -76,8 +76,8 @@ const TAG_VALIDATORS: Record<string, ContentValidator> = {
   'daoships.dao.announcement': validateDaoAnnouncement,
   'daoships.member.profile': validateMemberProfile,
   'daoships.proposal.vote.reason': validateVoteReason,
-  'daoships.treasury.label': validateTreasuryLabel,
   'daoships.navigator.metadata': validateNavigatorMetadata,
+  'daoships.navigator.allowlist': validateNavigatorAllowlist,
 };
 
 // ── Helpers ─────────────────────────────────────────────────────
@@ -192,29 +192,42 @@ function validateVoteReason(p: Record<string, unknown>): Record<string, unknown>
   return clean({ daoAddress, proposalId: num(p.proposalId), vote: bool(p.vote), reason, schemaVersion: str(p.schemaVersion, 10) });
 }
 
-function validateTreasuryLabel(p: Record<string, unknown>): Record<string, unknown> | null {
-  const daoAddress = str(p.daoAddress, 42);
-  if (!daoAddress) return null;
-  let labels: Array<{ address: string; label: string; purpose?: string }> | undefined;
-  if (Array.isArray(p.labels)) {
-    labels = p.labels.slice(0, 50).map(l => {
-      if (!l || typeof l !== 'object') return null;
-      const lbl = l as Record<string, unknown>;
-      const address = str(lbl.address, 42);
-      const label = str(lbl.label, 100);
-      if (!address || !label) return null;
-      return { address, label, ...(str(lbl.purpose, 1000) ? { purpose: str(lbl.purpose, 1000) } : {}) };
-    }).filter((l): l is { address: string; label: string; purpose?: string } => l !== null);
-    if (labels.length === 0) labels = undefined;
-  }
-  return clean({ daoAddress, labels, schemaVersion: str(p.schemaVersion, 10) });
-}
-
 function validateNavigatorMetadata(p: Record<string, unknown>): Record<string, unknown> | null {
   const daoAddress = str(p.daoAddress, 42);
   const navigatorAddress = str(p.navigatorAddress, 42);
   if (!daoAddress || !navigatorAddress) return null;
   return clean({ daoAddress, navigatorAddress, name: str(p.name, 100), description: str(p.description, 1000), schemaVersion: str(p.schemaVersion, 10) });
+}
+
+const ETH_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+const BYTES32_RE = /^0x[0-9a-fA-F]{64}$/;
+
+function validateNavigatorAllowlist(p: Record<string, unknown>): Record<string, unknown> | null {
+  const daoAddress = str(p.daoAddress, 42);
+  const navigatorAddress = str(p.navigatorAddress, 42);
+  const root = str(p.root, 66);
+  if (!daoAddress || !navigatorAddress || !root) return null;
+
+  if (!ETH_ADDRESS_RE.test(daoAddress)) return null;
+  if (!ETH_ADDRESS_RE.test(navigatorAddress)) return null;
+  if (!BYTES32_RE.test(root)) return null;
+
+  if (!Array.isArray(p.addresses)) return null;
+  const validAddresses = p.addresses.filter(
+    (a: unknown) => typeof a === 'string' && ETH_ADDRESS_RE.test(a),
+  );
+  if (validAddresses.length === 0) return null;
+
+  if (!p.treeDump || typeof p.treeDump !== 'object' || Array.isArray(p.treeDump)) return null;
+
+  return clean({
+    daoAddress,
+    navigatorAddress,
+    root,
+    addresses: validAddresses,
+    treeDump: p.treeDump,
+    schemaVersion: str(p.schemaVersion, 10),
+  });
 }
 
 /**
@@ -424,6 +437,13 @@ export async function handleNewPost(
             }
           }
         }
+        break;
+      }
+
+      case 'daoships.navigator.allowlist': {
+        const navAddr = (validatedJson.navigatorAddress as string)?.toLowerCase();
+        const addrCount = Array.isArray(validatedJson.addresses) ? validatedJson.addresses.length : 0;
+        logger.info({ daoId, navigatorAddress: navAddr, addressCount: addrCount }, 'Navigator allowlist indexed');
         break;
       }
 
