@@ -30,17 +30,17 @@ async function determineTrustLevel(
   user: string,
   daoId: string,
   tag: string,
-): Promise<TrustLevel> {
+): Promise<{ trust: TrustLevel; dao: Awaited<ReturnType<typeof ctx.db.getDao>> }> {
   const dao = await ctx.db.getDao(daoId);
-  if (!dao) return 'UNTRUSTED';
-  if (user === dao.avatar) return 'VERIFIED';
-  if (user === dao.launcher && tag === 'daoships.dao.profile.initial') return 'VERIFIED_INITIAL';
-  if (user === dao.id) return 'VERIFIED';
+  if (!dao) return { trust: 'UNTRUSTED', dao: null };
+  if (user === dao.avatar) return { trust: 'VERIFIED', dao };
+  if (user === dao.launcher && tag === 'daoships.dao.profile.initial') return { trust: 'VERIFIED_INITIAL', dao };
+  if (user === dao.id) return { trust: 'VERIFIED', dao };
   const navigatorDaoId = ctx.registry.getDaoByNavigatorAddress(user);
-  if (navigatorDaoId === daoId) return 'SEMI_TRUSTED';
+  if (navigatorDaoId === daoId) return { trust: 'SEMI_TRUSTED', dao };
   const member = await ctx.db.getMember(makeMemberId(daoId, user));
-  if (member && BigInt(member.shares || '0') > 0n) return 'MEMBER';
-  return 'UNTRUSTED';
+  if (member && BigInt(member.shares || '0') > 0n) return { trust: 'MEMBER', dao };
+  return { trust: 'UNTRUSTED', dao };
 }
 
 // ── Known Tag Hash Map ──────────────────────────────────────────
@@ -119,6 +119,19 @@ function strArray(v: unknown, maxItems: number, maxItemLen: number): string[] | 
 }
 
 const BLOCKED_KEYS = new Set(['__proto__', 'constructor', 'prototype', 'toString', 'valueOf', 'hasOwnProperty']);
+
+/** Recursively sanitize JSONB objects: strip prototype-pollution keys and cap depth. */
+function sanitizeJsonb(obj: unknown, maxDepth = 5, depth = 0): unknown {
+  if (depth > maxDepth) return null;
+  if (typeof obj !== 'object' || obj === null) return obj;
+  if (Array.isArray(obj)) return obj.map(v => sanitizeJsonb(v, maxDepth, depth + 1));
+  const result: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+    if (BLOCKED_KEYS.has(k)) continue;
+    result[k] = sanitizeJsonb(v, maxDepth, depth + 1);
+  }
+  return result;
+}
 const KEY_PATTERN = /^[a-zA-Z0-9_-]+$/;
 
 function linksObj(v: unknown, maxUrlLen: number): Record<string, string> | undefined {
@@ -147,6 +160,9 @@ function clean(obj: Record<string, unknown>): Record<string, unknown> {
   return Object.keys(result).length > 0 ? result : {};
 }
 
+const ETH_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+const BYTES32_RE = /^0x[0-9a-fA-F]{64}$/;
+
 // ── Tag-Specific Content Validators ─────────────────────────────
 
 type ContentValidator = (parsed: Record<string, unknown>) => Record<string, unknown> | null;
@@ -158,12 +174,14 @@ function validateDaoProfileInitial(p: Record<string, unknown>): Record<string, u
   const name = str(p.name, 100);
   const description = str(p.description, 1000);
   if (!daoAddress || !name || !description) return null; // all required for initial
+  if (!ETH_ADDRESS_RE.test(daoAddress)) return null;
   return clean({ daoAddress, name, description, avatar: urlStr(p.avatar, 2048), banner: urlStr(p.banner, 2048), links: linksObj(p.links, 2048), tags: strArray(p.tags, 20, 50), chainId: num(p.chainId), schemaVersion: str(p.schemaVersion, 10) });
 }
 
 function validateDaoProfile(p: Record<string, unknown>): Record<string, unknown> | null {
   const daoAddress = str(p.daoAddress, 42);
   if (!daoAddress) return null; // only daoAddress required — supports partial updates
+  if (!ETH_ADDRESS_RE.test(daoAddress)) return null;
   return clean({ daoAddress, name: str(p.name, 100), description: str(p.description, 1000), avatar: urlStr(p.avatar, 2048), banner: urlStr(p.banner, 2048), links: linksObj(p.links, 2048), tags: strArray(p.tags, 20, 50), chainId: num(p.chainId), schemaVersion: str(p.schemaVersion, 10) });
 }
 
@@ -171,6 +189,7 @@ function validateDaoAnnouncement(p: Record<string, unknown>): Record<string, unk
   const daoAddress = str(p.daoAddress, 42);
   const title = str(p.title, 200);
   if (!daoAddress || !title) return null; // both required
+  if (!ETH_ADDRESS_RE.test(daoAddress)) return null;
   const severity = str(p.severity, 10);
   const validSeverity = severity && ['info', 'warning', 'critical'].includes(severity) ? severity : undefined;
   return clean({ daoAddress, title, body: str(p.body, 4096), severity: validSeverity, schemaVersion: str(p.schemaVersion, 10) });
@@ -180,6 +199,7 @@ function validateMemberProfile(p: Record<string, unknown>): Record<string, unkno
   const name = str(p.name, 100);
   if (!name) return null; // required
   const daoAddress = str(p.daoAddress, 42); // optional (global if omitted)
+  if (daoAddress && !ETH_ADDRESS_RE.test(daoAddress)) return null;
   return clean({ daoAddress, name, bio: str(p.bio, 1000), avatar: urlStr(p.avatar, 2048), schemaVersion: str(p.schemaVersion, 10) });
 }
 
@@ -190,9 +210,6 @@ function validateVoteReason(p: Record<string, unknown>): Record<string, unknown>
   return clean({ daoAddress, proposalId: num(p.proposalId), vote: bool(p.vote), reason, schemaVersion: str(p.schemaVersion, 10) });
 }
 
-
-const ETH_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
-const BYTES32_RE = /^0x[0-9a-fA-F]{64}$/;
 
 function validateNavigatorAllowlist(p: Record<string, unknown>): Record<string, unknown> | null {
   const daoAddress = str(p.daoAddress, 42);
@@ -217,7 +234,7 @@ function validateNavigatorAllowlist(p: Record<string, unknown>): Record<string, 
     navigatorAddress,
     root,
     addresses: validAddresses,
-    treeDump: p.treeDump,
+    treeDump: sanitizeJsonb(p.treeDump),
     schemaVersion: str(p.schemaVersion, 10),
   });
 }
@@ -307,7 +324,7 @@ export async function handleNewPost(
   }
 
   // Enforce schemaVersion — all DAO Ships poster content must include it
-  if (!parsed || !parsed.schemaVersion) {
+  if (!parsed || typeof parsed.schemaVersion !== 'string') {
     logger.warn({ user, tagHash }, 'NewPost missing schemaVersion, rejecting');
     return;
   }
@@ -340,7 +357,7 @@ export async function handleNewPost(
 
   // ── Trust verification ────────────────────────────────────────
 
-  const trustLevel = await determineTrustLevel(ctx, user, daoId, tagName);
+  const { trust: trustLevel, dao: trustDao } = await determineTrustLevel(ctx, user, daoId, tagName);
   const requiredTrust = tagDef.minTrust;
 
   if (!meetsMinTrust(trustLevel, requiredTrust)) {
@@ -388,7 +405,8 @@ export async function handleNewPost(
     switch (tagDef.tag) {
       case 'daoships.dao.profile.initial': {
         // Permanently rejected once vault has posted dao.profile
-        const dao = await ctx.db.getDao(daoId);
+        // Reuse trustDao from determineTrustLevel — no redundant fetch needed.
+        const dao = trustDao;
         if (dao?.profile_source === 'vault') {
           logger.debug({ daoId }, 'NewPost: profile.initial permanently rejected — vault profile exists');
           break;

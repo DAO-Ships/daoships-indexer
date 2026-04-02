@@ -170,7 +170,11 @@ export class BlockchainService {
    */
   async rawCall(to: string, data: string): Promise<string> {
     await this.rateLimit();
-    return this.provider.call({ to, from: '0x0000000000000000000000000000000000000000', data });
+    const result = await Promise.race([
+      this.provider.call({ to, from: '0x0000000000000000000000000000000000000000', data }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('rawCall timeout (10s)')), 10_000)),
+    ]);
+    return result;
   }
 
   getProvider(): quais.JsonRpcProvider {

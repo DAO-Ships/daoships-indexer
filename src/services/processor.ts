@@ -239,14 +239,13 @@ export class BlockProcessor {
   }
 
   /**
-   * H3: Topic-based log fetching — O(1) RPC calls regardless of DAO count.
+   * Topic + address log fetching — O(1) RPC calls regardless of DAO count.
    *
-   * Instead of querying by address (which scales linearly with DAOs), we query
-   * by topic0 hashes (a fixed set of event signatures we handle). The RPC node
-   * returns all matching logs across all contracts, and we filter in-memory to
-   * keep only logs from known addresses.
-   *
-   * This reduces RPC calls from O(DAOs/100) per poll cycle to exactly 1.
+   * Queries by topic0 hashes (fixed set) AND known addresses (server-side).
+   * This avoids pulling chain-wide Transfer events (topic0 0xddf252ad matches
+   * every ERC20/ERC721 transfer). For most deployments with a few dozen DAOs +
+   * tokens, a single getLogs call handles everything. If the address list grows
+   * beyond RPC provider limits (~50-100), batch into multiple calls here.
    */
   private async fetchAllLogs(fromBlock: number, toBlock: number): Promise<Log[]> {
     // All topic0 hashes we care about — fixed set regardless of DAO count
@@ -261,17 +260,18 @@ export class BlockProcessor {
       ...this.registry.getAllNavigatorAddresses(),
     ]);
 
-    // Single RPC call: fetch ALL logs matching ANY of our topic0 hashes
-    // The first topics element is an array = OR filter (match any topic0)
+    // Single RPC call: fetch all logs matching our topic0 hashes, scoped to
+    // known addresses. Server-side address filter avoids pulling chain-wide
+    // Transfer events (topic0 0xddf252ad matches all ERC20/ERC721 transfers).
+    const addressFilter = [...knownAddresses];
     const allLogs = await this.blockchain.getLogs(
-      [],  // no address filter — topic filter handles it
+      addressFilter,
       fromBlock,
       toBlock,
       [registeredTopics],  // topics[0] = array of topic0 hashes (OR)
     );
 
-    // Filter in-memory: keep only logs from addresses we're tracking
-    return allLogs.filter(log => knownAddresses.has(log.address.toLowerCase()));
+    return allLogs;
   }
 
   private async getBlockTimestamp(blockNumber: number): Promise<number> {

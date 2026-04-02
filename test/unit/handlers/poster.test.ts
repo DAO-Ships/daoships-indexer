@@ -659,6 +659,24 @@ describe('content_json schema validation', () => {
     expect(json).not.toHaveProperty('skills');
   });
 
+  it('member.profile rejected for UNTRUSTED user (non-member)', async () => {
+    const randomWallet = '0x0000000000000000000000000000000000000042';
+    const { db } = await postAndGetContentJson({
+      tag: 'daoships.member.profile',
+      user: randomWallet,
+      content: {
+        schemaVersion: '1.0',
+        daoAddress: DAOSHIP,
+        name: 'Impersonator',
+      },
+      dbSetup: (db) => {
+        db.getMember.mockResolvedValue(null); // not a member
+      },
+    });
+    // UNTRUSTED does not meet MEMBER requirement — record not stored
+    expect(db.upsert).not.toHaveBeenCalled();
+  });
+
   // ── vote.reason (requires reason) ──────────────────────────────
 
   it('vote.reason requires reason field', async () => {

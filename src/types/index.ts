@@ -117,8 +117,8 @@ export interface NavigatorRow {
   permission: number;
   permission_label: string;
   is_active: boolean;
-  paused: boolean;
-  navigator_type: string;
+  paused?: boolean;
+  navigator_type: string | null;
   name?: string;
   description?: string;
   created_at: string;

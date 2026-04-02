@@ -67,6 +67,7 @@ export async function handleTransfer(
       member_address: from,
       [field]: senderNewBalance,
       created_at: sender ? (sender.created_at as string) : now,
+      updated_at: now,
       last_activity_at: now,
     });
   }
@@ -90,6 +91,7 @@ export async function handleTransfer(
       member_address: to,
       [field]: receiverNewBalance,
       created_at: receiver ? (receiver.created_at as string) : now,
+      updated_at: now,
       last_activity_at: now,
     });
   }

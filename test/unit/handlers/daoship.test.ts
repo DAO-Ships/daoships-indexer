@@ -379,6 +379,18 @@ describe('handleRagequit', () => {
       total_shares: '400',
     });
   });
+
+  it('skips when tokens/amounts array lengths mismatch', async () => {
+    const db = makeMockDb();
+    const ctx = makeCtx({ db, log: { address: DAOSHIP } });
+
+    await handleRagequit(ctx, {
+      member: MEMBER1, to: MEMBER2, lootToBurn: 0n, sharesToBurn: 50n,
+      tokens: [TOKEN_A, '0x000000000000000000000000000000000000000a'], amounts: ['100'],
+    });
+
+    expect(db.upsert).not.toHaveBeenCalled();
+  });
 });
 
 // ── handleNavigatorSet ─────────────────────────────────────────
@@ -427,11 +439,11 @@ describe('handleNavigatorSet', () => {
     expect(db.upsert).not.toHaveBeenCalled();
   });
 
-  it('skips permission > 255 (invalid)', async () => {
+  it('skips permission > 7 (reserved bits)', async () => {
     const db = makeMockDb();
     const ctx = makeCtx({ db, log: { address: DAOSHIP } });
 
-    await handleNavigatorSet(ctx, { navigator: NAVIGATOR, permission: 256n });
+    await handleNavigatorSet(ctx, { navigator: NAVIGATOR, permission: 8n });
 
     expect(db.upsert).not.toHaveBeenCalled();
   });

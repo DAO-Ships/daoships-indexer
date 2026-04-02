@@ -105,6 +105,13 @@ export class ContractRegistry {
     return this.navigatorToDaoMap.get(navigatorAddress.toLowerCase());
   }
 
+  clear(): void {
+    this.daos.clear();
+    this.tokenToDaoMap.clear();
+    this.navigators.clear();
+    this.navigatorToDaoMap.clear();
+  }
+
   get daoCount(): number {
     return this.daos.size;
   }

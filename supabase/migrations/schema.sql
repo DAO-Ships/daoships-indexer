@@ -523,12 +523,14 @@ BEGIN
             IF array_length(affected_daos, 1) > 0 THEN
                 UPDATE %I.ds_daos SET
                     proposal_count = (SELECT COUNT(*) FROM %I.ds_proposals p WHERE p.dao_id = %I.ds_daos.id),
-                    active_member_count = (SELECT COUNT(*) FROM %I.ds_members m WHERE m.dao_id = %I.ds_daos.id AND (m.shares > 0 OR m.loot > 0))
+                    active_member_count = (SELECT COUNT(*) FROM %I.ds_members m WHERE m.dao_id = %I.ds_daos.id AND (m.shares > 0 OR m.loot > 0)),
+                    total_shares = COALESCE((SELECT SUM(m.shares) FROM %I.ds_members m WHERE m.dao_id = %I.ds_daos.id), 0),
+                    total_loot = COALESCE((SELECT SUM(m.loot) FROM %I.ds_members m WHERE m.dao_id = %I.ds_daos.id), 0)
                 WHERE id = ANY(affected_daos);
             END IF;
         END;
         $fn$ LANGUAGE plpgsql
-    ', s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s);
+    ', s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s);
 
     -- ═══════════════════════════════════════════════════════════════════
     -- ROW LEVEL SECURITY

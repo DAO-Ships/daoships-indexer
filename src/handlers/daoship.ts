@@ -492,8 +492,8 @@ export const handleNavigatorSet: EventHandler = async (
   validateEventArgs(args, ['navigator', 'permission'], 'NavigatorSet');
   const navigatorAddress = validateAndNormalizeAddress(args.navigator, 'navigator');
   const permission = Number(args.permission);
-  // M14: Validate permission is within the 0-255 range DAOShip contracts use
-  if (!Number.isFinite(permission) || permission < 0 || permission > 255) {
+  // Validate permission is within defined range (bits 0-2); bits 3-7 are reserved
+  if (!Number.isFinite(permission) || permission < 0 || permission > 7) {
     logger.warn({ daoId, rawPermission: args.permission }, 'NavigatorSet: invalid permission value, skipping');
     return;
   }
@@ -523,6 +523,10 @@ export const handleNavigatorSet: EventHandler = async (
         ctx.log.blockNumber,
         [[topic0]],
       );
+      if (logs.length > 1) {
+        logger.warn({ navigatorAddress, count: logs.length },
+          'Multiple NavigatorDeployed logs found — using first');
+      }
       if (logs.length > 0) {
         const parsed = iNavIface.parseLog({
           topics: logs[0].topics as string[],
@@ -776,7 +780,6 @@ export const handleConvertSharesToLoot: EventHandler = async (
   const from = validateAndNormalizeAddress(args.from, 'from');
   const amount = strictBigInt(args.amount, 'amount');
   const amountStr = amount.toString();
-  const memberId = makeMemberId(daoId, from);
 
   logger.info(
     { daoId, member: from, amount: amountStr },

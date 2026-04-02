@@ -278,6 +278,26 @@ async function main(): Promise<void> {
         // pre-reorg events that are now being rolled back (I13).
         clearNavigatorDaoCache();
 
+        // Rebuild the in-memory registry from surviving DB rows.
+        // The SQL cleanup deleted orphaned navigators/DAOs, so stale entries
+        // must be evicted before the replay pass re-registers what survived.
+        registry.clear();
+        for await (const dao of db.getAllDaosIterator()) {
+          registry.registerDao({
+            daoShipAddress: dao.id,
+            sharesAddress: dao.shares_address,
+            lootAddress: dao.loot_address,
+            avatar: dao.avatar,
+          });
+        }
+        for await (const nav of db.getActiveNavigatorsIterator()) {
+          registry.registerNavigator(nav.navigator_address, nav.dao_id);
+        }
+        logger.info(
+          { daos: registry.daoCount, navigators: registry.navigatorCount },
+          'Registry rebuilt from surviving DB rows after reorg',
+        );
+
         lastProcessedBlock = forkPoint;
       }
     }
