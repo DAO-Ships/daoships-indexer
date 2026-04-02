@@ -75,12 +75,13 @@ All columns are contract-derived. No user-supplied strings.
 | Column | Trust | Source | Rendering |
 |--------|-------|--------|-----------|
 | `id`, `dao_id`, `navigator_address` | Contract | NavigatorSet event | Plain text (hex) |
+| `deployer` | Contract | NavigatorDeployed event | Plain text (hex) |
 | `permission`, `permission_label` | Contract | NavigatorSet event | Numeric / enum string |
 | `is_active`, `paused` | Contract | NavigatorSet event | Boolean |
-| `navigator_type` | Contract | Best-effort on-chain probe | Plain text or null |
+| `navigator_type` | Contract | NavigatorDeployed event | Plain text or null |
 | `tx_hash`, `created_at` | Contract | Event / block timestamp | Plain text / timestamp |
-| **`name`** | **UNTRUSTED** | Poster navigator.metadata (max 100 chars) | **Must escape.** |
-| **`description`** | **UNTRUSTED** | Poster navigator.metadata (max 1000 chars) | **Sanitize as Markdown or escape.** |
+| **`name`** | **Deployer-authored** | NavigatorDeployed event (max 255 chars) or governance Poster update | **Must escape.** Initially set by deployer in constructor, updatable via governance proposal. |
+| **`description`** | **Deployer-authored** | NavigatorDeployed event (max 1000 chars) or governance Poster update | **Sanitize as Markdown or escape.** |
 #### ds_records
 
 **Every column in ds_records except structural fields is untrusted.** This table stores raw Poster content.
@@ -504,24 +505,14 @@ interface VoteReasonJson {
   reason: string;          // required, max 2000
 }
 
-// daoships.treasury.label
-interface TreasuryLabelJson {
+// daoships.navigator.allowlist (MEMBER trust)
+interface NavigatorAllowlistJson {
   schemaVersion: string;   // required
-  daoAddress: string;      // required, max 42
-  labels?: Array<{
-    address: string;       // max 42
-    label: string;         // max 100
-    purpose?: string;      // max 1000
-  }>;                      // max 50
-}
-
-// daoships.navigator.metadata
-interface NavigatorMetadataJson {
-  schemaVersion: string;   // required
-  daoAddress: string;      // required, max 42
-  navigatorAddress: string; // required, max 42
-  name?: string;           // max 100
-  description?: string;    // max 1000
+  daoAddress: string;      // required, hex address
+  navigatorAddress: string; // required, hex address
+  root: string;            // required, bytes32 Merkle root
+  addresses: string[];     // required, non-empty array of hex addresses
+  treeDump: object;        // required, StandardMerkleTree.dump() output
 }
 ```
 

@@ -45,6 +45,8 @@ export function makeMockDb() {
 export function makeMockBlockchain() {
   return {
     callContract: vi.fn().mockResolvedValue(''),
+    rawCall: vi.fn().mockResolvedValue('0x'),
+    getLogs: vi.fn().mockResolvedValue([]),
     getTransaction: vi.fn().mockResolvedValue(null),
   };
 }

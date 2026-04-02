@@ -62,7 +62,6 @@ const TAG_DEFINITIONS: TagDefinition[] = [
   { tag: 'daoships.dao.announcement', minTrust: 'VERIFIED', updatesDao: false },
   { tag: 'daoships.member.profile', minTrust: 'MEMBER', updatesDao: false },
   { tag: 'daoships.proposal.vote.reason', minTrust: 'MEMBER', updatesDao: false },
-  { tag: 'daoships.navigator.metadata', minTrust: 'MEMBER', updatesDao: false },
   { tag: 'daoships.navigator.allowlist', minTrust: 'MEMBER', updatesDao: false },
 ];
 
@@ -76,7 +75,6 @@ const TAG_VALIDATORS: Record<string, ContentValidator> = {
   'daoships.dao.announcement': validateDaoAnnouncement,
   'daoships.member.profile': validateMemberProfile,
   'daoships.proposal.vote.reason': validateVoteReason,
-  'daoships.navigator.metadata': validateNavigatorMetadata,
   'daoships.navigator.allowlist': validateNavigatorAllowlist,
 };
 
@@ -192,12 +190,6 @@ function validateVoteReason(p: Record<string, unknown>): Record<string, unknown>
   return clean({ daoAddress, proposalId: num(p.proposalId), vote: bool(p.vote), reason, schemaVersion: str(p.schemaVersion, 10) });
 }
 
-function validateNavigatorMetadata(p: Record<string, unknown>): Record<string, unknown> | null {
-  const daoAddress = str(p.daoAddress, 42);
-  const navigatorAddress = str(p.navigatorAddress, 42);
-  if (!daoAddress || !navigatorAddress) return null;
-  return clean({ daoAddress, navigatorAddress, name: str(p.name, 100), description: str(p.description, 1000), schemaVersion: str(p.schemaVersion, 10) });
-}
 
 const ETH_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 const BYTES32_RE = /^0x[0-9a-fA-F]{64}$/;
@@ -417,25 +409,6 @@ export async function handleNewPost(
           updates.profile_source = 'vault';
           await ctx.db.updateDao(daoId, updates);
           logger.info({ daoId, updates }, 'DAO profile updated from vault');
-        }
-        break;
-      }
-
-      case 'daoships.navigator.metadata': {
-        if (typeof validatedJson.navigatorAddress === 'string') {
-          const navigatorAddr = (validatedJson.navigatorAddress as string).toLowerCase();
-          const navigatorId = `${daoId}-${navigatorAddr}`;
-          const navUpdates: Record<string, unknown> = {};
-          if (typeof validatedJson.name === 'string') navUpdates.name = validatedJson.name;
-          if (typeof validatedJson.description === 'string') navUpdates.description = validatedJson.description;
-          if (Object.keys(navUpdates).length > 0) {
-            try {
-              await ctx.db.updateNavigator(navigatorId, navUpdates);
-              logger.info({ daoId, navigatorAddr }, 'Navigator metadata updated from post');
-            } catch (err) {
-              logger.warn({ daoId, navigatorAddr, error: (err as Error).message }, 'Navigator metadata update failed (row may not exist yet)');
-            }
-          }
         }
         break;
       }

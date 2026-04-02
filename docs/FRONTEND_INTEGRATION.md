@@ -160,13 +160,14 @@ export interface NavigatorRow {
   id: string;
   dao_id: string;
   navigator_address: string;
+  deployer?: string;                   // Address that deployed this navigator (from NavigatorDeployed event)
   permission: number;                  // Bitmask: 0=none, 1=admin, 2=manager, 3=admin+manager, 4=governor, 5=admin+governor, 6=manager+governor, 7=all
   permission_label: string;            // 'none' | 'admin' | 'manager' | 'admin_manager' | 'governor' | 'admin_governor' | 'manager_governor' | 'all'
   is_active: boolean;
   paused: boolean;
-  navigator_type: string;             // e.g. 'OnboarderNavigator'
-  name?: string;
-  description?: string;
+  navigator_type: string;             // e.g. 'OnboarderNavigator' (from NavigatorDeployed event)
+  name?: string;                       // Human-readable name (from NavigatorDeployed event)
+  description?: string;                // Human-readable description (from NavigatorDeployed event)
   created_at: string;
   tx_hash: string;
 }
@@ -1190,31 +1191,9 @@ async function postVoteReason(
 }
 ```
 
-### Post navigator metadata
+### Navigator metadata
 
-Called by the navigator deployer after deployment:
-
-```typescript
-async function postNavigatorMetadata(
-  daoAddress: string,
-  navigatorAddress: string,
-  metadata: {
-    name?: string;
-    description?: string;
-  },
-) {
-  const content = JSON.stringify({
-    schemaVersion: '1.0',
-    daoAddress: daoAddress.toLowerCase(),
-    navigatorAddress: navigatorAddress.toLowerCase(),
-    ...metadata,
-  });
-
-  const tx = await poster.post(content, 'daoships.navigator.metadata');
-  await tx.wait();
-  return tx.hash;
-}
-```
+Navigator metadata (name, description, deployer, type) is set automatically at deployment via the `NavigatorDeployed` constructor event emitted by all `INavigator`-compliant contracts. No Poster interaction is needed — the indexer fetches the event when the navigator is registered via `NavigatorSet`.
 
 ### Tag reference
 
@@ -1225,8 +1204,7 @@ async function postNavigatorMetadata(
 | `daoships.dao.announcement` | DAO vault (via proposal) | `VERIFIED` | `{ schemaVersion*, daoAddress*, title*, body?, severity? }` |
 | `daoships.member.profile` | Member wallet | `MEMBER` | `{ schemaVersion*, daoAddress?, name*, bio?, avatar? }` |
 | `daoships.proposal.vote.reason` | Voter wallet | `MEMBER` | `{ schemaVersion*, daoAddress*, proposalId?, vote?, reason* }` |
-| `daoships.treasury.label` | DAO vault (via proposal) | `VERIFIED` | `{ schemaVersion*, daoAddress*, labels? }` |
-| `daoships.navigator.metadata` | Navigator deployer | `SEMI_TRUSTED` | `{ schemaVersion*, daoAddress*, navigatorAddress*, name?, description? }` |
+| `daoships.navigator.allowlist` | Navigator deployer (member) | `MEMBER` | `{ schemaVersion*, daoAddress*, navigatorAddress*, root*, addresses*, treeDump* }` |
 
 > **Note:** All content payloads require a `schemaVersion` field (e.g. `"1.0"`). Posts missing `schemaVersion` are rejected. Maximum content size is **16KB** (hard rejection above 16,384 bytes).
 

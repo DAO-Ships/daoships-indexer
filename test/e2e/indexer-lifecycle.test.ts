@@ -693,7 +693,7 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
         onboarderIpfsHash,
       );
       // OnboarderNavigator(daoShip, shareMultiplier, lootMultiplier, pricePerUnit,
-      //   sharesPerUnit, lootPerUnit, minTribute, expiry, mintCap, perAddressCap, allowlistRoot)
+      //   sharesPerUnit, lootPerUnit, minTribute, expiry, mintCap, perAddressCap, allowlistRoot, name, description)
       const onboarderInstance = await OnboarderFactory.deploy(
         predictedDaoShipAddress,
         sharesPerQuai,     // shareMultiplier (basis points)
@@ -706,6 +706,8 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
         0,                 // mintCap (0 = unlimited)
         0,                 // perAddressCap (0 = unlimited)
         '0x' + '00'.repeat(32), // allowlistRoot (0 = open)
+        'Test Onboarder',  // name
+        'Open onboarding navigator for E2E tests', // description
       );
       await onboarderInstance.waitForDeployment();
       const onboarderAddr = await onboarderInstance.getAddress();
@@ -719,7 +721,7 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
         erc20TributeIpfsHash,
       );
       // ERC20TributeNavigator(daoShip, tributeToken, pricePerShare, pricePerLoot,
-      //   expiry, mintCap, perAddressCap, allowlistRoot)
+      //   expiry, mintCap, perAddressCap, allowlistRoot, name, description)
       // Use the predicted shares address as the tribute token (it's a valid ERC20)
       const predictedSharesAddress = sharesSalt.address;
       const erc20TributeInstance = await ERC20TributeFactory.deploy(
@@ -731,6 +733,8 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
         0,                      // mintCap (0 = unlimited)
         0,                      // perAddressCap (0 = unlimited)
         '0x' + '00'.repeat(32), // allowlistRoot (0 = open)
+        'Test ERC20 Tribute',   // name
+        'ERC20 tribute navigator for E2E tests', // description
       );
       await erc20TributeInstance.waitForDeployment();
       const erc20TributeAddr = await erc20TributeInstance.getAddress();
@@ -970,6 +974,22 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
 
       expect(navigatorsData).toBeTruthy();
       expect(navigatorsData!.length).toBeGreaterThanOrEqual(3);
+
+      // Verify NavigatorDeployed metadata was indexed
+      const onboarderNav = navigatorsData!.find((n: any) => n.navigator_type === 'OnboarderNavigator');
+      if (onboarderNav) {
+        expect(onboarderNav.name).toBe('Test Onboarder');
+        expect(onboarderNav.description).toBe('Open onboarding navigator for E2E tests');
+        expect(onboarderNav.deployer).toBeTruthy();
+        console.log(`   OnboarderNavigator metadata verified (deployer: ${onboarderNav.deployer})`);
+      }
+      const erc20Nav = navigatorsData!.find((n: any) => n.navigator_type === 'ERC20TributeNavigator');
+      if (erc20Nav) {
+        expect(erc20Nav.name).toBe('Test ERC20 Tribute');
+        expect(erc20Nav.description).toBe('ERC20 tribute navigator for E2E tests');
+        expect(erc20Nav.deployer).toBeTruthy();
+        console.log(`   ERC20TributeNavigator metadata verified (deployer: ${erc20Nav.deployer})`);
+      }
       console.log(`   Navigators verified (${navigatorsData!.length} registered)`);
 
       // Check governance params are populated (from SetupComplete)

@@ -18,6 +18,9 @@ import {
 } from '../utils/addresses.js';
 
 import { evictNavigatorFromCache } from './navigators.js';
+import { config } from '../config.js';
+
+import INavigatorAbi from '../abis/INavigator.json' with { type: 'json' };
 import DAOShipAbi from '../abis/DAOShip.json' with { type: 'json' };
 
 export const daoShipIface = new Interface(DAOShipAbi);
@@ -502,25 +505,45 @@ export const handleNavigatorSet: EventHandler = async (
     'NavigatorSet',
   );
 
-  // Read navigator type from the contract's public constant (one call per registration).
-  // Best-effort probe — EOAs and older contracts won't have this function.
-  // Uses rawCall (rate-limited, no retry) since BAD_DATA is deterministic.
+  // Fetch NavigatorDeployed event from the navigator contract.
+  // All INavigator-compliant navigators emit this once in their constructor.
+  // Targeted getLogs scoped to this address — not added to global topic polling.
+  let deployerAddress: string | null = null;
   let navigatorType: string | null = null;
+  let navName: string | null = null;
+  let navDescription: string | null = null;
+
   if (permission > 0) {
     try {
-      const navTypeIface = new Interface(['function navigatorType() view returns (string)']);
-      const callData = navTypeIface.encodeFunctionData('navigatorType');
-      const result = await ctx.blockchain.rawCall(navigatorAddress, callData);
-      if (result && result !== '0x') {
-        const decoded = navTypeIface.decodeFunctionResult('navigatorType', result);
-        const rawType = String(decoded[0]);
-        if (rawType.length > 0) {
-          navigatorType = rawType.slice(0, 50);
+      const iNavIface = new Interface(INavigatorAbi);
+      const topic0 = iNavIface.getEvent('NavigatorDeployed')!.topicHash;
+      const logs = await ctx.blockchain.getLogs(
+        navigatorAddress,
+        config.startBlock,
+        ctx.log.blockNumber,
+        [[topic0]],
+      );
+      if (logs.length > 0) {
+        const parsed = iNavIface.parseLog({
+          topics: logs[0].topics as string[],
+          data: logs[0].data,
+        });
+        if (parsed) {
+          const eventDaoShip = String(parsed.args.daoShip).toLowerCase();
+          if (eventDaoShip === daoId) {
+            deployerAddress = String(parsed.args.deployer).toLowerCase();
+            navigatorType = String(parsed.args.navigatorType).slice(0, 50) || null;
+            navName = String(parsed.args.name).slice(0, 255) || null;
+            navDescription = String(parsed.args.description).slice(0, 1000) || null;
+          } else {
+            logger.warn({ navigatorAddress, eventDaoShip, expectedDaoId: daoId },
+              'NavigatorDeployed daoShip mismatch — ignoring deploy event');
+          }
         }
       }
-    } catch {
-      // Navigator may not implement navigatorType() — EOAs, older contracts, or custom navigators.
-      logger.debug({ navigatorAddress }, 'NavigatorSet: navigatorType() not available');
+    } catch (err) {
+      logger.warn({ navigatorAddress, error: (err as Error).message },
+        'NavigatorDeployed log fetch failed (non-fatal)');
     }
   }
 
@@ -528,10 +551,13 @@ export const handleNavigatorSet: EventHandler = async (
     id,
     dao_id: daoId,
     navigator_address: navigatorAddress,
+    deployer: deployerAddress,
     permission,
     permission_label: permissionToLabel(permission),
     is_active: permission > 0,
     navigator_type: navigatorType,
+    name: navName,
+    description: navDescription,
     created_at: new Date(ctx.blockTimestamp * 1000).toISOString(),
     tx_hash: ctx.log.transactionHash,
   });

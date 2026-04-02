@@ -22,7 +22,7 @@ import {
 } from '../../../src/handlers/daoship.js';
 import {
   DAOSHIP, SHARES, LOOT, MEMBER1, MEMBER2, NAVIGATOR, LAUNCHER, TOKEN_A, TX_HASH,
-  makeCtx, makeMockDb, makeMockRegistry,
+  makeCtx, makeMockDb, makeMockBlockchain, makeMockRegistry,
 } from './helpers.js';
 
 // Minimal DAO row returned by getDao mock
@@ -434,6 +434,108 @@ describe('handleNavigatorSet', () => {
     await handleNavigatorSet(ctx, { navigator: NAVIGATOR, permission: 256n });
 
     expect(db.upsert).not.toHaveBeenCalled();
+  });
+
+  it('populates deployer, name, description from NavigatorDeployed event', async () => {
+    const db = makeMockDb();
+    const blockchain = makeMockBlockchain();
+    const iface = new (await import('quais')).Interface([{
+      type: 'event', name: 'NavigatorDeployed',
+      inputs: [
+        { name: 'daoShip', type: 'address', indexed: true },
+        { name: 'deployer', type: 'address', indexed: true },
+        { name: 'navigatorType', type: 'string', indexed: false },
+        { name: 'name', type: 'string', indexed: false },
+        { name: 'description', type: 'string', indexed: false },
+      ],
+    }]);
+    const fragment = iface.getEvent('NavigatorDeployed')!;
+    const encoded = iface.encodeEventLog(fragment, [DAOSHIP, MEMBER1, 'OnboarderNavigator', 'My Nav', 'Does things']);
+    blockchain.getLogs.mockResolvedValue([{
+      topics: encoded.topics,
+      data: encoded.data,
+      address: NAVIGATOR,
+      blockNumber: 50,
+      transactionHash: TX_HASH,
+      index: 0,
+      transactionIndex: 0,
+    }]);
+    const registry = makeMockRegistry();
+    registry.getDaoByDaoShipAddress.mockReturnValue({ daoShipAddress: DAOSHIP });
+    const ctx = makeCtx({ db, blockchain, registry, log: { address: DAOSHIP } });
+
+    await handleNavigatorSet(ctx, { navigator: NAVIGATOR, permission: 4n });
+
+    expect(blockchain.getLogs).toHaveBeenCalled();
+    expect(db.upsert).toHaveBeenCalledWith('ds_navigators', expect.objectContaining({
+      deployer: MEMBER1,
+      navigator_type: 'OnboarderNavigator',
+      name: 'My Nav',
+      description: 'Does things',
+    }));
+  });
+
+  it('rejects NavigatorDeployed when daoShip does not match', async () => {
+    const db = makeMockDb();
+    const blockchain = makeMockBlockchain();
+    const iface = new (await import('quais')).Interface([{
+      type: 'event', name: 'NavigatorDeployed',
+      inputs: [
+        { name: 'daoShip', type: 'address', indexed: true },
+        { name: 'deployer', type: 'address', indexed: true },
+        { name: 'navigatorType', type: 'string', indexed: false },
+        { name: 'name', type: 'string', indexed: false },
+        { name: 'description', type: 'string', indexed: false },
+      ],
+    }]);
+    const fragment = iface.getEvent('NavigatorDeployed')!;
+    const wrongDao = '0x0000000000000000000000000000000000000099';
+    const encoded = iface.encodeEventLog(fragment, [wrongDao, MEMBER1, 'OnboarderNavigator', 'Fake', 'Bad']);
+    blockchain.getLogs.mockResolvedValue([{
+      topics: encoded.topics, data: encoded.data,
+      address: NAVIGATOR, blockNumber: 50, transactionHash: TX_HASH, index: 0, transactionIndex: 0,
+    }]);
+    const registry = makeMockRegistry();
+    registry.getDaoByDaoShipAddress.mockReturnValue({ daoShipAddress: DAOSHIP });
+    const ctx = makeCtx({ db, blockchain, registry, log: { address: DAOSHIP } });
+
+    await handleNavigatorSet(ctx, { navigator: NAVIGATOR, permission: 4n });
+
+    expect(db.upsert).toHaveBeenCalledWith('ds_navigators', expect.objectContaining({
+      deployer: null,
+      name: null,
+      description: null,
+    }));
+  });
+
+  it('handles missing NavigatorDeployed gracefully', async () => {
+    const db = makeMockDb();
+    const blockchain = makeMockBlockchain();
+    blockchain.getLogs.mockResolvedValue([]);
+    const registry = makeMockRegistry();
+    registry.getDaoByDaoShipAddress.mockReturnValue({ daoShipAddress: DAOSHIP });
+    const ctx = makeCtx({ db, blockchain, registry, log: { address: DAOSHIP } });
+
+    await handleNavigatorSet(ctx, { navigator: NAVIGATOR, permission: 4n });
+
+    expect(db.upsert).toHaveBeenCalledWith('ds_navigators', expect.objectContaining({
+      deployer: null,
+      navigator_type: null,
+      name: null,
+      description: null,
+    }));
+  });
+
+  it('skips NavigatorDeployed fetch when permission=0', async () => {
+    const db = makeMockDb();
+    const blockchain = makeMockBlockchain();
+    const registry = makeMockRegistry();
+    registry.getDaoByDaoShipAddress.mockReturnValue({ daoShipAddress: DAOSHIP });
+    const ctx = makeCtx({ db, blockchain, registry, log: { address: DAOSHIP } });
+
+    await handleNavigatorSet(ctx, { navigator: NAVIGATOR, permission: 0n });
+
+    expect(blockchain.getLogs).not.toHaveBeenCalled();
   });
 
   it('upserts to DB but skips registry when daoship not in registry', async () => {

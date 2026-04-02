@@ -1,0 +1,13 @@
+[
+  {
+    "type": "event",
+    "name": "NavigatorDeployed",
+    "inputs": [
+      { "name": "daoShip", "type": "address", "indexed": true },
+      { "name": "deployer", "type": "address", "indexed": true },
+      { "name": "navigatorType", "type": "string", "indexed": false },
+      { "name": "name", "type": "string", "indexed": false },
+      { "name": "description", "type": "string", "indexed": false }
+    ]
+  }
+]

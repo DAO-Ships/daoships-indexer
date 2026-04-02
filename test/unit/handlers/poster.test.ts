@@ -699,63 +699,6 @@ describe('content_json schema validation', () => {
     });
   });
 
-  // ── navigator.metadata (simplified: name + description only) ───
-
-  it('navigator.metadata has no config, sourceCode, auditReport, or permissions', async () => {
-    const navigatorAddr = NAVIGATOR;
-    const { db } = await postAndGetContentJson({
-      tag: 'daoships.navigator.metadata',
-      user: MEMBER1,
-      content: {
-        schemaVersion: '1.0',
-        daoAddress: DAOSHIP,
-        navigatorAddress: navigatorAddr,
-        name: 'My Navigator',
-        description: 'Nav description',
-        config: { key: 'value' },
-        sourceCode: 'https://github.com/example',
-        auditReport: 'https://example.com/audit',
-        permissions: ['read', 'write'],
-      },
-      registrySetup: (reg) => {
-        reg.getDaoByNavigatorAddress.mockReturnValue(DAOSHIP);
-      },
-    });
-    const json = getContentJson(db);
-    expect(json).not.toHaveProperty('config');
-    expect(json).not.toHaveProperty('sourceCode');
-    expect(json).not.toHaveProperty('auditReport');
-    expect(json).not.toHaveProperty('permissions');
-    expect(json!.name).toBe('My Navigator');
-    expect(json!.description).toBe('Nav description');
-  });
-
-  it('navigator.metadata with name + description — accepted', async () => {
-    const navigatorAddr = NAVIGATOR;
-    const { db } = await postAndGetContentJson({
-      tag: 'daoships.navigator.metadata',
-      user: MEMBER1,
-      content: {
-        schemaVersion: '1.0',
-        daoAddress: DAOSHIP,
-        navigatorAddress: navigatorAddr,
-        name: 'My Navigator',
-        description: 'A useful navigator',
-      },
-      registrySetup: (reg) => {
-        reg.getDaoByNavigatorAddress.mockReturnValue(DAOSHIP);
-      },
-    });
-    const json = getContentJson(db);
-    expect(json).toEqual({
-      daoAddress: DAOSHIP,
-      navigatorAddress: navigatorAddr,
-      name: 'My Navigator',
-      description: 'A useful navigator',
-      schemaVersion: '1.0',
-    });
-  });
-
   // ── navigator.allowlist ────────────────────────────────────────
 
   it('navigator.allowlist with valid data — accepted', async () => {
@@ -1173,29 +1116,4 @@ describe('content_json schema validation', () => {
     expect(updateArgs).not.toHaveProperty('evilField');
   });
 
-  it('navigator.metadata — updateNavigator receives name + description only', async () => {
-    const navigatorAddr = NAVIGATOR;
-    const { db } = await postAndGetContentJson({
-      tag: 'daoships.navigator.metadata',
-      user: MEMBER1,
-      content: {
-        schemaVersion: '1.0',
-        daoAddress: DAOSHIP,
-        navigatorAddress: navigatorAddr,
-        name: 'Nav Name',
-        description: 'Nav Description',
-        evilField: 'should not reach updateNavigator',
-      },
-      registrySetup: (reg) => {
-        reg.getDaoByNavigatorAddress.mockReturnValue(DAOSHIP);
-      },
-    });
-    expect(db.updateNavigator).toHaveBeenCalled();
-    const [navId, navData] = db.updateNavigator.mock.calls[0] as [string, Record<string, unknown>];
-    expect(navId).toBe(`${DAOSHIP}-${navigatorAddr}`);
-    expect(navData.name).toBe('Nav Name');
-    expect(navData.description).toBe('Nav Description');
-    expect(navData).not.toHaveProperty('evilField');
-    expect(navData).not.toHaveProperty('config');
-  });
 });

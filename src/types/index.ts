@@ -113,6 +113,7 @@ export interface NavigatorRow {
   id: string;
   dao_id: string;
   navigator_address: string;
+  deployer?: string | null;
   permission: number;
   permission_label: string;
   is_active: boolean;

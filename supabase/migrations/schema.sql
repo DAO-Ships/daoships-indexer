@@ -226,6 +226,7 @@ BEGIN
             id VARCHAR(85) PRIMARY KEY,
             dao_id VARCHAR(42) NOT NULL REFERENCES %I.ds_daos(id) ON DELETE CASCADE,
             navigator_address VARCHAR(42) NOT NULL,
+            deployer VARCHAR(42),
 
             created_at TIMESTAMPTZ NOT NULL,
 

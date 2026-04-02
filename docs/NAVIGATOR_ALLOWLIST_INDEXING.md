@@ -97,8 +97,7 @@ function validateNavigatorAllowlist(p: Record<string, unknown>): Record<string, 
 ```typescript
 const TAG_DEFINITIONS: TagDefinition[] = [
   // ... existing tags ...
-  { tag: 'daoships.navigator.metadata', minTrust: 'SEMI_TRUSTED', updatesDao: false },
-  { tag: 'daoships.navigator.allowlist', minTrust: 'MEMBER', updatesDao: false },  // NEW
+  { tag: 'daoships.navigator.allowlist', minTrust: 'MEMBER', updatesDao: false },
 ];
 ```
 
@@ -107,8 +106,7 @@ const TAG_DEFINITIONS: TagDefinition[] = [
 ```typescript
 const TAG_VALIDATORS: Record<string, ContentValidator> = {
   // ... existing validators ...
-  'daoships.navigator.metadata': validateNavigatorMetadata,
-  'daoships.navigator.allowlist': validateNavigatorAllowlist,  // NEW
+  'daoships.navigator.allowlist': validateNavigatorAllowlist,
 };
 ```
 
