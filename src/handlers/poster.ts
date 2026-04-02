@@ -62,7 +62,7 @@ const TAG_DEFINITIONS: TagDefinition[] = [
   { tag: 'daoships.dao.announcement', minTrust: 'VERIFIED', updatesDao: false },
   { tag: 'daoships.member.profile', minTrust: 'MEMBER', updatesDao: false },
   { tag: 'daoships.proposal.vote.reason', minTrust: 'MEMBER', updatesDao: false },
-  { tag: 'daoships.navigator.metadata', minTrust: 'SEMI_TRUSTED', updatesDao: false },
+  { tag: 'daoships.navigator.metadata', minTrust: 'MEMBER', updatesDao: false },
   { tag: 'daoships.navigator.allowlist', minTrust: 'MEMBER', updatesDao: false },
 ];
 
