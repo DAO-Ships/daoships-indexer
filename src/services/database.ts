@@ -284,6 +284,35 @@ export class DatabaseService {
     logger.info({ blockNumber }, 'Deleted indexed events after block for reorg recovery');
   }
 
+  async reparentOrphanedRecords(daoAddress: string): Promise<void> {
+    const normalized = validateAndNormalizeAddress(daoAddress, 'daoAddress');
+    const { data, error } = await this.withDbTimeout(
+      this.client.rpc('ds_reparent_orphaned_records', { p_dao_address: normalized }),
+      'reparentOrphanedRecords',
+    );
+    if (error) {
+      logger.warn({ daoAddress: normalized, error: error.message }, 'Failed to reparent orphaned records (non-fatal)');
+      return;
+    }
+    if (data && data > 0) {
+      logger.info({ daoAddress: normalized, count: data }, 'Reparented orphaned allowlist records');
+    }
+  }
+
+  async pruneOrphanedRecords(retentionDays: number): Promise<void> {
+    const { data, error } = await this.withDbTimeout(
+      this.client.rpc('ds_prune_orphaned_records', { p_retention_days: retentionDays }),
+      'pruneOrphanedRecords',
+    );
+    if (error) {
+      logger.warn({ retentionDays, error: error.message }, 'Failed to prune orphaned records (non-fatal)');
+      return;
+    }
+    if (data && data > 0) {
+      logger.info({ retentionDays, deleted: data }, 'Pruned orphaned records');
+    }
+  }
+
   // ── Lookup Helpers ─────────────────────────────────────────────
 
   async *getAllDaosIterator(): AsyncGenerator<DaoSummary> {

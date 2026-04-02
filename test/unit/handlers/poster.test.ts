@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { handleNewPost } from '../../../src/handlers/poster.js';
 import {
   DAOSHIP, AVATAR, MEMBER1, MEMBER2, LAUNCHER, TX_HASH, NAVIGATOR,
-  makeCtx, makeMockDb, makeMockRegistry,
+  makeCtx, makeMockDb, makeMockBlockchain, makeMockRegistry,
 } from './helpers.js';
 
 // ── handleNewPost ────────────────────────────────────────────────
@@ -848,6 +848,171 @@ describe('content_json schema validation', () => {
     const json = getContentJson(db);
     expect(json).not.toHaveProperty('extraField');
     expect(json).not.toHaveProperty('malicious');
+  });
+
+  // ── navigator.allowlist: on-chain verification (pre-DAO) ───────
+
+  const VALID_ROOT = '0x' + 'ab'.repeat(32);
+  const VALID_NAV = '0x0000000000000000000000000000000000000007';
+  // ABI-encoded address: 12 bytes zero padding + 20 bytes address = 32 bytes
+  const ENCODED_DAOSHIP = '0x' + '0'.repeat(24) + DAOSHIP.slice(2);
+  const ENCODED_ROOT = VALID_ROOT;
+  const VALID_ALLOWLIST_CONTENT = {
+    schemaVersion: '1.0',
+    daoAddress: DAOSHIP,
+    navigatorAddress: VALID_NAV,
+    root: VALID_ROOT,
+    addresses: [MEMBER1],
+    treeDump: { format: 'standard-v1', values: [] },
+  };
+
+  it('navigator.allowlist accepted via on-chain verification when DAO does not exist', async () => {
+    const db = makeMockDb();
+    db.getDao.mockResolvedValue(null); // DAO doesn't exist
+    const blockchain = makeMockBlockchain();
+    blockchain.getCode.mockResolvedValue('0x6080604052');
+    blockchain.rawCall
+      .mockResolvedValueOnce(ENCODED_DAOSHIP) // daoShip()
+      .mockResolvedValueOnce(ENCODED_ROOT);   // allowlistRoot()
+    const ctx = makeCtx({
+      db, blockchain,
+      log: { address: '0x0000000000000000000000000000000000000099', index: 0, transactionHash: TX_HASH },
+    });
+    const tagHash = keccak('daoships.navigator.allowlist');
+    await handleNewPost(ctx, {
+      user: MEMBER1,
+      content: JSON.stringify(VALID_ALLOWLIST_CONTENT),
+      tag: tagHash,
+    });
+    expect(db.upsert).toHaveBeenCalledWith('ds_records', expect.objectContaining({
+      dao_id: null,
+      trust_level: 'ON_CHAIN_PROVISIONAL',
+      tag: 'daoships.navigator.allowlist',
+    }));
+  });
+
+  it('navigator.allowlist rejected when no contract code at navigatorAddress', async () => {
+    const db = makeMockDb();
+    db.getDao.mockResolvedValue(null);
+    const blockchain = makeMockBlockchain();
+    blockchain.getCode.mockResolvedValue('0x'); // no code
+    const ctx = makeCtx({
+      db, blockchain,
+      log: { address: '0x0000000000000000000000000000000000000099', index: 0, transactionHash: TX_HASH },
+    });
+    const tagHash = keccak('daoships.navigator.allowlist');
+    await handleNewPost(ctx, {
+      user: MEMBER1,
+      content: JSON.stringify(VALID_ALLOWLIST_CONTENT),
+      tag: tagHash,
+    });
+    expect(db.upsert).not.toHaveBeenCalled();
+  });
+
+  it('navigator.allowlist rejected when daoShip() mismatch', async () => {
+    const db = makeMockDb();
+    db.getDao.mockResolvedValue(null);
+    const blockchain = makeMockBlockchain();
+    blockchain.getCode.mockResolvedValue('0x6080604052');
+    const wrongDao = '0x' + '0'.repeat(24) + 'ff'.repeat(20);
+    blockchain.rawCall.mockResolvedValueOnce(wrongDao); // daoShip() returns wrong address
+    const ctx = makeCtx({
+      db, blockchain,
+      log: { address: '0x0000000000000000000000000000000000000099', index: 0, transactionHash: TX_HASH },
+    });
+    const tagHash = keccak('daoships.navigator.allowlist');
+    await handleNewPost(ctx, {
+      user: MEMBER1,
+      content: JSON.stringify(VALID_ALLOWLIST_CONTENT),
+      tag: tagHash,
+    });
+    expect(db.upsert).not.toHaveBeenCalled();
+  });
+
+  it('navigator.allowlist rejected when allowlistRoot() mismatch', async () => {
+    const db = makeMockDb();
+    db.getDao.mockResolvedValue(null);
+    const blockchain = makeMockBlockchain();
+    blockchain.getCode.mockResolvedValue('0x6080604052');
+    const wrongRoot = '0x' + 'ff'.repeat(32);
+    blockchain.rawCall
+      .mockResolvedValueOnce(ENCODED_DAOSHIP) // daoShip() matches
+      .mockResolvedValueOnce(wrongRoot);       // allowlistRoot() mismatch
+    const ctx = makeCtx({
+      db, blockchain,
+      log: { address: '0x0000000000000000000000000000000000000099', index: 0, transactionHash: TX_HASH },
+    });
+    const tagHash = keccak('daoships.navigator.allowlist');
+    await handleNewPost(ctx, {
+      user: MEMBER1,
+      content: JSON.stringify(VALID_ALLOWLIST_CONTENT),
+      tag: tagHash,
+    });
+    expect(db.upsert).not.toHaveBeenCalled();
+  });
+
+  it('navigator.allowlist rejected when rawCall reverts', async () => {
+    const db = makeMockDb();
+    db.getDao.mockResolvedValue(null);
+    const blockchain = makeMockBlockchain();
+    blockchain.getCode.mockResolvedValue('0x6080604052');
+    blockchain.rawCall.mockRejectedValue(new Error('execution reverted'));
+    const ctx = makeCtx({
+      db, blockchain,
+      log: { address: '0x0000000000000000000000000000000000000099', index: 0, transactionHash: TX_HASH },
+    });
+    const tagHash = keccak('daoships.navigator.allowlist');
+    // rawCall throws → propagates (transient error, processor retries block range)
+    await expect(handleNewPost(ctx, {
+      user: MEMBER1,
+      content: JSON.stringify(VALID_ALLOWLIST_CONTENT),
+      tag: tagHash,
+    })).rejects.toThrow('execution reverted');
+  });
+
+  it('navigator.allowlist uses normal trust path when DAO exists (no RPC calls)', async () => {
+    const db = makeMockDb();
+    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, launcher: LAUNCHER });
+    db.getMember.mockResolvedValue({ shares: '100' });
+    const blockchain = makeMockBlockchain();
+    const ctx = makeCtx({
+      db, blockchain,
+      log: { address: '0x0000000000000000000000000000000000000099', index: 0, transactionHash: TX_HASH },
+    });
+    const tagHash = keccak('daoships.navigator.allowlist');
+    await handleNewPost(ctx, {
+      user: MEMBER1,
+      content: JSON.stringify(VALID_ALLOWLIST_CONTENT),
+      tag: tagHash,
+    });
+    expect(db.upsert).toHaveBeenCalledWith('ds_records', expect.objectContaining({
+      dao_id: DAOSHIP,
+      trust_level: 'MEMBER',
+    }));
+    expect(blockchain.getCode).not.toHaveBeenCalled();
+    expect(blockchain.rawCall).not.toHaveBeenCalled();
+  });
+
+  it('navigator.allowlist dropped when DAO exists but trust insufficient (no fallback)', async () => {
+    const db = makeMockDb();
+    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, launcher: LAUNCHER });
+    db.getMember.mockResolvedValue(null); // not a member
+    const blockchain = makeMockBlockchain();
+    const ctx = makeCtx({
+      db, blockchain,
+      log: { address: '0x0000000000000000000000000000000000000099', index: 0, transactionHash: TX_HASH },
+    });
+    const tagHash = keccak('daoships.navigator.allowlist');
+    const randomWallet = '0x0000000000000000000000000000000000000042';
+    await handleNewPost(ctx, {
+      user: randomWallet,
+      content: JSON.stringify(VALID_ALLOWLIST_CONTENT),
+      tag: tagHash,
+    });
+    expect(db.upsert).not.toHaveBeenCalled();
+    // No fallback to on-chain verification
+    expect(blockchain.getCode).not.toHaveBeenCalled();
+    expect(blockchain.rawCall).not.toHaveBeenCalled();
   });
 
   // ── String limit enforcement (tightened) ───────────────────────

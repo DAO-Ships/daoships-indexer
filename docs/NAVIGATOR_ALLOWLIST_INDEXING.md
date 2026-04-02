@@ -14,11 +14,11 @@ The **deployer's wallet** (the human wallet that deployed the navigator contract
 
 ## Trust Level
 
-Use `MEMBER` trust. The deployer is typically a DAO member, but may not be a recognized navigator address in the registry yet (the `setNavigators` governance proposal hasn't been processed at this point — the navigator is deployed but not yet registered with the DAO).
+**When DAO exists**: Use `MEMBER` trust (normal path). The deployer is typically a DAO member.
 
-**Important:** Do NOT require `SEMI_TRUSTED`. The `SEMI_TRUSTED` level in `determineTrustLevel()` (poster.ts:39-40) checks `ctx.registry.getDaoByNavigatorAddress(user)`, which looks up whether `msg.sender` is a navigator contract. But for allowlist posts, `msg.sender` is the deployer wallet, not the navigator contract.
+**When DAO does not exist (pre-launch)**: Use `ON_CHAIN_PROVISIONAL` trust via on-chain verification (`getCode` + `daoShip()` + `allowlistRoot()`). See "On-Chain Verification" section below.
 
-**Validation alternative:** Instead of relying solely on trust level, the indexer can verify that the `navigatorAddress` in the content actually exists on-chain as a contract (code size > 0) and that its `allowlistRoot()` matches the `root` in the post. This confirms the post is legitimate without requiring the deployer to be a recognized navigator.
+**Important:** Do NOT require `SEMI_TRUSTED`. The deployer wallet is the `msg.sender`, not the navigator contract. If the DAO exists but the poster isn't a member, the post is dropped — no fallback to on-chain verification.
 
 ## Content Schema
 
@@ -154,17 +154,22 @@ The `treeDump` field contains the full Merkle tree structure. For a 100-address 
 
 The `ds_records.content_json` column (JSONB) can store this without issues. No special size handling is needed.
 
-## On-Chain Verification (Optional Enhancement)
+## On-Chain Verification (Mandatory for Pre-DAO Posts)
 
-For additional security, the indexer can verify the posted `root` matches the navigator contract's on-chain `allowlistRoot()` view function:
+When the DAO does not yet exist in the indexer (allowlist posted before DAO launch), the indexer verifies on-chain instead of using the normal DAO+trust path. Three checks are performed:
 
-```typescript
-const navigatorContract = new ethers.Contract(navigatorAddress, ['function allowlistRoot() view returns (bytes32)'], provider);
-const onChainRoot = await navigatorContract.allowlistRoot();
-if (onChainRoot.toLowerCase() !== root.toLowerCase()) {
-  logger.warn({ navigatorAddress, postedRoot: root, onChainRoot }, 'Allowlist root mismatch — rejecting post');
-  return; // Don't index
-}
-```
+1. **Contract existence**: `getCode(navigatorAddress)` — must have deployed code
+2. **DAO binding**: `daoShip()` — returned address must match posted `daoAddress` (prevents cross-DAO spoofing)
+3. **Root match**: `allowlistRoot()` — must match posted `root`
 
-This is optional but recommended — it prevents spam posts with fake allowlist data.
+If all three pass, the record is stored with `dao_id = NULL` and `trust_level = 'ON_CHAIN_PROVISIONAL'`. When the DAO eventually launches, `dao_id` is backfilled automatically (via `ds_reparent_orphaned_records`).
+
+When the DAO already exists, the normal trust path (MEMBER) is used. If trust fails, the post is dropped — **no fallback to on-chain verification** when the DAO exists.
+
+## Orphan Record Lifecycle
+
+Records stored with `dao_id = NULL` (pre-DAO) follow this lifecycle:
+
+1. **Posted**: Stored with `dao_id = NULL`, `trust_level = 'ON_CHAIN_PROVISIONAL'`
+2. **DAO launches**: `dao_id` backfilled to match the DAO (in launcher handler)
+3. **Pruning**: Unclaimed orphans (DAO never launched) deleted after configurable retention period (default 90 days, `ORPHAN_RETENTION_DAYS` env var). Pruning runs daily in the indexer polling loop.

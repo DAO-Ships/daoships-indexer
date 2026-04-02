@@ -81,6 +81,9 @@ export const config = {
   // Reorg detection
   reorgWalkBack: parseIntWithBounds(process.env.REORG_WALK_BACK, 10, 1, 1000, 'REORG_WALK_BACK'),
 
+  // Orphan record pruning (navigator.allowlist records with no DAO)
+  orphanRetentionDays: parseIntWithBounds(process.env.ORPHAN_RETENTION_DAYS, 90, 1, 365, 'ORPHAN_RETENTION_DAYS'),
+
   // Logging
   logLevel: validateLogLevel(process.env.LOG_LEVEL || 'info'),
 

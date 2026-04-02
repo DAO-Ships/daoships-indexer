@@ -89,6 +89,9 @@ export const handleLaunchDAOShipAndVault: EventHandler = async (
     txHash: ctx.log.transactionHash,
     createdAt: new Date(ctx.blockTimestamp * 1000).toISOString(),
   }));
+
+  // Reparent orphaned allowlist records posted before this DAO existed
+  await ctx.db.reparentOrphanedRecords(daoShipAddress);
 };
 
 /**
@@ -135,4 +138,7 @@ export const handleLaunchDAOShip: EventHandler = async (
     txHash: ctx.log.transactionHash,
     createdAt: new Date(ctx.blockTimestamp * 1000).toISOString(),
   }));
+
+  // Reparent orphaned allowlist records posted before this DAO existed
+  await ctx.db.reparentOrphanedRecords(daoShipAddress);
 };

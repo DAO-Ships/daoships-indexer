@@ -10,15 +10,16 @@ export const posterIface = new Interface(PosterAbi);
 
 // ── Trust Model ─────────────────────────────────────────────────
 
-type TrustLevel = 'VERIFIED' | 'VERIFIED_INITIAL' | 'SEMI_TRUSTED' | 'MEMBER' | 'UNTRUSTED';
+type TrustLevel = 'VERIFIED' | 'VERIFIED_INITIAL' | 'SEMI_TRUSTED' | 'ON_CHAIN_PROVISIONAL' | 'MEMBER' | 'UNTRUSTED';
 
 /** Trust level hierarchy for minimum-trust comparisons */
 const TRUST_RANK: Record<TrustLevel, number> = {
   UNTRUSTED: 0,
   MEMBER: 1,
-  SEMI_TRUSTED: 2,
-  VERIFIED_INITIAL: 3,
-  VERIFIED: 4,
+  ON_CHAIN_PROVISIONAL: 2,
+  SEMI_TRUSTED: 3,
+  VERIFIED_INITIAL: 4,
+  VERIFIED: 5,
 };
 
 function meetsMinTrust(actual: TrustLevel, required: TrustLevel): boolean {
@@ -162,6 +163,59 @@ function clean(obj: Record<string, unknown>): Record<string, unknown> {
 
 const ETH_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 const BYTES32_RE = /^0x[0-9a-fA-F]{64}$/;
+
+// ── On-Chain Verification for Pre-DAO Allowlist Posts ───────────
+
+const ALLOWLIST_ROOT_SELECTOR = keccak256('allowlistRoot()').slice(0, 10);
+const DAOSHIP_SELECTOR = keccak256('daoShip()').slice(0, 10);
+
+/**
+ * Verify navigator allowlist data on-chain when the DAO doesn't exist yet.
+ * Checks: contract exists, daoShip() matches claimed daoAddress, allowlistRoot() matches posted root.
+ * Throws on transient RPC errors (block range will be retried by processor).
+ * Returns false on deterministic failures (no code, mismatch).
+ */
+async function verifyAllowlistOnChain(
+  ctx: EventContext,
+  navigatorAddress: string,
+  daoAddress: string,
+  expectedRoot: string,
+): Promise<boolean> {
+  // 1. Verify contract exists
+  const code = await ctx.blockchain.getCode(navigatorAddress);
+  if (!code || code === '0x' || code === '0x0') {
+    logger.warn({ navigatorAddress }, 'navigator.allowlist: no contract code at navigatorAddress');
+    return false;
+  }
+
+  // 2. Verify daoShip() matches claimed daoAddress (prevents cross-DAO spoofing)
+  const daoShipResult = await ctx.blockchain.rawCall(navigatorAddress, DAOSHIP_SELECTOR);
+  if (!daoShipResult || daoShipResult.length < 66) {
+    logger.warn({ navigatorAddress, daoShipResult }, 'navigator.allowlist: daoShip() returned invalid data');
+    return false;
+  }
+  const onChainDaoShip = ('0x' + daoShipResult.slice(26)).toLowerCase();
+  if (onChainDaoShip !== daoAddress.toLowerCase()) {
+    logger.warn({ navigatorAddress, expected: daoAddress, onChain: onChainDaoShip },
+      'navigator.allowlist: daoShip mismatch — possible cross-DAO spoofing');
+    return false;
+  }
+
+  // 3. Verify allowlistRoot() matches posted root
+  const rootResult = await ctx.blockchain.rawCall(navigatorAddress, ALLOWLIST_ROOT_SELECTOR);
+  if (!rootResult || rootResult.length < 66) {
+    logger.warn({ navigatorAddress, rootResult }, 'navigator.allowlist: allowlistRoot() returned invalid data');
+    return false;
+  }
+  const onChainRoot = ('0x' + rootResult.slice(2).padStart(64, '0')).toLowerCase();
+  if (onChainRoot !== expectedRoot.toLowerCase()) {
+    logger.warn({ navigatorAddress, expected: expectedRoot, onChain: onChainRoot },
+      'navigator.allowlist: root mismatch');
+    return false;
+  }
+
+  return true;
+}
 
 // ── Tag-Specific Content Validators ─────────────────────────────
 
@@ -329,43 +383,94 @@ export async function handleNewPost(
     return;
   }
 
-  // ── Determine DAO ─────────────────────────────────────────────
-  // Try to extract daoAddress from the content payload itself.
+  // ── Determine DAO + Trust ──────────────────────────────────────
 
+  const isNavigatorAllowlist = tagName === 'daoships.navigator.allowlist';
   let daoId: string | null = null;
+  let trustLevel: TrustLevel = 'UNTRUSTED';
+  let trustDao: Awaited<ReturnType<typeof ctx.db.getDao>> = null;
 
-  if (parsed?.daoAddress) {
-    const candidate = String(parsed.daoAddress).toLowerCase();
-    try {
-      const dao = await ctx.db.getDao(candidate);
-      if (dao) {
-        daoId = candidate;
-      }
-    } catch (err) {
-      // Invalid address format in user-supplied content — not a real DAO, fall through
-      logger.debug({ candidate, err }, 'NewPost: daoAddress lookup failed, trying member fallback');
+  if (isNavigatorAllowlist && parsed?.daoAddress && parsed?.navigatorAddress && parsed?.root) {
+    // ── Navigator allowlist: on-chain verification path ────────
+    // The DAO may not exist yet (navigator deployed before DAO launch).
+    // Try normal path first; if DAO doesn't exist, verify on-chain.
+
+    const validator = TAG_VALIDATORS[tagName];
+    const preValidated = validator ? validator(parsed) : null;
+    if (!preValidated) {
+      logger.warn({ user, tagHash, tagName }, 'navigator.allowlist: schema validation failed, skipping');
+      return;
     }
-  }
 
-  if (!daoId) {
-    logger.warn(
-      { user, tagHash, tagName },
-      'NewPost: could not determine DAO, skipping',
-    );
-    return;
-  }
+    const claimedDao = String(preValidated.daoAddress).toLowerCase();
+    const navAddr = String(preValidated.navigatorAddress).toLowerCase();
+    const root = String(preValidated.root);
 
-  // ── Trust verification ────────────────────────────────────────
+    // Try normal DAO+trust path first
+    let normalPathSucceeded = false;
+    try {
+      const dao = await ctx.db.getDao(claimedDao);
+      if (dao) {
+        daoId = claimedDao;
+        const result = await determineTrustLevel(ctx, user, daoId, tagName);
+        trustLevel = result.trust;
+        trustDao = result.dao;
+        if (meetsMinTrust(trustLevel, tagDef.minTrust)) {
+          normalPathSucceeded = true;
+        } else {
+          // DAO exists but trust insufficient — NO fallback to on-chain
+          logger.warn({ user, daoId, tag: tagName, trustLevel, requiredTrust: tagDef.minTrust },
+            'NewPost: insufficient trust level, skipping');
+          return;
+        }
+      }
+    } catch {
+      // DAO lookup failed — fall through to on-chain verification
+    }
 
-  const { trust: trustLevel, dao: trustDao } = await determineTrustLevel(ctx, user, daoId, tagName);
-  const requiredTrust = tagDef.minTrust;
+    if (!normalPathSucceeded) {
+      // On-chain verification: getCode + daoShip() + allowlistRoot()
+      // Throws on transient RPC errors (processor retries block range).
+      const verified = await verifyAllowlistOnChain(ctx, navAddr, claimedDao, root);
+      if (!verified) {
+        logger.warn({ user, navigatorAddress: navAddr, daoAddress: claimedDao },
+          'navigator.allowlist: on-chain verification failed, skipping');
+        return;
+      }
+      daoId = null; // DAO doesn't exist yet — store as orphan
+      trustLevel = 'ON_CHAIN_PROVISIONAL';
+      logger.info({ daoAddress: claimedDao, navigatorAddress: navAddr },
+        'navigator.allowlist: verified via on-chain (pre-DAO)');
+    }
+  } else {
+    // ── Normal path for all other tags ─────────────────────────
 
-  if (!meetsMinTrust(trustLevel, requiredTrust)) {
-    logger.warn(
-      { user, daoId, tag: tagName, trustLevel, requiredTrust },
-      'NewPost: insufficient trust level, skipping',
-    );
-    return;
+    if (parsed?.daoAddress) {
+      const candidate = String(parsed.daoAddress).toLowerCase();
+      try {
+        const dao = await ctx.db.getDao(candidate);
+        if (dao) {
+          daoId = candidate;
+        }
+      } catch (err) {
+        logger.debug({ candidate, err }, 'NewPost: daoAddress lookup failed');
+      }
+    }
+
+    if (!daoId) {
+      logger.warn({ user, tagHash, tagName }, 'NewPost: could not determine DAO, skipping');
+      return;
+    }
+
+    const result = await determineTrustLevel(ctx, user, daoId, tagName);
+    trustLevel = result.trust;
+    trustDao = result.dao;
+
+    if (!meetsMinTrust(trustLevel, tagDef.minTrust)) {
+      logger.warn({ user, daoId, tag: tagName, trustLevel, requiredTrust: tagDef.minTrust },
+        'NewPost: insufficient trust level, skipping');
+      return;
+    }
   }
 
   // ── Validate content_json against tag-specific schema ─────────
@@ -382,8 +487,10 @@ export async function handleNewPost(
   }
 
   // ── Insert record ─────────────────────────────────────────────
+  // Use daoAddress from content for record ID (always present), even when dao_id is null.
 
-  const recordId = `${daoId}-${ctx.log.transactionHash}-${ctx.log.index}`;
+  const daoAddress = parsed?.daoAddress ? String(parsed.daoAddress).toLowerCase() : daoId;
+  const recordId = `${daoAddress}-${ctx.log.transactionHash}-${ctx.log.index}`;
 
   await ctx.db.upsert('ds_records', {
     id: recordId,
@@ -404,6 +511,7 @@ export async function handleNewPost(
   if (validatedJson && tagDef) {
     switch (tagDef.tag) {
       case 'daoships.dao.profile.initial': {
+        if (!daoId) break; // only possible in normal path where daoId is set
         // Permanently rejected once vault has posted dao.profile
         // Reuse trustDao from determineTrustLevel — no redundant fetch needed.
         const dao = trustDao;
@@ -421,6 +529,7 @@ export async function handleNewPost(
       }
 
       case 'daoships.dao.profile': {
+        if (!daoId) break;
         // Merge semantics: null removes, omitted unchanged, value sets
         const updates = extractDaoMetadataUpdates(validatedJson as Record<string, unknown>, parsed!);
         if (Object.keys(updates).length > 0) {

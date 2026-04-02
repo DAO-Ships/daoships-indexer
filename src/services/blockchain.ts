@@ -164,6 +164,15 @@ export class BlockchainService {
     );
   }
 
+  /** Rate-limited getCode — checks if an address has deployed contract code. */
+  async getCode(address: string): Promise<string> {
+    await this.rateLimit();
+    return this.withTrackedRetry(
+      () => this.provider.getCode(address),
+      `getCode(${address.slice(0, 10)})`,
+    );
+  }
+
   /**
    * Rate-limited raw eth_call — no retry (for best-effort probes like navigatorType()).
    * BAD_DATA or revert responses are deterministic, not transient, so retry is skipped.

@@ -365,6 +365,7 @@ async function main(): Promise<void> {
 
   const pollRetryTracker = new RetryTracker();
   const circuitBreaker = { failures: 0, isOpen: false, openUntil: 0 };
+  let lastPruneTime = 0;
 
   logger.info(
     { lastProcessedBlock, pollIntervalMs: config.pollIntervalMs },
@@ -492,6 +493,16 @@ async function main(): Promise<void> {
 
       await sleep(retryDelay);
       continue;
+    }
+
+    // Daily orphan record pruning (pre-DAO allowlist records that were never claimed)
+    if (Date.now() - lastPruneTime > 86_400_000) {
+      try {
+        await db.pruneOrphanedRecords(config.orphanRetentionDays);
+        lastPruneTime = Date.now();
+      } catch (err) {
+        logger.warn({ err }, 'Orphan record pruning failed (non-fatal)');
+      }
     }
 
     // Only sleep when caught up — skip sleep if there may be more blocks to process

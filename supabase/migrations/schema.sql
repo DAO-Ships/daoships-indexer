@@ -266,7 +266,7 @@ BEGIN
     EXECUTE format('
         CREATE TABLE IF NOT EXISTS %I.ds_records (
             id VARCHAR(130) PRIMARY KEY,
-            dao_id VARCHAR(42) NOT NULL REFERENCES %I.ds_daos(id) ON DELETE CASCADE,
+            dao_id VARCHAR(42) REFERENCES %I.ds_daos(id) ON DELETE CASCADE,
 
             created_at TIMESTAMPTZ NOT NULL,
             user_address VARCHAR(42) NOT NULL,
@@ -386,6 +386,8 @@ BEGIN
     EXECUTE format('CREATE INDEX IF NOT EXISTS idx_ds_votes_block ON %I.ds_votes(block_number)', s);
     EXECUTE format('CREATE INDEX IF NOT EXISTS idx_ds_ragequits_block ON %I.ds_ragequits(block_number)', s);
     EXECUTE format('CREATE INDEX IF NOT EXISTS idx_ds_records_block ON %I.ds_records(block_number)', s);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS idx_ds_records_orphaned ON %I.ds_records(created_at) WHERE dao_id IS NULL', s);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS idx_ds_records_navigator_addr ON %I.ds_records((content_json->>''navigatorAddress'')) WHERE tag = ''daoships.navigator.allowlist''', s);
     EXECUTE format('CREATE INDEX IF NOT EXISTS idx_ds_proposals_block ON %I.ds_proposals(block_number)', s);
 
     -- ═══════════════════════════════════════════════════════════════════
@@ -531,6 +533,41 @@ BEGIN
         END;
         $fn$ LANGUAGE plpgsql
     ', s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s);
+
+    -- Prune orphaned records (dao_id IS NULL) older than retention period
+    EXECUTE format('
+        CREATE OR REPLACE FUNCTION %I.ds_prune_orphaned_records(
+            p_retention_days INTEGER
+        ) RETURNS INTEGER AS $fn$
+        DECLARE
+            deleted INTEGER;
+        BEGIN
+            DELETE FROM %I.ds_records
+            WHERE dao_id IS NULL
+              AND created_at < NOW() - (p_retention_days || '' days'')::INTERVAL;
+            GET DIAGNOSTICS deleted = ROW_COUNT;
+            RETURN deleted;
+        END;
+        $fn$ LANGUAGE plpgsql
+    ', s, s);
+
+    -- Reparent orphaned allowlist records when a DAO is created
+    EXECUTE format('
+        CREATE OR REPLACE FUNCTION %I.ds_reparent_orphaned_records(
+            p_dao_address VARCHAR(42)
+        ) RETURNS INTEGER AS $fn$
+        DECLARE
+            updated INTEGER;
+        BEGIN
+            UPDATE %I.ds_records SET dao_id = p_dao_address
+            WHERE dao_id IS NULL
+              AND tag = ''daoships.navigator.allowlist''
+              AND content_json->>''daoAddress'' = p_dao_address;
+            GET DIAGNOSTICS updated = ROW_COUNT;
+            RETURN updated;
+        END;
+        $fn$ LANGUAGE plpgsql
+    ', s, s);
 
     -- ═══════════════════════════════════════════════════════════════════
     -- ROW LEVEL SECURITY
@@ -686,6 +723,8 @@ BEGIN
     EXECUTE format('DROP FUNCTION IF EXISTS %I.ds_increment_proposal_count CASCADE', s);
     EXECUTE format('DROP FUNCTION IF EXISTS %I.ds_update_active_member_count CASCADE', s);
     EXECUTE format('DROP FUNCTION IF EXISTS %I.ds_delete_events_after_block CASCADE', s);
+    EXECUTE format('DROP FUNCTION IF EXISTS %I.ds_prune_orphaned_records CASCADE', s);
+    EXECUTE format('DROP FUNCTION IF EXISTS %I.ds_reparent_orphaned_records CASCADE', s);
 
     -- 4. Drop the schema itself (only if empty after our cleanup)
     EXECUTE format('DROP SCHEMA IF EXISTS %I CASCADE', s);

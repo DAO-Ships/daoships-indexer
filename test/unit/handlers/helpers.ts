@@ -39,6 +39,8 @@ export function makeMockDb() {
     incrementProposalCount: vi.fn().mockResolvedValue(undefined),
     updateActiveMemberCount: vi.fn().mockResolvedValue(undefined),
     updateNavigator: vi.fn().mockResolvedValue(undefined),
+    reparentOrphanedRecords: vi.fn().mockResolvedValue(undefined),
+    pruneOrphanedRecords: vi.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -46,6 +48,7 @@ export function makeMockBlockchain() {
   return {
     callContract: vi.fn().mockResolvedValue(''),
     rawCall: vi.fn().mockResolvedValue('0x'),
+    getCode: vi.fn().mockResolvedValue('0x'),
     getLogs: vi.fn().mockResolvedValue([]),
     getTransaction: vi.fn().mockResolvedValue(null),
   };
