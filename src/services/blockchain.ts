@@ -167,8 +167,10 @@ export class BlockchainService {
   /** Rate-limited getCode — checks if an address has deployed contract code. */
   async getCode(address: string): Promise<string> {
     await this.rateLimit();
+    // Quai Network requires EIP-55 checksummed addresses for quai_getCode
+    const checksummed = quais.getAddress(address);
     return this.withTrackedRetry(
-      () => this.provider.getCode(address),
+      () => this.provider.getCode(checksummed),
       `getCode(${address.slice(0, 10)})`,
     );
   }
@@ -179,8 +181,10 @@ export class BlockchainService {
    */
   async rawCall(to: string, data: string): Promise<string> {
     await this.rateLimit();
+    // Quai Network requires EIP-55 checksummed addresses
+    const checksummedTo = quais.getAddress(to);
     const result = await Promise.race([
-      this.provider.call({ to, from: '0x0000000000000000000000000000000000000000', data }),
+      this.provider.call({ to: checksummedTo, from: '0x0000000000000000000000000000000000000000', data }),
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error('rawCall timeout (10s)')), 10_000)),
     ]);
     return result;
