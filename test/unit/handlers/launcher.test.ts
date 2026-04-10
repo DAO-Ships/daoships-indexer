@@ -40,7 +40,7 @@ describe('handleLaunchDAOShipAndVault', () => {
       shares_address: SHARES,
       avatar: AVATAR,
       new_vault: true, // newVault=true → new_vault=true
-      launcher: LAUNCHER,
+      deployer: LAUNCHER,
       tx_hash: TX_HASH,
     }));
   });

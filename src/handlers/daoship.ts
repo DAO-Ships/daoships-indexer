@@ -551,25 +551,45 @@ export const handleNavigatorSet: EventHandler = async (
     }
   }
 
-  await ctx.db.upsert('ds_navigators', {
-    id,
-    dao_id: daoId,
-    navigator_address: navigatorAddress,
-    deployer: deployerAddress,
-    permission,
-    permission_label: permissionToLabel(permission),
-    is_active: permission > 0,
-    navigator_type: navigatorType,
-    name: navName,
-    description: navDescription,
-    created_at: new Date(ctx.blockTimestamp * 1000).toISOString(),
-    tx_hash: ctx.log.transactionHash,
-  });
+  const now = new Date(ctx.blockTimestamp * 1000).toISOString();
+  if (permission === 0) {
+    // Deactivation: only update status fields, preserve existing metadata
+    await ctx.db.upsert('ds_navigators', {
+      id,
+      dao_id: daoId,
+      navigator_address: navigatorAddress,
+      permission,
+      permission_label: permissionToLabel(permission),
+      is_active: false,
+      created_at: now,
+      tx_hash: ctx.log.transactionHash,
+      updated_at: now,
+    });
+  } else {
+    // Activation/update: full upsert with metadata from NavigatorDeployed
+    await ctx.db.upsert('ds_navigators', {
+      id,
+      dao_id: daoId,
+      navigator_address: navigatorAddress,
+      deployer: deployerAddress,
+      permission,
+      permission_label: permissionToLabel(permission),
+      is_active: true,
+      navigator_type: navigatorType,
+      name: navName,
+      description: navDescription,
+      created_at: now,
+      tx_hash: ctx.log.transactionHash,
+      updated_at: now,
+    });
+  }
 
   // Register navigator for log fetching — only if this NavigatorSet came from a known DAOShip
   if (ctx.registry.getDaoByDaoShipAddress(daoId)) {
     if (permission > 0) {
       ctx.registry.registerNavigator(navigatorAddress, daoId);
+      // Reparent orphaned allowlist records for this specific navigator+DAO pair
+      await ctx.db.reparentOrphanedRecords(daoId, navigatorAddress);
     } else {
       ctx.registry.unregisterNavigator(navigatorAddress);
       evictNavigatorFromCache(navigatorAddress);

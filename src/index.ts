@@ -365,7 +365,7 @@ async function main(): Promise<void> {
 
   const pollRetryTracker = new RetryTracker();
   const circuitBreaker = { failures: 0, isOpen: false, openUntil: 0 };
-  let lastPruneTime = 0;
+  let lastPruneTime = Date.now();
 
   logger.info(
     { lastProcessedBlock, pollIntervalMs: config.pollIntervalMs },
@@ -532,11 +532,8 @@ let sleepResolve: (() => void) | null = null;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
-    sleepResolve = resolve;
-    setTimeout(() => {
-      sleepResolve = null;
-      resolve();
-    }, ms);
+    const timer = setTimeout(() => { sleepResolve = null; resolve(); }, ms);
+    sleepResolve = () => { clearTimeout(timer); sleepResolve = null; resolve(); };
   });
 }
 

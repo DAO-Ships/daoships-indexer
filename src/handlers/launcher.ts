@@ -16,7 +16,8 @@ function buildDaoSkeleton(fields: {
   sharesAddress: string;
   lootAddress: string;
   avatar: string;
-  launcher: string;
+  deployer: string;
+  launcherContract: string;
   newVault: boolean;
   txHash: string;
   createdAt: string;
@@ -25,7 +26,8 @@ function buildDaoSkeleton(fields: {
     id: fields.id,
     created_at: fields.createdAt,
     updated_at: fields.createdAt,
-    launcher: fields.launcher,
+    deployer: fields.deployer,
+    launcher_contract: fields.launcherContract,
     tx_hash: fields.txHash,
     loot_address: fields.lootAddress,
     shares_address: fields.sharesAddress,
@@ -72,8 +74,10 @@ export const handleLaunchDAOShipAndVault: EventHandler = async (
   const newVault = Boolean(validated.newVault);
   const launcher = validateAndNormalizeAddress(validated.launcher, 'launcher');
 
+  // launcher param = the real deployer wallet (msg.sender, enforced on-chain)
+  // ctx.log.address = the DAOShipAndVaultLauncher contract
   logger.info(
-    { daoShip: daoShipAddress, vault: vaultAddress, launcher },
+    { daoShip: daoShipAddress, vault: vaultAddress, deployer: launcher },
     'LaunchDAOShipAndVault - registering new DAO',
   );
 
@@ -84,14 +88,12 @@ export const handleLaunchDAOShipAndVault: EventHandler = async (
     sharesAddress,
     lootAddress,
     avatar: vaultAddress,
-    launcher,
+    deployer: launcher,
+    launcherContract: ctx.log.address.toLowerCase(),
     newVault,
     txHash: ctx.log.transactionHash,
     createdAt: new Date(ctx.blockTimestamp * 1000).toISOString(),
   }));
-
-  // Reparent orphaned allowlist records posted before this DAO existed
-  await ctx.db.reparentOrphanedRecords(daoShipAddress);
 };
 
 /**
@@ -121,8 +123,11 @@ export const handleLaunchDAOShip: EventHandler = async (
     return;
   }
 
+  // For vault-launched DAOs, this fires first with launcher = vault launcher contract.
+  // The subsequent LaunchDAOShipAndVault upsert overwrites with the correct EOA deployer.
+  // For direct launches (no vault launcher), launcher IS the deployer.
   logger.info(
-    { daoShip: daoShipAddress, avatar: avatarAddress, launcher },
+    { daoShip: daoShipAddress, avatar: avatarAddress, deployer: launcher },
     'LaunchDAOShip - registering new DAO (direct launch)',
   );
 
@@ -133,12 +138,10 @@ export const handleLaunchDAOShip: EventHandler = async (
     sharesAddress,
     lootAddress,
     avatar: avatarAddress,
-    launcher,
-    newVault: false, // LaunchDAOShip always uses a pre-existing vault
+    deployer: launcher,
+    launcherContract: ctx.log.address.toLowerCase(),
+    newVault: false,
     txHash: ctx.log.transactionHash,
     createdAt: new Date(ctx.blockTimestamp * 1000).toISOString(),
   }));
-
-  // Reparent orphaned allowlist records posted before this DAO existed
-  await ctx.db.reparentOrphanedRecords(daoShipAddress);
 };

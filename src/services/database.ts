@@ -284,18 +284,19 @@ export class DatabaseService {
     logger.info({ blockNumber }, 'Deleted indexed events after block for reorg recovery');
   }
 
-  async reparentOrphanedRecords(daoAddress: string): Promise<void> {
-    const normalized = validateAndNormalizeAddress(daoAddress, 'daoAddress');
+  async reparentOrphanedRecords(daoAddress: string, navigatorAddress: string): Promise<void> {
+    const normalizedDao = validateAndNormalizeAddress(daoAddress, 'daoAddress');
+    const normalizedNav = validateAndNormalizeAddress(navigatorAddress, 'navigatorAddress');
     const { data, error } = await this.withDbTimeout(
-      this.client.rpc('ds_reparent_orphaned_records', { p_dao_address: normalized }),
+      this.client.rpc('ds_reparent_orphaned_records', { p_dao_address: normalizedDao, p_navigator_address: normalizedNav }),
       'reparentOrphanedRecords',
     );
     if (error) {
-      logger.warn({ daoAddress: normalized, error: error.message }, 'Failed to reparent orphaned records (non-fatal)');
+      logger.warn({ daoAddress: normalizedDao, navigatorAddress: normalizedNav, error: error.message }, 'Failed to reparent orphaned records (non-fatal)');
       return;
     }
     if (data && data > 0) {
-      logger.info({ daoAddress: normalized, count: data }, 'Reparented orphaned allowlist records');
+      logger.info({ daoAddress: normalizedDao, navigatorAddress: normalizedNav, count: data }, 'Reparented orphaned allowlist records');
     }
   }
 

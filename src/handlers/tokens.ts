@@ -151,6 +151,7 @@ export async function handleDelegateChanged(
     member_address: delegator,
     delegating_to: delegatingTo,
     created_at: now,
+    updated_at: now,
     last_activity_at: now,
   });
 
@@ -188,6 +189,7 @@ export async function handleDelegateVotesChanged(
     member_address: delegate,
     voting_power: bigintToString(newBalance),
     created_at: now,
+    updated_at: now,
     last_activity_at: now,
   });
 
@@ -214,7 +216,7 @@ async function handlePauseState(ctx: EventContext, paused: boolean): Promise<voi
 
   const navDaoId = ctx.registry.getDaoByNavigatorAddress(addr);
   if (navDaoId) {
-    await ctx.db.updateNavigator(`${navDaoId}-${addr}`, { paused });
+    await ctx.db.updateNavigator(`${navDaoId}-${addr}`, { paused, updated_at: new Date(ctx.blockTimestamp * 1000).toISOString() });
     logger.info({ daoId: navDaoId, navigator: addr }, `Navigator ${label}`);
     return;
   }

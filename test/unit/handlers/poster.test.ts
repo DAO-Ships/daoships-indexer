@@ -12,7 +12,7 @@ describe('handleNewPost', () => {
 
   it('resolves DAO from content.daoAddress and upserts record with recognized tag', async () => {
     const db = makeMockDb();
-    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, launcher: LAUNCHER });
+    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, deployer: LAUNCHER, launcher_contract: LAUNCHER });
     db.getMember.mockResolvedValue({ shares: '100' });
     const ctx = makeCtx({
       db,
@@ -61,7 +61,7 @@ describe('handleNewPost', () => {
 
   it('rejects non-JSON content (not stored as raw text)', async () => {
     const db = makeMockDb();
-    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, launcher: LAUNCHER });
+    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, deployer: LAUNCHER, launcher_contract: LAUNCHER });
     const ctx = makeCtx({ db });
     const { id: keccak256 } = await import('quais');
     const tagHash = keccak256('daoships.member.profile');
@@ -73,7 +73,7 @@ describe('handleNewPost', () => {
 
   it('hard rejects content exceeding 16KB', async () => {
     const db = makeMockDb();
-    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, launcher: LAUNCHER });
+    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, deployer: LAUNCHER, launcher_contract: LAUNCHER });
     db.getMember.mockResolvedValue({ shares: '100' });
     const ctx = makeCtx({ db });
     const { id: keccak256 } = await import('quais');
@@ -88,7 +88,7 @@ describe('handleNewPost', () => {
 
   it('rejects posts missing schemaVersion', async () => {
     const db = makeMockDb();
-    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, launcher: LAUNCHER });
+    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, deployer: LAUNCHER, launcher_contract: LAUNCHER });
     db.getMember.mockResolvedValue({ shares: '100' });
     const ctx = makeCtx({
       db,
@@ -109,7 +109,7 @@ describe('handleNewPost', () => {
 
   it('updates DAO name/description for daoships.dao.profile.initial tag', async () => {
     const db = makeMockDb();
-    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, launcher: LAUNCHER });
+    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, deployer: LAUNCHER, launcher_contract: LAUNCHER });
     const ctx = makeCtx({ db });
     const profileContent = JSON.stringify({
       schemaVersion: '1.0',
@@ -130,7 +130,7 @@ describe('handleNewPost', () => {
 
   it('ignores invalid avatar URL schemes', async () => {
     const db = makeMockDb();
-    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, launcher: LAUNCHER });
+    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, deployer: LAUNCHER, launcher_contract: LAUNCHER });
     const ctx = makeCtx({ db });
     const { id: keccak256 } = await import('quais');
     const tagHash = keccak256('daoships.dao.profile.initial');
@@ -151,7 +151,7 @@ describe('handleNewPost', () => {
 
   it('accepts http/https/ipfs avatar URL schemes', async () => {
     const db = makeMockDb();
-    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, launcher: LAUNCHER });
+    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, deployer: LAUNCHER, launcher_contract: LAUNCHER });
     const ctx = makeCtx({ db });
     const { id: keccak256 } = await import('quais');
     const tagHash = keccak256('daoships.dao.profile.initial');
@@ -183,7 +183,7 @@ describe('handleNewPost', () => {
     const tagHash = keccak256('daoships.dao.profile');
     const randomWallet = '0x0000000000000000000000000000000000000099';
 
-    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, launcher: LAUNCHER });
+    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, deployer: LAUNCHER, launcher_contract: LAUNCHER });
     db.getMember.mockResolvedValue(null);
     const registry = makeMockRegistry();
     registry.getDaoByNavigatorAddress.mockReturnValue(undefined);
@@ -205,7 +205,7 @@ describe('handleNewPost', () => {
     const { id: keccak256 } = await import('quais');
     const tagHash = keccak256('daoships.dao.profile');
 
-    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, launcher: LAUNCHER });
+    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, deployer: LAUNCHER, launcher_contract: LAUNCHER });
     const ctx = makeCtx({
       db,
       log: { address: '0x0000000000000000000000000000000000000099', index: 0, transactionHash: TX_HASH },
@@ -226,7 +226,7 @@ describe('handleNewPost', () => {
     const { id: keccak256 } = await import('quais');
     const tagHash = keccak256('daoships.dao.profile.initial');
 
-    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, launcher: LAUNCHER, profile_source: null });
+    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, deployer: LAUNCHER, launcher_contract: LAUNCHER, profile_source: null });
     const ctx = makeCtx({
       db,
       log: { address: '0x0000000000000000000000000000000000000099', index: 0, transactionHash: TX_HASH },
@@ -248,7 +248,7 @@ describe('handleNewPost', () => {
     const tagHash = keccak256('daoships.dao.profile.initial');
 
     // profile_source is already 'vault' => permanently rejected
-    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, launcher: LAUNCHER, profile_source: 'vault' });
+    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, deployer: LAUNCHER, launcher_contract: LAUNCHER, profile_source: 'vault' });
     const ctx = makeCtx({
       db,
       log: { address: '0x0000000000000000000000000000000000000099', index: 0, transactionHash: TX_HASH },
@@ -271,7 +271,7 @@ describe('handleNewPost', () => {
     const tagHash = keccak256('daoships.dao.announcement');
 
     // Navigator has SEMI_TRUSTED trust, but announcement now requires VERIFIED
-    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, launcher: LAUNCHER });
+    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, deployer: LAUNCHER, launcher_contract: LAUNCHER });
     db.getMember.mockResolvedValue(null);
     const registry = makeMockRegistry();
     registry.getDaoByNavigatorAddress.mockReturnValue(DAOSHIP); // makes user SEMI_TRUSTED
@@ -293,7 +293,7 @@ describe('handleNewPost', () => {
     const { id: keccak256 } = await import('quais');
     const tagHash = keccak256('daoships.dao.announcement');
 
-    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, launcher: LAUNCHER });
+    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, deployer: LAUNCHER, launcher_contract: LAUNCHER });
     const ctx = makeCtx({
       db,
       log: { address: '0x0000000000000000000000000000000000000099', index: 0, transactionHash: TX_HASH },
@@ -313,7 +313,7 @@ describe('handleNewPost', () => {
     const { id: keccak256 } = await import('quais');
     const tagHash = keccak256('daoships.dao.profile');
 
-    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, launcher: LAUNCHER });
+    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, deployer: LAUNCHER, launcher_contract: LAUNCHER });
     const ctx = makeCtx({
       db,
       log: { address: '0x0000000000000000000000000000000000000099', index: 0, transactionHash: TX_HASH },
@@ -354,7 +354,7 @@ describe('content_json schema validation', () => {
     registrySetup?: (reg: ReturnType<typeof makeMockRegistry>) => void;
   }) {
     const db = makeMockDb();
-    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, launcher: LAUNCHER });
+    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, deployer: LAUNCHER, launcher_contract: LAUNCHER });
     db.getMember.mockResolvedValue({ shares: '100' });
     opts.dbSetup?.(db);
     const registry = makeMockRegistry();
@@ -386,7 +386,7 @@ describe('content_json schema validation', () => {
 
   it('rejects post with missing schemaVersion (no record stored)', async () => {
     const db = makeMockDb();
-    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, launcher: LAUNCHER });
+    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, deployer: LAUNCHER, launcher_contract: LAUNCHER });
     db.getMember.mockResolvedValue({ shares: '100' });
     const ctx = makeCtx({
       db,
@@ -402,7 +402,7 @@ describe('content_json schema validation', () => {
 
   it('rejects non-JSON content (no record stored)', async () => {
     const db = makeMockDb();
-    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, launcher: LAUNCHER });
+    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, deployer: LAUNCHER, launcher_contract: LAUNCHER });
     const ctx = makeCtx({
       db,
       log: { address: '0x0000000000000000000000000000000000000099', index: 0, transactionHash: TX_HASH },
@@ -416,7 +416,7 @@ describe('content_json schema validation', () => {
 
   it('hard rejects content exceeding 16KB (no record stored)', async () => {
     const db = makeMockDb();
-    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, launcher: LAUNCHER });
+    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, deployer: LAUNCHER, launcher_contract: LAUNCHER });
     db.getMember.mockResolvedValue({ shares: '100' });
     const ctx = makeCtx({
       db,
@@ -551,7 +551,7 @@ describe('content_json schema validation', () => {
         description: 'Should not apply',
       },
       dbSetup: (db) => {
-        db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, launcher: LAUNCHER, profile_source: 'vault' });
+        db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, deployer: LAUNCHER, launcher_contract: LAUNCHER, profile_source: 'vault' });
       },
     });
     // Record is stored but updateDao is NOT called
@@ -951,7 +951,7 @@ describe('content_json schema validation', () => {
     expect(db.upsert).not.toHaveBeenCalled();
   });
 
-  it('navigator.allowlist rejected when rawCall reverts', async () => {
+  it('navigator.allowlist rejected when rawCall reverts (deterministic)', async () => {
     const db = makeMockDb();
     db.getDao.mockResolvedValue(null);
     const blockchain = makeMockBlockchain();
@@ -962,17 +962,18 @@ describe('content_json schema validation', () => {
       log: { address: '0x0000000000000000000000000000000000000099', index: 0, transactionHash: TX_HASH },
     });
     const tagHash = keccak('daoships.navigator.allowlist');
-    // rawCall throws → propagates (transient error, processor retries block range)
-    await expect(handleNewPost(ctx, {
+    // rawCall revert is deterministic — post dropped, not retried
+    await handleNewPost(ctx, {
       user: MEMBER1,
       content: JSON.stringify(VALID_ALLOWLIST_CONTENT),
       tag: tagHash,
-    })).rejects.toThrow('execution reverted');
+    });
+    expect(db.upsert).not.toHaveBeenCalled();
   });
 
   it('navigator.allowlist uses normal trust path when DAO exists (no RPC calls)', async () => {
     const db = makeMockDb();
-    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, launcher: LAUNCHER });
+    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, deployer: LAUNCHER, launcher_contract: LAUNCHER });
     db.getMember.mockResolvedValue({ shares: '100' });
     const blockchain = makeMockBlockchain();
     const ctx = makeCtx({
@@ -995,7 +996,7 @@ describe('content_json schema validation', () => {
 
   it('navigator.allowlist dropped when DAO exists but trust insufficient (no fallback)', async () => {
     const db = makeMockDb();
-    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, launcher: LAUNCHER });
+    db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, deployer: LAUNCHER, launcher_contract: LAUNCHER });
     db.getMember.mockResolvedValue(null); // not a member
     const blockchain = makeMockBlockchain();
     const ctx = makeCtx({
@@ -1013,6 +1014,61 @@ describe('content_json schema validation', () => {
     // No fallback to on-chain verification
     expect(blockchain.getCode).not.toHaveBeenCalled();
     expect(blockchain.rawCall).not.toHaveBeenCalled();
+  });
+
+  // ── navigator.allowlist: ipfsCid format ────────────────────────
+
+  it('navigator.allowlist with ipfsCid only — accepted', async () => {
+    const { db } = await postAndGetContentJson({
+      tag: 'daoships.navigator.allowlist',
+      user: MEMBER1,
+      content: {
+        schemaVersion: '1.0',
+        daoAddress: DAOSHIP,
+        navigatorAddress: VALID_NAV,
+        root: VALID_ROOT,
+        ipfsCid: 'bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi',
+      },
+    });
+    const json = getContentJson(db);
+    expect(json).toBeTruthy();
+    expect(json!.ipfsCid).toBe('bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi');
+    expect(json).not.toHaveProperty('addresses');
+    expect(json).not.toHaveProperty('treeDump');
+  });
+
+  it('navigator.allowlist rejects both ipfsCid and inline data', async () => {
+    const { db } = await postAndGetContentJson({
+      tag: 'daoships.navigator.allowlist',
+      user: MEMBER1,
+      content: {
+        schemaVersion: '1.0',
+        daoAddress: DAOSHIP,
+        navigatorAddress: VALID_NAV,
+        root: VALID_ROOT,
+        ipfsCid: 'bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi',
+        addresses: [MEMBER1],
+        treeDump: { format: 'standard-v1', values: [] },
+      },
+    });
+    const json = getContentJson(db);
+    expect(json).toBeNull();
+  });
+
+  it('navigator.allowlist rejects invalid CID format', async () => {
+    const { db } = await postAndGetContentJson({
+      tag: 'daoships.navigator.allowlist',
+      user: MEMBER1,
+      content: {
+        schemaVersion: '1.0',
+        daoAddress: DAOSHIP,
+        navigatorAddress: VALID_NAV,
+        root: VALID_ROOT,
+        ipfsCid: 'not-a-valid-cid',
+      },
+    });
+    const json = getContentJson(db);
+    expect(json).toBeNull();
   });
 
   // ── String limit enforcement (tightened) ───────────────────────

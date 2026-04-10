@@ -13,7 +13,8 @@ export interface DaoRow {
   shares_address: string;
   loot_address: string;
   avatar: string;
-  launcher: string | null;
+  deployer?: string | null;
+  launcher_contract: string;
   default_expiry_window: number;
   new_vault: boolean;
   voting_period: number;
@@ -121,8 +122,10 @@ export interface NavigatorRow {
   navigator_type: string | null;
   name?: string;
   description?: string;
+  config?: Record<string, unknown> | null;
   created_at: string;
   tx_hash: string;
+  updated_at?: string;
 }
 
 export interface RagequitRow {
@@ -141,7 +144,7 @@ export interface RagequitRow {
 
 export interface RecordRow {
   id: string;
-  dao_id: string;
+  dao_id: string | null;
   created_at: string;
   user_address: string;
   tx_hash: string;

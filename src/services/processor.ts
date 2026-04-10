@@ -229,10 +229,11 @@ export class BlockProcessor {
    * DAOs/tokens/navigators are found during processing).
    */
   private async fetchLogsForAddresses(addresses: string[], fromBlock: number, toBlock: number): Promise<Log[]> {
+    const registeredTopics = this.dispatcher.getRegisteredTopics();
     const allLogs: Log[] = [];
     for (let i = 0; i < addresses.length; i += GET_LOGS_ADDRESS_CHUNK_SIZE) {
       const batch = addresses.slice(i, i + GET_LOGS_ADDRESS_CHUNK_SIZE);
-      const logs = await this.blockchain.getLogs(batch, fromBlock, toBlock);
+      const logs = await this.blockchain.getLogs(batch, fromBlock, toBlock, [registeredTopics]);
       allLogs.push(...logs);
     }
     return allLogs;
@@ -260,17 +261,20 @@ export class BlockProcessor {
       ...this.registry.getAllNavigatorAddresses(),
     ]);
 
-    // Single RPC call: fetch all logs matching our topic0 hashes, scoped to
-    // known addresses. Server-side address filter avoids pulling chain-wide
-    // Transfer events (topic0 0xddf252ad matches all ERC20/ERC721 transfers).
+    // Fetch logs matching our topic0 hashes, scoped to known addresses.
+    // Server-side address filter avoids pulling chain-wide Transfer events.
+    // Batch into chunks if address list exceeds RPC provider limits.
     const addressFilter = [...knownAddresses];
-    const allLogs = await this.blockchain.getLogs(
-      addressFilter,
-      fromBlock,
-      toBlock,
-      [registeredTopics],  // topics[0] = array of topic0 hashes (OR)
-    );
+    if (addressFilter.length <= GET_LOGS_ADDRESS_CHUNK_SIZE) {
+      return this.blockchain.getLogs(addressFilter, fromBlock, toBlock, [registeredTopics]);
+    }
 
+    const allLogs: Log[] = [];
+    for (let i = 0; i < addressFilter.length; i += GET_LOGS_ADDRESS_CHUNK_SIZE) {
+      const batch = addressFilter.slice(i, i + GET_LOGS_ADDRESS_CHUNK_SIZE);
+      const logs = await this.blockchain.getLogs(batch, fromBlock, toBlock, [registeredTopics]);
+      allLogs.push(...logs);
+    }
     return allLogs;
   }
 

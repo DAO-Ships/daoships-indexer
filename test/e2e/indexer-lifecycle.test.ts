@@ -220,17 +220,42 @@ async function withTestRetry(
 
 /**
  * Send a transaction and wait for its receipt, with retry on both steps.
- * Uses tighter timeouts than the default: 30s per send attempt, 60s per
- * receipt attempt.  This prevents indefinite hangs from both the tx
- * submission (estimateGas / sendRawTransaction) and receipt polling.
+ * Retries the entire send+wait cycle on generic CALL_EXCEPTION reverts
+ * (Quai testnet flakiness: random txs revert with no decoded reason due
+ * to block.timestamp lag, nonce races, or gas estimation quirks).
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function sendTx(
   fn: () => Promise<any>,
   label: string,
+  maxAttempts = 3,
 ): Promise<any> {
-  const tx = await withTestRetry(fn, label, 3, 5000, TX_SEND_TIMEOUT_MS);
-  return await withTestRetry(() => tx.wait(), `${label} .wait()`, 3, 5000, TX_WAIT_TIMEOUT_MS);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const tx = await withTestRetry(fn, label, 3, 5000, TX_SEND_TIMEOUT_MS);
+      return await withTestRetry(() => tx.wait(), `${label} .wait()`, 3, 5000, TX_WAIT_TIMEOUT_MS);
+    } catch (err: any) {
+      const msg = err?.message ?? String(err);
+      const data = err?.data ?? '';
+      // Timing-related custom errors from Quai testnet block.timestamp lag:
+      // 0x44e7e7a8 = NotVoting() — proposal not yet in voting period
+      // 0x9488aaa6 = NotReady()  — proposal not yet processable
+      const TIMING_ERRORS = ['0x44e7e7a8', '0x9488aaa6'];
+      const isTimingError = TIMING_ERRORS.some(sel => data.startsWith(sel))
+        || msg.includes('NotVoting') || msg.includes('NotReady') || msg.includes('not ready');
+      // Generic CALL_EXCEPTION with no reason AND no revert data = testnet flake
+      const isGenericFlake = err?.code === 'CALL_EXCEPTION' && !err?.reason && (!data || data === '0x');
+      if ((isTimingError || isGenericFlake) && attempt < maxAttempts) {
+        console.log(
+          `   [retry] ${label}: ${isTimingError ? 'timing error' : 'generic revert'} (attempt ${attempt}/${maxAttempts}), retrying in 15s...`,
+        );
+        await sleep(15_000);
+      } else {
+        throw err;
+      }
+    }
+  }
+  throw new Error(`${label}: all ${maxAttempts} attempts failed`);
 }
 
 /**
@@ -250,6 +275,22 @@ async function sendProcessProposal(
   maxAttempts = 6,
   retryDelayMs = 30_000,
 ): Promise<any> {
+  // Pre-flight diagnostics — log proposal state before attempting processProposal
+  try {
+    const daoShipAddr = await daoShip.getAddress();
+    const avatarAddr = await daoShip.avatar();
+    const isModuleEnabled = await (new quais.Contract(
+      avatarAddr,
+      ['function isModuleEnabled(address) view returns (bool)'],
+      signer.provider ?? signer,
+    )).isModuleEnabled(daoShipAddr);
+    const proposalState = await daoShip.state(proposalId);
+    const stateNames = ['Unborn', 'Submitted', 'Voting', 'Grace', 'Ready', 'Processed', 'Cancelled', 'Defeated', 'Expired'];
+    console.log(`   [diag] ${label}: proposalId=${proposalId}, state=${stateNames[Number(proposalState)] ?? proposalState}, isModuleEnabled=${isModuleEnabled}, daoShip=${daoShipAddr}, avatar=${avatarAddr}`);
+  } catch (diagErr: any) {
+    console.log(`   [diag] ${label}: pre-flight diagnostics failed: ${diagErr.message}`);
+  }
+
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       return await sendTx(
@@ -258,12 +299,34 @@ async function sendProcessProposal(
       );
     } catch (err: any) {
       const msg = err?.message ?? String(err);
-      if (msg.includes('not ready') && attempt < maxAttempts) {
+      // Retry on timing-related reverts. On Quai testnet, block.timestamp can lag
+      // behind wall-clock time, so processProposal reverts because the proposal
+      // is still in voting/grace period. The revert reason may be "NotReady",
+      // "not ready", or a generic CALL_EXCEPTION with no decoded reason (reason=null).
+      const isTimingRevert = msg.includes('not ready') || msg.includes('NotReady')
+        || (err?.code === 'CALL_EXCEPTION' && !err?.reason);
+      if (isTimingRevert && attempt < maxAttempts) {
+        // Check proposal state for diagnostics
+        let stateInfo = '';
+        try {
+          const s = await daoShip.state(proposalId);
+          const names = ['Unborn', 'Submitted', 'Voting', 'Grace', 'Ready', 'Processed', 'Cancelled', 'Defeated', 'Expired'];
+          stateInfo = ` (state=${names[Number(s)] ?? s})`;
+        } catch { /* ignore */ }
         console.log(
-          `   [retry] ${label}: proposal not ready (attempt ${attempt}/${maxAttempts}), waiting ${retryDelayMs / 1000}s...`,
+          `   [retry] ${label}: proposal not processable${stateInfo} (attempt ${attempt}/${maxAttempts}), waiting ${retryDelayMs / 1000}s...`,
         );
         await sleep(retryDelayMs);
       } else {
+        // Log detailed failure info before throwing
+        console.log(`   [FAIL] ${label}: attempt ${attempt}/${maxAttempts}`);
+        console.log(`   [FAIL] error: ${msg.slice(0, 500)}`);
+        if (err?.receipt) {
+          console.log(`   [FAIL] tx status: ${err.receipt.status}, gasUsed: ${err.receipt.gasUsed}, logs: ${err.receipt.logs?.length ?? 0}`);
+        }
+        if (err?.code) console.log(`   [FAIL] code: ${err.code}`);
+        if (err?.reason) console.log(`   [FAIL] reason: ${err.reason}`);
+        if (err?.revert) console.log(`   [FAIL] revert: ${JSON.stringify(err.revert)}`);
         throw err;
       }
     }

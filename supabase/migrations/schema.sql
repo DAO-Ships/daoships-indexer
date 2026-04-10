@@ -83,7 +83,8 @@ BEGIN
             loot_address VARCHAR(42) NOT NULL,
             shares_address VARCHAR(42) NOT NULL,
             avatar VARCHAR(42) NOT NULL,
-            launcher VARCHAR(42) NOT NULL,
+            deployer VARCHAR(42),
+            launcher_contract VARCHAR(42) NOT NULL,
 
             loot_paused BOOLEAN DEFAULT FALSE,
             shares_paused BOOLEAN DEFAULT FALSE,
@@ -238,8 +239,10 @@ BEGIN
             navigator_type VARCHAR(50),
             name VARCHAR(255),
             description TEXT,
+            config JSONB,
 
             tx_hash VARCHAR(66) NOT NULL,
+            updated_at TIMESTAMPTZ DEFAULT NOW(),
 
             UNIQUE(dao_id, navigator_address)
         )', s, s);
@@ -518,10 +521,17 @@ BEGIN
                 USING %I.ds_event_transactions et
                 WHERE n.tx_hash = et.id AND et.block_number > p_block_number;
 
-            -- 3. Delete event_transactions last (used for joins above)
+            -- 3. Delete members for affected DAOs so replay rebuilds correct balances.
+            -- Member balances are delta-accumulated via Transfer events; keeping stale
+            -- rows would double-count when the block range replays.
+            IF array_length(affected_daos, 1) > 0 THEN
+                DELETE FROM %I.ds_members WHERE dao_id = ANY(affected_daos);
+            END IF;
+
+            -- 4. Delete event_transactions last (used for joins above)
             DELETE FROM %I.ds_event_transactions WHERE block_number > p_block_number;
 
-            -- 4. Recalculate aggregate counters on affected DAOs only
+            -- 5. Recalculate aggregate counters on affected DAOs only
             IF array_length(affected_daos, 1) > 0 THEN
                 UPDATE %I.ds_daos SET
                     proposal_count = (SELECT COUNT(*) FROM %I.ds_proposals p WHERE p.dao_id = %I.ds_daos.id),
@@ -532,7 +542,7 @@ BEGIN
             END IF;
         END;
         $fn$ LANGUAGE plpgsql
-    ', s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s);
+    ', s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s);
 
     -- Prune orphaned records (dao_id IS NULL) older than retention period
     EXECUTE format('
@@ -551,18 +561,25 @@ BEGIN
         $fn$ LANGUAGE plpgsql
     ', s, s);
 
-    -- Reparent orphaned allowlist records when a DAO is created
+    -- Reparent orphaned allowlist records when a navigator is registered to a DAO
     EXECUTE format('
         CREATE OR REPLACE FUNCTION %I.ds_reparent_orphaned_records(
-            p_dao_address VARCHAR(42)
+            p_dao_address VARCHAR(42),
+            p_navigator_address VARCHAR(42)
         ) RETURNS INTEGER AS $fn$
         DECLARE
             updated INTEGER;
         BEGIN
-            UPDATE %I.ds_records SET dao_id = p_dao_address
+            UPDATE %I.ds_records SET dao_id = p_dao_address,
+              trust_level = CASE
+                WHEN trust_level IN (''SEMI_TRUSTED'', ''VERIFIED_INITIAL'', ''VERIFIED'')
+                THEN trust_level
+                ELSE ''MEMBER''
+              END
             WHERE dao_id IS NULL
               AND tag = ''daoships.navigator.allowlist''
-              AND content_json->>''daoAddress'' = p_dao_address;
+              AND content_json->>''daoAddress'' = p_dao_address
+              AND content_json->>''navigatorAddress'' = p_navigator_address;
             GET DIAGNOSTICS updated = ROW_COUNT;
             RETURN updated;
         END;

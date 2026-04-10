@@ -183,11 +183,17 @@ export class BlockchainService {
     await this.rateLimit();
     // Quai Network requires EIP-55 checksummed addresses
     const checksummedTo = quais.getAddress(to);
-    const result = await Promise.race([
-      this.provider.call({ to: checksummedTo, from: '0x0000000000000000000000000000000000000000', data }),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('rawCall timeout (10s)')), 10_000)),
-    ]);
-    return result;
+    try {
+      const result = await Promise.race([
+        this.provider.call({ to: checksummedTo, from: '0x0000000000000000000000000000000000000000', data }),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('rawCall timeout (10s)')), 10_000)),
+      ]);
+      this.recordSuccess();
+      return result;
+    } catch (err) {
+      this.recordFailure();
+      throw err;
+    }
   }
 
   getProvider(): quais.JsonRpcProvider {
