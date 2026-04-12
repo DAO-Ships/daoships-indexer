@@ -37,6 +37,7 @@ export function makeMockDb() {
     incrementProposalVotes: vi.fn().mockResolvedValue(undefined),
     incrementMemberVotes: vi.fn().mockResolvedValue(undefined),
     incrementProposalCount: vi.fn().mockResolvedValue(undefined),
+    adjustDaoTotals: vi.fn().mockResolvedValue(undefined),
     updateActiveMemberCount: vi.fn().mockResolvedValue(undefined),
     updateNavigator: vi.fn().mockResolvedValue(undefined),
     reparentOrphanedRecords: vi.fn().mockResolvedValue(undefined),

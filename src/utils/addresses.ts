@@ -30,8 +30,8 @@ export function permissionToLabel(permission: number): string {
     7: 'all',
   };
   // DAOShip uses 3-bit bitmask (admin=1, manager=2, governor=4).
-  // Mask to low 3 bits so values 8-255 map to valid enum labels
-  // (e.g. 9 = 0b1001 & 0b111 = 1 = 'admin').
+  // M11: Caller (handleNavigatorSet) already validates 0-7 range, so the & 7
+  // mask is defense-in-depth only — it never triggers in normal operation.
   if (permission <= 0) return 'none';
   return labels[permission & 7] ?? 'none';
 }

@@ -19,6 +19,7 @@ import {
   handleLockGovernor,
   handleConvertSharesToLoot,
   handleAdminConfigSet,
+  clearNavigatorMetadataCache,
 } from '../../../src/handlers/daoship.js';
 import {
   DAOSHIP, SHARES, LOOT, MEMBER1, MEMBER2, NAVIGATOR, LAUNCHER, TOKEN_A, TX_HASH,
@@ -34,7 +35,10 @@ const MOCK_DAO = {
   grace_period: 3600,
 };
 
-beforeEach(() => vi.clearAllMocks());
+beforeEach(() => {
+  vi.clearAllMocks();
+  clearNavigatorMetadataCache();
+});
 
 // ── handleSetupComplete ─────────────────────────────────────────
 
@@ -349,35 +353,28 @@ describe('handleRagequit', () => {
     }));
   });
 
-  it('decrements DAO total_shares and total_loot on ragequit', async () => {
+  it('atomically decrements DAO totals via adjustDaoTotals on ragequit', async () => {
     const db = makeMockDb();
     db.getMember.mockResolvedValue({ id: `${DAOSHIP}-${MEMBER1}` });
-    db.getDao.mockResolvedValue({ ...MOCK_DAO, total_shares: '500', total_loot: '200' });
     const ctx = makeCtx({ db, log: { address: DAOSHIP } });
 
     await handleRagequit(ctx, {
       member: MEMBER1, to: MEMBER2, lootToBurn: 50n, sharesToBurn: 100n, tokens: [], amounts: [],
     });
 
-    expect(db.updateDao).toHaveBeenCalledWith(DAOSHIP, {
-      total_shares: '400',
-      total_loot: '150',
-    });
+    expect(db.adjustDaoTotals).toHaveBeenCalledWith(DAOSHIP, '-100', '-50');
   });
 
-  it('only updates total_shares when lootToBurn is zero', async () => {
+  it('only sends shares delta when lootToBurn is zero', async () => {
     const db = makeMockDb();
     db.getMember.mockResolvedValue({ id: `${DAOSHIP}-${MEMBER1}` });
-    db.getDao.mockResolvedValue({ ...MOCK_DAO, total_shares: '500', total_loot: '200' });
     const ctx = makeCtx({ db, log: { address: DAOSHIP } });
 
     await handleRagequit(ctx, {
       member: MEMBER1, to: MEMBER2, lootToBurn: 0n, sharesToBurn: 100n, tokens: [], amounts: [],
     });
 
-    expect(db.updateDao).toHaveBeenCalledWith(DAOSHIP, {
-      total_shares: '400',
-    });
+    expect(db.adjustDaoTotals).toHaveBeenCalledWith(DAOSHIP, '-100', '0');
   });
 
   it('skips when tokens/amounts array lengths mismatch', async () => {
@@ -513,11 +510,11 @@ describe('handleNavigatorSet', () => {
 
     await handleNavigatorSet(ctx, { navigator: NAVIGATOR, permission: 4n });
 
-    expect(db.upsert).toHaveBeenCalledWith('ds_navigators', expect.objectContaining({
-      deployer: null,
-      name: null,
-      description: null,
-    }));
+    // Metadata fields omitted when fetch returns mismatched daoShip — preserves existing data
+    const upsertData = db.upsert.mock.calls[0][1];
+    expect(upsertData).not.toHaveProperty('deployer');
+    expect(upsertData).not.toHaveProperty('name');
+    expect(upsertData).not.toHaveProperty('description');
   });
 
   it('handles missing NavigatorDeployed gracefully', async () => {
@@ -530,12 +527,12 @@ describe('handleNavigatorSet', () => {
 
     await handleNavigatorSet(ctx, { navigator: NAVIGATOR, permission: 4n });
 
-    expect(db.upsert).toHaveBeenCalledWith('ds_navigators', expect.objectContaining({
-      deployer: null,
-      navigator_type: null,
-      name: null,
-      description: null,
-    }));
+    // Metadata fields omitted when no NavigatorDeployed logs found — preserves existing data
+    const upsertData = db.upsert.mock.calls[0][1];
+    expect(upsertData).not.toHaveProperty('deployer');
+    expect(upsertData).not.toHaveProperty('navigator_type');
+    expect(upsertData).not.toHaveProperty('name');
+    expect(upsertData).not.toHaveProperty('description');
   });
 
   it('skips NavigatorDeployed fetch when permission=0', async () => {
@@ -629,60 +626,45 @@ describe('handleSetGuildTokens', () => {
 // ── handleMintShares / handleBurnShares / handleMintLoot / handleBurnLoot ──
 
 describe('handleMintShares', () => {
-  it('updates total_shares via getDao + updateDao', async () => {
+  it('atomically adjusts total_shares via adjustDaoTotals', async () => {
     const db = makeMockDb();
-    db.getDao.mockResolvedValue(MOCK_DAO);
     const ctx = makeCtx({ db, log: { address: DAOSHIP } });
 
     await handleMintShares(ctx, { to: [MEMBER1, MEMBER2], amount: [100n, 200n] });
 
-    // Total delta = +300
-    expect(db.updateDao).toHaveBeenCalledWith(DAOSHIP, { total_shares: '1300' });
+    // Total delta = +300 shares, 0 loot
+    expect(db.adjustDaoTotals).toHaveBeenCalledWith(DAOSHIP, '300', '0');
   });
 
-  it('clamps total_shares to 0 when burn exceeds total', async () => {
+  it('sends negative delta for burns via adjustDaoTotals', async () => {
     const db = makeMockDb();
-    db.getDao.mockResolvedValue({ ...MOCK_DAO, total_shares: '50' });
     const ctx = makeCtx({ db, log: { address: DAOSHIP } });
 
-    // Burn 100 from a total of 50 — should clamp
     await handleBurnShares(ctx, { from: [MEMBER1], amount: [100n] });
 
-    expect(db.updateDao).toHaveBeenCalledWith(DAOSHIP, { total_shares: '0' });
-  });
-
-  it('skips when DAO not found', async () => {
-    const db = makeMockDb();
-    db.getDao.mockResolvedValue(null);
-    const ctx = makeCtx({ db, log: { address: DAOSHIP } });
-
-    await handleMintShares(ctx, { to: [MEMBER1], amount: [100n] });
-
-    expect(db.updateDao).not.toHaveBeenCalled();
+    expect(db.adjustDaoTotals).toHaveBeenCalledWith(DAOSHIP, '-100', '0');
   });
 });
 
 describe('handleMintLoot', () => {
-  it('updates total_loot', async () => {
+  it('atomically adjusts total_loot via adjustDaoTotals', async () => {
     const db = makeMockDb();
-    db.getDao.mockResolvedValue(MOCK_DAO);
     const ctx = makeCtx({ db, log: { address: DAOSHIP } });
 
     await handleMintLoot(ctx, { to: [MEMBER1], amount: [250n] });
 
-    expect(db.updateDao).toHaveBeenCalledWith(DAOSHIP, { total_loot: '750' });
+    expect(db.adjustDaoTotals).toHaveBeenCalledWith(DAOSHIP, '0', '250');
   });
 });
 
 describe('handleBurnLoot', () => {
-  it('updates total_loot on burn', async () => {
+  it('sends negative loot delta via adjustDaoTotals', async () => {
     const db = makeMockDb();
-    db.getDao.mockResolvedValue(MOCK_DAO);
     const ctx = makeCtx({ db, log: { address: DAOSHIP } });
 
     await handleBurnLoot(ctx, { from: [MEMBER1], amount: [100n] });
 
-    expect(db.updateDao).toHaveBeenCalledWith(DAOSHIP, { total_loot: '400' });
+    expect(db.adjustDaoTotals).toHaveBeenCalledWith(DAOSHIP, '0', '-100');
   });
 });
 
@@ -729,45 +711,15 @@ describe('handleConvertSharesToLoot', () => {
   // are updated by the Transfer events (burn shares + mint loot) that fire
   // from the contract's sharesToken.burn() / lootToken.mint() calls.
 
-  it('updates DAO totals only (member balances owned by Transfer handler)', async () => {
+  it('atomically adjusts DAO totals (member balances owned by Transfer handler)', async () => {
     const db = makeMockDb();
-    db.getDao.mockResolvedValue({ ...MOCK_DAO, total_shares: '1000', total_loot: '500' });
     const ctx = makeCtx({ db, log: { address: DAOSHIP } });
 
     await handleConvertSharesToLoot(ctx, { from: MEMBER1, amount: 30n });
 
-    // DAO: total_shares 1000-30=970, total_loot 500+30=530
-    expect(db.updateDao).toHaveBeenCalledWith(DAOSHIP, {
-      total_shares: '970',
-      total_loot: '530',
-    });
+    // shares -30, loot +30
+    expect(db.adjustDaoTotals).toHaveBeenCalledWith(DAOSHIP, '-30', '30');
     // Member balance NOT updated — Transfer handler owns that
-    expect(db.upsertMember).not.toHaveBeenCalled();
-  });
-
-  it('clamps DAO total_shares to 0 when conversion exceeds total (C1 audit fix)', async () => {
-    const db = makeMockDb();
-    db.getDao.mockResolvedValue({ ...MOCK_DAO, total_shares: '10', total_loot: '500' });
-    const ctx = makeCtx({ db, log: { address: DAOSHIP } });
-
-    await handleConvertSharesToLoot(ctx, { from: MEMBER1, amount: 20n });
-
-    // DAO: total_shares clamped to 0, total_loot 500+20=520
-    expect(db.updateDao).toHaveBeenCalledWith(DAOSHIP, {
-      total_shares: '0',
-      total_loot: '520',
-    });
-    expect(db.upsertMember).not.toHaveBeenCalled();
-  });
-
-  it('skips DAO totals when DAO not found', async () => {
-    const db = makeMockDb();
-    db.getDao.mockResolvedValue(null);
-    const ctx = makeCtx({ db, log: { address: DAOSHIP } });
-
-    await handleConvertSharesToLoot(ctx, { from: MEMBER1, amount: 50n });
-
-    expect(db.updateDao).not.toHaveBeenCalled();
     expect(db.upsertMember).not.toHaveBeenCalled();
   });
 });

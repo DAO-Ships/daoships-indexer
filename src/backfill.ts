@@ -5,6 +5,11 @@
  * Environment variables:
  * - BACKFILL_FROM: Starting block number (optional, defaults to START_BLOCK)
  * - BACKFILL_TO: Ending block number (optional, defaults to current block)
+ *
+ * M12: This script does not perform reorg detection. Backfilled blocks are
+ * deep in the chain (thousands of confirmations) and are effectively final.
+ * After backfill completes, run the main indexer to pick up the chain tip
+ * with full reorg detection enabled.
  */
 
 import { config } from './config.js';

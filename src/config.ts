@@ -90,6 +90,7 @@ export const config = {
   // Health check
   health: {
     enabled: process.env.HEALTH_CHECK_ENABLED !== 'false',
+    host: process.env.HEALTH_CHECK_HOST || '0.0.0.0',
     port: parseIntWithBounds(process.env.HEALTH_CHECK_PORT, 8080, 1, 65535, 'HEALTH_CHECK_PORT'),
     maxBlocksBehind: parseIntWithBounds(process.env.HEALTH_MAX_BLOCKS_BEHIND, 100, 1, 10000, 'HEALTH_MAX_BLOCKS_BEHIND'),
     checkTimeoutMs: parseIntWithBounds(process.env.HEALTH_CHECK_TIMEOUT_MS, 10000, 1000, 60000, 'HEALTH_CHECK_TIMEOUT_MS'),

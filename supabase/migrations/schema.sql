@@ -66,6 +66,11 @@ RETURNS void AS $$
 DECLARE
     s TEXT := network_name;
 BEGIN
+    -- H1: Whitelist valid schema names to prevent accidental or malicious schema creation.
+    IF network_name NOT IN ('testnet', 'mainnet', 'dev', 'public') THEN
+        RAISE EXCEPTION 'Invalid network name: %. Must be one of: testnet, mainnet, dev, public', network_name;
+    END IF;
+
     -- Create the schema (may already exist from other indexers)
     EXECUTE format('CREATE SCHEMA IF NOT EXISTS %I', s);
 
@@ -277,7 +282,7 @@ BEGIN
 
             tag VARCHAR(100) NOT NULL,
             content_type VARCHAR(50),
-            content TEXT NOT NULL,
+            content TEXT NOT NULL,              -- M6: Raw on-chain data. UNTRUSTED. Frontends MUST escape before rendering. Use content_json for sanitized data.
             content_json JSONB,
             trust_level VARCHAR(20),
             block_number BIGINT
@@ -387,6 +392,10 @@ BEGIN
     EXECUTE format('CREATE INDEX IF NOT EXISTS idx_ds_delegations_lookup ON %I.ds_delegations(dao_id, delegator)', s);
     EXECUTE format('CREATE INDEX IF NOT EXISTS idx_ds_processed_logs_block ON %I.ds_processed_logs(block_number)', s);
     EXECUTE format('CREATE INDEX IF NOT EXISTS idx_ds_votes_block ON %I.ds_votes(block_number)', s);
+    -- H6: Composite index for ds_increment_proposal_votes which queries by (proposal_id, approved).
+    EXECUTE format('CREATE INDEX IF NOT EXISTS idx_ds_votes_proposal_approved ON %I.ds_votes(proposal_id, approved)', s);
+    -- M9: Standalone index on navigator_address for potential cross-DAO lookups.
+    EXECUTE format('CREATE INDEX IF NOT EXISTS idx_ds_navigators_address ON %I.ds_navigators(navigator_address)', s);
     EXECUTE format('CREATE INDEX IF NOT EXISTS idx_ds_ragequits_block ON %I.ds_ragequits(block_number)', s);
     EXECUTE format('CREATE INDEX IF NOT EXISTS idx_ds_records_block ON %I.ds_records(block_number)', s);
     EXECUTE format('CREATE INDEX IF NOT EXISTS idx_ds_records_orphaned ON %I.ds_records(created_at) WHERE dao_id IS NULL', s);
@@ -489,6 +498,24 @@ BEGIN
         $fn$ LANGUAGE plpgsql
     ', s, s, s);
 
+    -- Atomic DAO totals adjustment (audit M20: eliminates read-modify-write crash window).
+    -- Accepts signed deltas; clamps each total to 0 if it would go negative.
+    EXECUTE format('
+        CREATE OR REPLACE FUNCTION %I.ds_adjust_dao_totals(
+            p_dao_id TEXT,
+            p_shares_delta NUMERIC(78, 0),
+            p_loot_delta NUMERIC(78, 0)
+        ) RETURNS void AS $fn$
+        BEGIN
+            UPDATE %I.ds_daos SET
+                total_shares = GREATEST(0, COALESCE(total_shares, 0) + p_shares_delta),
+                total_loot = GREATEST(0, COALESCE(total_loot, 0) + p_loot_delta),
+                updated_at = NOW()
+            WHERE id = p_dao_id;
+        END;
+        $fn$ LANGUAGE plpgsql
+    ', s, s);
+
     -- Delete indexed events after a block number (for reorg recovery)
     -- C2: Expanded to clean ALL append-only event tables, then recalculate aggregate counters.
     EXECUTE format('
@@ -521,12 +548,15 @@ BEGIN
                 USING %I.ds_event_transactions et
                 WHERE n.tx_hash = et.id AND et.block_number > p_block_number;
 
-            -- 3. Delete members for affected DAOs so replay rebuilds correct balances.
-            -- Member balances are delta-accumulated via Transfer events; keeping stale
-            -- rows would double-count when the block range replays.
-            IF array_length(affected_daos, 1) > 0 THEN
-                DELETE FROM %I.ds_members WHERE dao_id = ANY(affected_daos);
-            END IF;
+            -- 3. Member balances are delta-accumulated via Transfer events.
+            -- Shallow reorgs (within CONFIRMATION_BLOCKS) are safe because those
+            -- blocks have not been indexed yet. For reorgs that overlap indexed
+            -- blocks: Transfer events common to both forks replay correctly, but
+            -- Transfers unique to the old fork leave stale deltas in member
+            -- balances (shares/loot). Deleting members is too aggressive
+            -- (destroys pre-fork data that cannot be rebuilt from the replay
+            -- range). For deep reorgs affecting member balances, a full
+            -- re-index is required.
 
             -- 4. Delete event_transactions last (used for joins above)
             DELETE FROM %I.ds_event_transactions WHERE block_number > p_block_number;
@@ -542,7 +572,7 @@ BEGIN
             END IF;
         END;
         $fn$ LANGUAGE plpgsql
-    ', s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s);
+    ', s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s);
 
     -- Prune orphaned records (dao_id IS NULL) older than retention period
     EXECUTE format('
@@ -628,6 +658,9 @@ BEGIN
     EXECUTE format('CREATE POLICY "Public read" ON %I.ds_delegations FOR SELECT USING (true)', s);
     EXECUTE format('DROP POLICY IF EXISTS "Public read" ON %I.ds_navigator_events', s);
     EXECUTE format('CREATE POLICY "Public read" ON %I.ds_navigator_events FOR SELECT USING (true)', s);
+    -- H7: Public read on ds_indexer_state is intentional — frontends use it for sync
+    -- status display. The indexer is a read-only observer; exposing sync state has no
+    -- impact on on-chain governance security.
     EXECUTE format('DROP POLICY IF EXISTS "Public read" ON %I.ds_indexer_state', s);
     EXECUTE format('CREATE POLICY "Public read" ON %I.ds_indexer_state FOR SELECT USING (true)', s);
     -- ds_processed_logs: no public read policy (H1: internal dedup table, no frontend use)
@@ -711,6 +744,11 @@ DECLARE
         'ds_records', 'ds_navigators', 'ds_navigator_events', 'ds_indexer_state'
     ];
 BEGIN
+    -- H1: Whitelist valid schema names to prevent accidental or malicious schema drops.
+    IF network_name NOT IN ('testnet', 'mainnet', 'dev', 'public') THEN
+        RAISE EXCEPTION 'Invalid network name: %. Must be one of: testnet, mainnet, dev, public', network_name;
+    END IF;
+
     -- 1. Remove tables from realtime publication before dropping
     FOREACH tbl IN ARRAY realtime_tables LOOP
         IF EXISTS (SELECT 1 FROM pg_publication_tables WHERE pubname = 'supabase_realtime' AND schemaname = s AND tablename = tbl) THEN
@@ -739,6 +777,7 @@ BEGIN
     EXECUTE format('DROP FUNCTION IF EXISTS %I.ds_increment_member_votes CASCADE', s);
     EXECUTE format('DROP FUNCTION IF EXISTS %I.ds_increment_proposal_count CASCADE', s);
     EXECUTE format('DROP FUNCTION IF EXISTS %I.ds_update_active_member_count CASCADE', s);
+    EXECUTE format('DROP FUNCTION IF EXISTS %I.ds_adjust_dao_totals CASCADE', s);
     EXECUTE format('DROP FUNCTION IF EXISTS %I.ds_delete_events_after_block CASCADE', s);
     EXECUTE format('DROP FUNCTION IF EXISTS %I.ds_prune_orphaned_records CASCADE', s);
     EXECUTE format('DROP FUNCTION IF EXISTS %I.ds_reparent_orphaned_records CASCADE', s);

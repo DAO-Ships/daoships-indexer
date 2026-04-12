@@ -1,5 +1,6 @@
 import { Interface } from 'quais';
 import type { EventContext } from './index.js';
+import type { MemberRow } from '../types/index.js';
 import { makeMemberId } from '../utils/addresses.js';
 import { addNumericStrings, subtractNumericStringsFloored, wouldClamp, bigintToString, safeBigInt, strictBigInt } from '../utils/bigint.js';
 import { logger } from '../utils/logger.js';
@@ -45,11 +46,29 @@ export async function handleTransfer(
   const now = new Date(ctx.blockTimestamp * 1000).toISOString();
   let activeMemberDelta = 0;
 
+  const hasSender = from !== ZERO_ADDRESS;
+  const hasReceiver = to !== ZERO_ADDRESS;
+  const senderId = hasSender ? makeMemberId(daoId, from) : null;
+  const receiverId = hasReceiver ? makeMemberId(daoId, to) : null;
+
+  // H5: Parallelize independent getMember reads when both sender and receiver
+  // exist and are different members. Self-transfers (from === to) must remain
+  // sequential to avoid reading stale data for the second operation.
+  let sender: MemberRow | null = null;
+  let receiver: MemberRow | null = null;
+  if (hasSender && hasReceiver && from !== to) {
+    [sender, receiver] = await Promise.all([
+      ctx.db.getMember(senderId!),
+      ctx.db.getMember(receiverId!),
+    ]);
+  } else {
+    if (hasSender) sender = await ctx.db.getMember(senderId!);
+    if (hasReceiver) receiver = await ctx.db.getMember(receiverId!);
+  }
+
   // ── Debit sender (skip for mints where from is zero address) ──
 
-  if (from !== ZERO_ADDRESS) {
-    const senderId = makeMemberId(daoId, from);
-    const sender = await ctx.db.getMember(senderId);
+  if (hasSender) {
     const senderOldBalance = (sender?.[field] as string) || '0';
     const senderOtherBalance = (sender?.[otherField] as string) || '0';
     if (wouldClamp(senderOldBalance, valueStr)) {
@@ -62,7 +81,7 @@ export async function handleTransfer(
     if (oldTotal > 0n && newTotal === 0n) activeMemberDelta -= 1;
 
     await ctx.db.upsertMember({
-      id: senderId,
+      id: senderId!,
       dao_id: daoId,
       member_address: from,
       [field]: senderNewBalance,
@@ -74,9 +93,7 @@ export async function handleTransfer(
 
   // ── Credit receiver (skip for burns where to is zero address) ─
 
-  if (to !== ZERO_ADDRESS) {
-    const receiverId = makeMemberId(daoId, to);
-    const receiver = await ctx.db.getMember(receiverId);
+  if (hasReceiver) {
     const receiverOldBalance = (receiver?.[field] as string) || '0';
     const receiverOtherBalance = (receiver?.[otherField] as string) || '0';
     const receiverNewBalance = addNumericStrings(receiverOldBalance, valueStr);
@@ -86,7 +103,7 @@ export async function handleTransfer(
     if (oldTotal === 0n && newTotal > 0n) activeMemberDelta += 1;
 
     await ctx.db.upsertMember({
-      id: receiverId,
+      id: receiverId!,
       dao_id: daoId,
       member_address: to,
       [field]: receiverNewBalance,

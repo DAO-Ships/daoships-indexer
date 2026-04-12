@@ -38,6 +38,7 @@ import {
   handleLockGovernor,
   handleConvertSharesToLoot,
   handleAdminConfigSet,
+  clearNavigatorMetadataCache,
 } from './handlers/daoship.js';
 
 import {
@@ -274,9 +275,10 @@ async function main(): Promise<void> {
         // We must not continue with stale data after a detected reorg.
         await db.deleteEventsAfterBlock(forkPoint);
 
-        // Clear navigator DAO cache — it may contain stale mappings from
-        // pre-reorg events that are now being rolled back (I13).
+        // Clear navigator caches — they may contain stale mappings from
+        // pre-reorg events that are now being rolled back (I13, H3).
         clearNavigatorDaoCache();
+        clearNavigatorMetadataCache();
 
         // Rebuild the in-memory registry from surviving DB rows.
         // The SQL cleanup deleted orphaned navigators/DAOs, so stale entries
@@ -527,7 +529,8 @@ async function main(): Promise<void> {
 // ── Helpers ─────────────────────────────────────────────────────
 
 // M24: Interruptible sleep — resolve is captured so shutdown can wake it early.
-// Only one sleep is ever active at a time (single-threaded polling loop).
+// M14: Single module-level mutable by design — only one sleep is ever active
+// at a time (single-threaded polling loop). Tests don't call sleep() directly.
 let sleepResolve: (() => void) | null = null;
 
 function sleep(ms: number): Promise<void> {
@@ -601,6 +604,10 @@ export async function processChunkedRange(
 
     await db.updateLastProcessedBlock(end, result.lastBlockHash);
     lastProcessed = end;
+
+    // M2: Prune old dedup entries during chunked processing (backfill/catch-up),
+    // matching the pruning that the main polling loop does.
+    await db.pruneProcessedLogs(end, config.reorgWalkBack);
 
     options?.onProgress?.(start, end);
   }

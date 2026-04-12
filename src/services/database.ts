@@ -14,6 +14,10 @@ import type {
   EventTransactionRow,
 } from '../types/index.js';
 
+// M15: Allowlist for generic upsert/insert methods — prevents SQL injection via
+// dynamic table names. MUST be updated when adding new tables that use the
+// generic upsert() or insert() methods. Tables with dedicated methods (ds_daos,
+// ds_members, ds_proposals, ds_votes) don't need to be listed here.
 const VALID_TABLES = new Set([
   'ds_guild_tokens',
   'ds_ragequits',
@@ -266,6 +270,19 @@ export class DatabaseService {
     if (error) throw new Error(`Failed to increment proposal count: ${error.message}`);
   }
 
+  async adjustDaoTotals(daoId: string, sharesDelta: string, lootDelta: string): Promise<void> {
+    const normalized = validateAndNormalizeAddress(daoId, 'daoId');
+    const { error } = await this.withDbTimeout(
+      this.client.rpc('ds_adjust_dao_totals', {
+        p_dao_id: normalized,
+        p_shares_delta: sharesDelta,
+        p_loot_delta: lootDelta,
+      }),
+      'adjustDaoTotals',
+    );
+    if (error) throw new Error(`Failed to adjust DAO totals for ${normalized}: ${error.message}`);
+  }
+
   async updateActiveMemberCount(daoId: string, delta: number): Promise<void> {
     const normalized = validateAndNormalizeAddress(daoId, 'daoId');
     const { error } = await this.withDbTimeout(
@@ -473,14 +490,11 @@ export class DatabaseService {
     try {
       // If the builder supports abortSignal, use it to cancel the fetch.
       // Otherwise fall back to Promise.race (for RPC calls that return plain promises).
-      let promise: PromiseLike<T>;
-      if ('abortSignal' in promiseOrBuilder && typeof promiseOrBuilder.abortSignal === 'function') {
-        promise = promiseOrBuilder.abortSignal(controller.signal);
-      } else {
-        promise = promiseOrBuilder as PromiseLike<T>;
+      if (!('abortSignal' in promiseOrBuilder) || typeof promiseOrBuilder.abortSignal !== 'function') {
+        throw new Error(`withDbTimeout: '${operation}' builder does not support abortSignal`);
       }
 
-      return await promise;
+      return await promiseOrBuilder.abortSignal(controller.signal);
     } catch (err) {
       if (controller.signal.aborted) {
         throw new Error(`Database operation '${operation}' timed out after ${DB_TIMEOUT_MS}ms`);

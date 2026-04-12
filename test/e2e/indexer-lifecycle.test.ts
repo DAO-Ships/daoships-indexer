@@ -241,8 +241,9 @@ async function sendTx(
       // 0x44e7e7a8 = NotVoting() — proposal not yet in voting period
       // 0x9488aaa6 = NotReady()  — proposal not yet processable
       const TIMING_ERRORS = ['0x44e7e7a8', '0x9488aaa6'];
-      const isTimingError = TIMING_ERRORS.some(sel => data.startsWith(sel))
-        || msg.includes('NotVoting') || msg.includes('NotReady') || msg.includes('not ready');
+      const isTimingError = TIMING_ERRORS.some(sel => data.startsWith(sel) || msg.includes(sel))
+        || msg.includes('NotVoting') || msg.includes('NotReady') || msg.includes('not ready')
+        || msg.includes('not yet determined');
       // Generic CALL_EXCEPTION with no reason AND no revert data = testnet flake
       const isGenericFlake = err?.code === 'CALL_EXCEPTION' && !err?.reason && (!data || data === '0x');
       if ((isTimingError || isGenericFlake) && attempt < maxAttempts) {

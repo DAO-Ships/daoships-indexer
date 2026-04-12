@@ -46,11 +46,8 @@ export class BlockProcessor {
   private registry: ContractRegistry;
   private dispatcher: HandlerDispatcher;
 
-  /** LRU Cache: blockNumber → unix timestamp (seconds) */
-  private blockTimestampCache: Map<number, number> = new Map();
-
-  /** LRU Cache: blockNumber → block hash (populated alongside timestamp) */
-  private blockHashCache: Map<number, string> = new Map();
+  /** M1: Single LRU cache for both timestamp and hash (populated together from getBlock) */
+  private blockCache: Map<number, { timestamp: number; hash: string }> = new Map();
 
   constructor(
     blockchain: BlockchainService,
@@ -110,7 +107,7 @@ export class BlockProcessor {
     }
 
     // Return the hash of the last block (may already be cached from getBlockTimestamp)
-    let lastBlockHash = this.blockHashCache.get(toBlock) ?? '';
+    let lastBlockHash = this.blockCache.get(toBlock)?.hash ?? '';
     if (!lastBlockHash) {
       try {
         const block = await this.blockchain.getBlock(toBlock);
@@ -279,12 +276,12 @@ export class BlockProcessor {
   }
 
   private async getBlockTimestamp(blockNumber: number): Promise<number> {
-    const cached = this.blockTimestampCache.get(blockNumber);
+    const cached = this.blockCache.get(blockNumber);
     if (cached !== undefined) {
       // Re-insert to maintain LRU order (moves to end of Map)
-      this.blockTimestampCache.delete(blockNumber);
-      this.blockTimestampCache.set(blockNumber, cached);
-      return cached;
+      this.blockCache.delete(blockNumber);
+      this.blockCache.set(blockNumber, cached);
+      return cached.timestamp;
     }
 
     const block = await this.blockchain.getBlock(blockNumber);
@@ -293,23 +290,14 @@ export class BlockProcessor {
     // Use validated extraction — throws clear error instead of silently returning 0
     const timestamp = extractBlockTimestamp(block as unknown as Record<string, unknown>, blockNumber);
 
-    // LRU eviction: remove oldest entry if at capacity
-    if (this.blockTimestampCache.size >= config.cache.timestampCacheSize) {
-      const oldestKey = this.blockTimestampCache.keys().next().value;
+    // M1: Single LRU eviction for both timestamp and hash
+    if (this.blockCache.size >= config.cache.timestampCacheSize) {
+      const oldestKey = this.blockCache.keys().next().value;
       if (oldestKey !== undefined) {
-        this.blockTimestampCache.delete(oldestKey);
+        this.blockCache.delete(oldestKey);
       }
     }
-    this.blockTimestampCache.set(blockNumber, timestamp);
-
-    // Also cache block hash (for processBlockRange to return without extra RPC call)
-    if (this.blockHashCache.size >= config.cache.timestampCacheSize) {
-      const oldestKey = this.blockHashCache.keys().next().value;
-      if (oldestKey !== undefined) {
-        this.blockHashCache.delete(oldestKey);
-      }
-    }
-    this.blockHashCache.set(blockNumber, block.hash ?? '');
+    this.blockCache.set(blockNumber, { timestamp, hash: block.hash ?? '' });
 
     return timestamp;
   }

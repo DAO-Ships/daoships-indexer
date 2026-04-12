@@ -56,6 +56,11 @@ export class HealthService {
   private rateLimitMap: Map<string, number[]> = new Map();
   private cleanupInterval: ReturnType<typeof setInterval> | null = null;
 
+  // M10: Cache health status to avoid RPC call on every probe
+  private cachedHealthStatus: HealthStatus | null = null;
+  private healthStatusCachedAt = 0;
+  private static readonly HEALTH_CACHE_TTL_MS = 5000;
+
   setServices(blockchain: BlockchainService, db: DatabaseService): void {
     this.blockchain = blockchain;
     this.db = db;
@@ -187,8 +192,10 @@ export class HealthService {
       }
     });
 
-    this.server.listen(config.health.port, () => {
-      logger.info({ port: config.health.port }, 'Health check server started');
+    // H9: Bind to configurable host (defaults to 0.0.0.0 for Docker compatibility).
+    // Set HEALTH_CHECK_HOST=127.0.0.1 for bare-metal deployments to restrict access.
+    this.server.listen(config.health.port, config.health.host, () => {
+      logger.info({ port: config.health.port, host: config.health.host }, 'Health check server started');
     });
   }
 
@@ -238,6 +245,19 @@ export class HealthService {
   }
 
   private async getHealthStatus(): Promise<HealthStatus> {
+    // M10: Return cached status if within TTL to avoid RPC call on every probe
+    const now = Date.now();
+    if (this.cachedHealthStatus && (now - this.healthStatusCachedAt) < HealthService.HEALTH_CACHE_TTL_MS) {
+      return this.cachedHealthStatus;
+    }
+
+    const status = await this.computeHealthStatus();
+    this.cachedHealthStatus = status;
+    this.healthStatusCachedAt = now;
+    return status;
+  }
+
+  private async computeHealthStatus(): Promise<HealthStatus> {
     const { quaiRpcCheck, currentBlock } = await this.checkQuaiRpc();
     const { supabaseCheck, indexerState } = await this.checkSupabase();
     let indexerCheck: CheckResult = { status: 'pass' };

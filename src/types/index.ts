@@ -40,7 +40,7 @@ export interface DaoRow {
   name?: string;
   description?: string;
   avatar_img?: string;
-  profile_source: string | null;
+  profile_source: 'vault' | 'launcher' | null;
 }
 
 export interface MemberRow {

@@ -31,8 +31,10 @@ async function determineTrustLevel(
   user: string,
   daoId: string,
   tag: string,
+  // M7: Accept pre-fetched DAO to avoid redundant DB call when caller already has it
+  prefetchedDao?: Awaited<ReturnType<typeof ctx.db.getDao>>,
 ): Promise<{ trust: TrustLevel; dao: Awaited<ReturnType<typeof ctx.db.getDao>> }> {
-  const dao = await ctx.db.getDao(daoId);
+  const dao = prefetchedDao ?? await ctx.db.getDao(daoId);
   if (!dao) return { trust: 'UNTRUSTED', dao: null };
   if (user === dao.avatar) return { trust: 'VERIFIED', dao };
   if (user === dao.deployer && tag === 'daoships.dao.profile.initial') return { trust: 'VERIFIED_INITIAL', dao };
@@ -125,7 +127,8 @@ const BLOCKED_KEYS = new Set(['__proto__', 'constructor', 'prototype', 'toString
 function sanitizeJsonb(obj: unknown, maxDepth = 5, depth = 0): unknown {
   if (depth > maxDepth) return null;
   if (typeof obj !== 'object' || obj === null) return obj;
-  if (Array.isArray(obj)) return obj.map(v => sanitizeJsonb(v, maxDepth, depth + 1));
+  // M3: Cap array length to prevent excessive memory during sanitization
+  if (Array.isArray(obj)) return obj.slice(0, 1000).map(v => sanitizeJsonb(v, maxDepth, depth + 1));
   const result: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
     if (BLOCKED_KEYS.has(k)) continue;
@@ -321,10 +324,10 @@ function validateNavigatorAllowlist(p: Record<string, unknown>): Record<string, 
     });
   }
 
-  // Legacy inline format
-  const validAddresses = (p.addresses as unknown[]).slice(0, 500).filter(
-    (a: unknown) => typeof a === 'string' && ETH_ADDRESS_RE.test(a),
-  );
+  // Legacy inline format — lowercase for consistent comparisons
+  const validAddresses = (p.addresses as unknown[]).slice(0, 500)
+    .filter((a: unknown) => typeof a === 'string' && ETH_ADDRESS_RE.test(a))
+    .map((a) => (a as string).toLowerCase());
   if (validAddresses.length === 0) return null;
 
   return clean({
@@ -456,7 +459,8 @@ export async function handleNewPost(
     const dao = await ctx.db.getDao(claimedDao);
     if (dao) {
       daoId = claimedDao;
-      const result = await determineTrustLevel(ctx, user, daoId, tagName);
+      // M7: Pass pre-fetched DAO to avoid redundant DB call
+      const result = await determineTrustLevel(ctx, user, daoId, tagName, dao);
       trustLevel = result.trust;
       trustDao = result.dao;
       if (meetsMinTrust(trustLevel, tagDef.minTrust)) {

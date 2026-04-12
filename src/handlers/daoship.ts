@@ -1,7 +1,7 @@
 import type { EventContext, EventHandler } from './index.js';
 import { logger } from '../utils/logger.js';
 import { Interface } from 'quais';
-import { safeBigInt, strictBigInt, addNumericStrings, subtractNumericStringsFloored } from '../utils/bigint.js';
+import { safeBigInt, strictBigInt } from '../utils/bigint.js';
 import {
   validateEventArgs,
   validateArray,
@@ -24,8 +24,41 @@ import INavigatorAbi from '../abis/INavigator.json' with { type: 'json' };
 import DAOShipAbi from '../abis/DAOShip.json' with { type: 'json' };
 
 export const daoShipIface = new Interface(DAOShipAbi);
+const iNavIface = new Interface(INavigatorAbi);
+
+// H3: Cache NavigatorDeployed metadata (immutable constructor data) to avoid
+// repeated getLogs scans for the same navigator across permission changes.
+type NavigatorMetadata = {
+  deployer: string;
+  navigatorType: string | null;
+  name: string | null;
+  description: string | null;
+} | null;
+const navigatorMetadataCache = new Map<string, NavigatorMetadata>();
+const NAVIGATOR_METADATA_CACHE_MAX = 500;
+
+/** Clear the NavigatorDeployed metadata cache (for reorg recovery and tests). */
+export function clearNavigatorMetadataCache(): void {
+  navigatorMetadataCache.clear();
+}
 
 const MAX_DETAILS_SIZE = 65536; // 64KB — matches poster content limit
+
+/** M5: Strip null bytes + C0/C1 control chars, truncate. Matches poster.ts str(). */
+function sanitizeStr(v: string, maxLen: number): string | null {
+  const s = v.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g, '').slice(0, maxLen);
+  return s.length > 0 ? s : null;
+}
+
+/** M4: Convert bigint/unknown to Number with bounds check for time-based fields. */
+function safeNumber(value: unknown, fieldName: string): number {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n > Number.MAX_SAFE_INTEGER || n < 0) {
+    logger.warn({ fieldName, raw: String(value) }, `${fieldName} out of safe range, clamping to 0`);
+    return 0;
+  }
+  return n;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -51,27 +84,24 @@ async function handleMintOrBurn(
   // setUp() mints via sharesToken.mint() directly without emitting MintShares,
   // so Transfer is the canonical source for member balances.
 
-  const sign = operation === 'mint' ? 1n : -1n;
-  const daoTotalDelta = amounts.reduce((sum, amt) => sum + amt * sign, 0n);
-
-  const dao = await ctx.db.getDao(daoId);
-  if (!dao) {
-    logger.warn({ daoId }, 'handleMintOrBurn - DAO not found, skipping total update');
+  // H4: Defensive length check (arrays come from ABI decoding so should always
+  // match, but validates the invariant explicitly like handleRagequit does).
+  if (addresses.length !== amounts.length) {
+    logger.error({ daoId, addressesLen: addresses.length, amountsLen: amounts.length },
+      'handleMintOrBurn: array length mismatch, skipping');
     return;
   }
 
-  const totalField = tokenType === 'shares' ? 'total_shares' : 'total_loot';
-  const currentTotalStr = (dao[totalField] as string) || '0';
-  const currentTotal = BigInt(currentTotalStr);
-  const updatedRaw = currentTotal + daoTotalDelta;
-  if (updatedRaw < 0n) {
-    logger.warn({ daoId, tokenType, operation, currentTotal: currentTotalStr, daoTotalDelta: daoTotalDelta.toString() }, 'handleMintOrBurn: DAO total would go negative — clamping to 0 (possible reorg or out-of-order event)');
-  }
-  const updatedTotal = (updatedRaw < 0n ? 0n : updatedRaw).toString();
+  const sign = operation === 'mint' ? 1n : -1n;
+  const daoTotalDelta = amounts.reduce((sum, amt) => sum + amt * sign, 0n);
 
-  await ctx.db.updateDao(daoId, {
-    [totalField]: updatedTotal,
-  });
+  // Atomic server-side adjustment — eliminates read-modify-write race window
+  // between handler completion and markLogProcessed (audit M20).
+  await ctx.db.adjustDaoTotals(
+    daoId,
+    tokenType === 'shares' ? daoTotalDelta.toString() : '0',
+    tokenType === 'loot' ? daoTotalDelta.toString() : '0',
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -87,20 +117,20 @@ export const handleSetupComplete: EventHandler = async (
 
   const lootPaused = Boolean(args.lootPaused);
   const sharesPaused = Boolean(args.sharesPaused);
-  const gracePeriod = Number(args.gracePeriod);
-  const votingPeriod = Number(args.votingPeriod);
+  const gracePeriod = safeNumber(args.gracePeriod, 'SetupComplete.gracePeriod');
+  const votingPeriod = safeNumber(args.votingPeriod, 'SetupComplete.votingPeriod');
   const proposalOffering = safeBigInt(args.proposalOffering).toString();
   const quorumPercent = safeBigInt(args.quorumPercent).toString();
   const sponsorThreshold = safeBigInt(args.sponsorThreshold).toString();
   const minRetentionPercent = safeBigInt(args.minRetentionPercent).toString();
-  const name = String(args.name);
-  const symbol = String(args.symbol);
+  const name = String(args.name).slice(0, 255);
+  const symbol = String(args.symbol).slice(0, 32);
   const guildTokens: string[] = validateArray(args.guildTokens, 'guildTokens').map((a) => String(a).toLowerCase());
   const totalShares = safeBigInt(args.totalShares).toString();
   const totalLoot = safeBigInt(args.totalLoot).toString();
 
-  const lootTokenName = String(args.lootName);
-  const lootTokenSymbol = String(args.lootSymbol);
+  const lootTokenName = String(args.lootName).slice(0, 255);
+  const lootTokenSymbol = String(args.lootSymbol).slice(0, 32);
 
   logger.info({ daoId, name, symbol }, 'SetupComplete');
 
@@ -149,11 +179,11 @@ export const handleSubmitProposal: EventHandler = async (
   const proposalIdNum = Number(args.proposal);
   const proposalDataHash = validateBytes32(args.proposalDataHash, 'proposalDataHash');
   const submitter = validateAndNormalizeAddress(args.submitter, 'submitter');
-  const votingPeriod = Number(args.votingPeriod);
+  const votingPeriod = safeNumber(args.votingPeriod, 'SubmitProposal.votingPeriod');
   const proposalData = String(args.proposalData);
-  const expiration = Number(args.expiration);
+  const expiration = safeNumber(args.expiration, 'SubmitProposal.expiration');
   const selfSponsor = Boolean(args.selfSponsor);
-  const timestamp = Number(args.timestamp);
+  const timestamp = safeNumber(args.timestamp, 'SubmitProposal.timestamp');
   let details = String(args.details);
   if (details.length > MAX_DETAILS_SIZE) {
     logger.warn({ daoId, proposalId: proposalIdNum, originalSize: details.length }, 'SubmitProposal details truncated');
@@ -219,9 +249,9 @@ export const handleSponsorProposal: EventHandler = async (
   const memberAddress = validateAndNormalizeAddress(args.member, 'member');
   // safe: proposal IDs are sequential from 1, overflow at 2^53 (~9 quadrillion) is impossible in practice
   const proposalIdNum = Number(args.proposal);
-  const votingStarts = Number(args.votingStarts);
-  const votingEnds = new Date(Number(args.votingEnds) * 1000).toISOString();
-  const graceEnds = new Date(Number(args.graceEnds) * 1000).toISOString();
+  const votingStarts = safeNumber(args.votingStarts, 'SponsorProposal.votingStarts');
+  const votingEnds = new Date(safeNumber(args.votingEnds, 'SponsorProposal.votingEnds') * 1000).toISOString();
+  const graceEnds = new Date(safeNumber(args.graceEnds, 'SponsorProposal.graceEnds') * 1000).toISOString();
   const maxTotalSharesAtSponsor = safeBigInt(args.maxTotalSharesAtSponsor).toString();
   const maxTotalSharesAndLootAtVote = safeBigInt(args.maxTotalSharesAndLootAtVote).toString();
 
@@ -465,18 +495,13 @@ export const handleRagequit: EventHandler = async (
   // sharesToken.burn() / lootToken.burn() but does NOT emit BurnShares /
   // BurnLoot events — only Transfer + Ragequit. So this handler is the
   // sole owner of the DAO total adjustment for ragequit operations.
-  const dao = await ctx.db.getDao(daoId);
-  if (dao) {
-    const updates: Record<string, unknown> = {};
-    if (sharesToBurn > 0n) {
-      updates.total_shares = subtractNumericStringsFloored(dao.total_shares || '0', sharesToBurn.toString());
-    }
-    if (lootToBurn > 0n) {
-      updates.total_loot = subtractNumericStringsFloored(dao.total_loot || '0', lootToBurn.toString());
-    }
-    if (Object.keys(updates).length > 0) {
-      await ctx.db.updateDao(daoId, updates);
-    }
+  // Atomic server-side adjustment (audit M20).
+  if (sharesToBurn > 0n || lootToBurn > 0n) {
+    await ctx.db.adjustDaoTotals(
+      daoId,
+      sharesToBurn > 0n ? (-sharesToBurn).toString() : '0',
+      lootToBurn > 0n ? (-lootToBurn).toString() : '0',
+    );
   }
 };
 
@@ -514,75 +539,99 @@ export const handleNavigatorSet: EventHandler = async (
   let navDescription: string | null = null;
 
   if (permission > 0) {
-    try {
-      const iNavIface = new Interface(INavigatorAbi);
-      const topic0 = iNavIface.getEvent('NavigatorDeployed')!.topicHash;
-      const logs = await ctx.blockchain.getLogs(
-        navigatorAddress,
-        config.startBlock,
-        ctx.log.blockNumber,
-        [[topic0]],
-      );
-      if (logs.length > 1) {
-        logger.warn({ navigatorAddress, count: logs.length },
-          'Multiple NavigatorDeployed logs found — using first');
+    // H3: Check metadata cache first (NavigatorDeployed is immutable constructor data).
+    const cachedMeta = navigatorMetadataCache.get(navigatorAddress);
+    if (cachedMeta !== undefined) {
+      if (cachedMeta !== null) {
+        deployerAddress = cachedMeta.deployer;
+        navigatorType = cachedMeta.navigatorType;
+        navName = cachedMeta.name;
+        navDescription = cachedMeta.description;
       }
-      if (logs.length > 0) {
-        const parsed = iNavIface.parseLog({
-          topics: logs[0].topics as string[],
-          data: logs[0].data,
-        });
-        if (parsed) {
-          const eventDaoShip = String(parsed.args.daoShip).toLowerCase();
-          if (eventDaoShip === daoId) {
-            deployerAddress = String(parsed.args.deployer).toLowerCase();
-            navigatorType = String(parsed.args.navigatorType).slice(0, 50) || null;
-            navName = String(parsed.args.name).slice(0, 255) || null;
-            navDescription = String(parsed.args.description).slice(0, 1000) || null;
-          } else {
-            logger.warn({ navigatorAddress, eventDaoShip, expectedDaoId: daoId },
-              'NavigatorDeployed daoShip mismatch — ignoring deploy event');
+      // cachedMeta === null means we already searched and found nothing — skip RPC.
+    } else {
+      try {
+        const topic0 = iNavIface.getEvent('NavigatorDeployed')!.topicHash;
+        // H3: Search backwards from the NavigatorSet block — the deploy event always
+        // precedes NavigatorSet (often in the same block or very close). This avoids
+        // scanning from startBlock on mature chains.
+        const MAX_LOG_RANGE = 10_000;
+        const searchStart = ctx.log.blockNumber;
+        // Search backwards from the NavigatorSet block down to startBlock (or 0).
+        // Use the lower of startBlock and searchStart as the floor to handle cases
+        // where startBlock is ahead of the event block (e.g., re-indexing).
+        const searchEnd = Math.min(Math.max(config.startBlock, 0), searchStart);
+        let logs: Awaited<ReturnType<typeof ctx.blockchain.getLogs>> = [];
+        for (let to = searchStart; to >= searchEnd; to -= MAX_LOG_RANGE) {
+          const from = Math.max(to - MAX_LOG_RANGE + 1, searchEnd);
+          const chunk = await ctx.blockchain.getLogs(navigatorAddress, from, to, [[topic0]]);
+          if (chunk.length > 0) {
+            logs = chunk;
+            break; // NavigatorDeployed is a constructor event — only need the first match
           }
         }
+        if (logs.length > 1) {
+          logger.warn({ navigatorAddress, count: logs.length },
+            'Multiple NavigatorDeployed logs found — using first');
+        }
+        let metadata: NavigatorMetadata = null;
+        if (logs.length > 0) {
+          const parsed = iNavIface.parseLog({
+            topics: logs[0].topics as string[],
+            data: logs[0].data,
+          });
+          if (parsed) {
+            const eventDaoShip = String(parsed.args.daoShip).toLowerCase();
+            if (eventDaoShip === daoId) {
+              deployerAddress = String(parsed.args.deployer).toLowerCase();
+              navigatorType = sanitizeStr(String(parsed.args.navigatorType), 50);
+              navName = sanitizeStr(String(parsed.args.name), 255);
+              navDescription = sanitizeStr(String(parsed.args.description), 1000);
+              metadata = { deployer: deployerAddress, navigatorType, name: navName, description: navDescription };
+            } else {
+              logger.warn({ navigatorAddress, eventDaoShip, expectedDaoId: daoId },
+                'NavigatorDeployed daoShip mismatch — ignoring deploy event');
+            }
+          }
+        }
+        // Cache result (including null for "not found") to avoid repeat scans.
+        if (navigatorMetadataCache.size >= NAVIGATOR_METADATA_CACHE_MAX) {
+          const oldest = navigatorMetadataCache.keys().next().value;
+          if (oldest !== undefined) navigatorMetadataCache.delete(oldest);
+        }
+        navigatorMetadataCache.set(navigatorAddress, metadata);
+      } catch (err) {
+        logger.warn({ navigatorAddress, error: (err as Error).message },
+          'NavigatorDeployed log fetch failed (non-fatal)');
       }
-    } catch (err) {
-      logger.warn({ navigatorAddress, error: (err as Error).message },
-        'NavigatorDeployed log fetch failed (non-fatal)');
     }
   }
 
   const now = new Date(ctx.blockTimestamp * 1000).toISOString();
-  if (permission === 0) {
-    // Deactivation: only update status fields, preserve existing metadata
-    await ctx.db.upsert('ds_navigators', {
-      id,
-      dao_id: daoId,
-      navigator_address: navigatorAddress,
-      permission,
-      permission_label: permissionToLabel(permission),
-      is_active: false,
-      created_at: now,
-      tx_hash: ctx.log.transactionHash,
-      updated_at: now,
-    });
-  } else {
-    // Activation/update: full upsert with metadata from NavigatorDeployed
-    await ctx.db.upsert('ds_navigators', {
-      id,
-      dao_id: daoId,
-      navigator_address: navigatorAddress,
-      deployer: deployerAddress,
-      permission,
-      permission_label: permissionToLabel(permission),
-      is_active: true,
-      navigator_type: navigatorType,
-      name: navName,
-      description: navDescription,
-      created_at: now,
-      tx_hash: ctx.log.transactionHash,
-      updated_at: now,
-    });
-  }
+
+  // Base fields for all upserts (INSERT needs created_at; UPDATE preserves it via
+  // the existing row — Supabase upsert overwrites provided columns, so we always
+  // include created_at for the INSERT path but accept the overwrite on UPDATE).
+  const baseFields: Record<string, unknown> = {
+    id,
+    dao_id: daoId,
+    navigator_address: navigatorAddress,
+    permission,
+    permission_label: permissionToLabel(permission),
+    is_active: permission > 0,
+    created_at: now,
+    tx_hash: ctx.log.transactionHash,
+    updated_at: now,
+  };
+
+  // Only include metadata fields when they were successfully fetched (non-null).
+  // Omitting them from the upsert preserves existing values on the UPDATE path.
+  if (deployerAddress !== null) baseFields.deployer = deployerAddress;
+  if (navigatorType !== null) baseFields.navigator_type = navigatorType;
+  if (navName !== null) baseFields.name = navName;
+  if (navDescription !== null) baseFields.description = navDescription;
+
+  await ctx.db.upsert('ds_navigators', baseFields);
 
   // Register navigator for log fetching — only if this NavigatorSet came from a known DAOShip
   if (ctx.registry.getDaoByDaoShipAddress(daoId)) {
@@ -608,13 +657,13 @@ export const handleGovernanceConfigSet: EventHandler = async (
   const daoId = ctx.log.address.toLowerCase();
   validateEventArgs(args, ['votingPeriod', 'gracePeriod', 'proposalOffering', 'quorumPercent', 'sponsorThreshold', 'minRetentionPercent', 'defaultExpiryWindow'], 'GovernanceConfigSet');
 
-  const votingPeriod = Number(args.votingPeriod);
-  const gracePeriod = Number(args.gracePeriod);
+  const votingPeriod = safeNumber(args.votingPeriod, 'GovernanceConfigSet.votingPeriod');
+  const gracePeriod = safeNumber(args.gracePeriod, 'GovernanceConfigSet.gracePeriod');
   const proposalOffering = safeBigInt(args.proposalOffering).toString();
   const quorumPercent = safeBigInt(args.quorumPercent).toString();
   const sponsorThreshold = safeBigInt(args.sponsorThreshold).toString();
   const minRetentionPercent = safeBigInt(args.minRetentionPercent).toString();
-  const defaultExpiryWindow = Number(args.defaultExpiryWindow);
+  const defaultExpiryWindow = safeNumber(args.defaultExpiryWindow, 'GovernanceConfigSet.defaultExpiryWindow');
 
   logger.info(
     { daoId, votingPeriod, gracePeriod, defaultExpiryWindow },
@@ -814,13 +863,8 @@ export const handleConvertSharesToLoot: EventHandler = async (
   // Note: convertSharesToLoot does NOT emit BurnShares or MintLoot, so
   // handleMintOrBurn won't fire for these. This handler is the sole owner
   // of the DAO total adjustment for this operation.
-  const dao = await ctx.db.getDao(daoId);
-  if (dao) {
-    await ctx.db.updateDao(daoId, {
-      total_shares: subtractNumericStringsFloored(dao.total_shares || '0', amountStr),
-      total_loot: addNumericStrings(dao.total_loot || '0', amountStr),
-    });
-  }
+  // Atomic server-side adjustment (audit M20).
+  await ctx.db.adjustDaoTotals(daoId, (-amount).toString(), amountStr);
 };
 
 // ---------------------------------------------------------------------------
