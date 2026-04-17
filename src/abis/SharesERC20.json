@@ -172,6 +172,11 @@
   },
   {
     "inputs": [],
+    "name": "InvalidDelegatee",
+    "type": "error"
+  },
+  {
+    "inputs": [],
     "name": "MintCapExceeded",
     "type": "error"
   },
@@ -195,6 +200,11 @@
       }
     ],
     "name": "OwnableUnauthorizedAccount",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "TimepointOverflow",
     "type": "error"
   },
   {

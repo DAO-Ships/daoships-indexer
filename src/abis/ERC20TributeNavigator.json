@@ -40,6 +40,16 @@
         "internalType": "bytes32",
         "name": "_allowlistRoot",
         "type": "bytes32"
+      },
+      {
+        "internalType": "string",
+        "name": "_name",
+        "type": "string"
+      },
+      {
+        "internalType": "string",
+        "name": "_description",
+        "type": "string"
       }
     ],
     "stateMutability": "nonpayable",
@@ -107,6 +117,43 @@
       {
         "indexed": true,
         "internalType": "address",
+        "name": "daoShip",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "deployer",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "string",
+        "name": "navigatorType",
+        "type": "string"
+      },
+      {
+        "indexed": false,
+        "internalType": "string",
+        "name": "name",
+        "type": "string"
+      },
+      {
+        "indexed": false,
+        "internalType": "string",
+        "name": "description",
+        "type": "string"
+      }
+    ],
+    "name": "NavigatorDeployed",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
         "name": "daoShipAddress",
         "type": "address"
       },
@@ -119,7 +166,7 @@
       {
         "indexed": false,
         "internalType": "uint256",
-        "name": "tributeAmount",
+        "name": "amount",
         "type": "uint256"
       },
       {
@@ -183,6 +230,19 @@
     "outputs": [
       {
         "internalType": "contract DAOShip",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "deployer",
+    "outputs": [
+      {
+        "internalType": "address",
         "name": "",
         "type": "address"
       }

@@ -167,74 +167,70 @@ function clean(obj: Record<string, unknown>): Record<string, unknown> {
 const ETH_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 const BYTES32_RE = /^0x[0-9a-fA-F]{64}$/;
 
-// ── On-Chain Verification for Pre-DAO Allowlist Posts ───────────
+// ── Allowlist Post Verification (H1) ────────────────────────────
+// The permissionless Poster contract lets anyone emit NewPost(navigator.allowlist)
+// with arbitrary content. Previously we verified each post via three per-event
+// RPC calls (getCode + daoShip() + allowlistRoot()) — an uncapped DoS vector
+// because an attacker could spam posts for any random navigator address.
+//
+// We now derive trust entirely from the indexed NavigatorDeployed event:
+//   - The navigator's `deployer` is immutable and comes from the constructor event.
+//   - The navigator's `daoShip` is immutable and encoded in the ds_navigators.id prefix.
+//   - The navigator's `allowlistRoot()` is cached in ds_navigators.allowlist_root
+//     when NavigatorDeployed is indexed (one RPC per navigator, not per post).
+//
+// An allowlist post must satisfy ALL of: the navigator row exists, the post's
+// user matches the stored deployer, the claimed DAO matches the navigator's
+// declared daoShip, and the posted root matches the cached root. Otherwise
+// rejected with zero RPC cost.
 
-const ALLOWLIST_ROOT_SELECTOR = keccak256('allowlistRoot()').slice(0, 10);
-const DAOSHIP_SELECTOR = keccak256('daoShip()').slice(0, 10);
+type AllowlistVerification = {
+  accepted: boolean;
+  trust: 'SEMI_TRUSTED' | 'ON_CHAIN_PROVISIONAL' | null;
+  daoId: string | null;
+  reason?: string;
+};
 
-/**
- * Verify navigator allowlist data on-chain when the DAO doesn't exist yet.
- * Checks: contract exists, daoShip() matches claimed daoAddress, allowlistRoot() matches posted root.
- * Returns false on deterministic failures (no code, mismatch, revert, timeout).
- * getCode errors propagate (transient — processor retries block range).
- * rawCall errors are caught (timeout/revert are deterministic for a given contract).
- */
-async function verifyAllowlistOnChain(
+async function verifyAllowlistFromIndex(
   ctx: EventContext,
+  user: string,
   navigatorAddress: string,
-  daoAddress: string,
-  expectedRoot: string,
-): Promise<boolean> {
-  // 1. Verify contract exists (getCode errors propagate as transient)
-  const code = await ctx.blockchain.getCode(navigatorAddress);
-  if (!code || code === '0x' || code === '0x0') {
-    logger.warn({ navigatorAddress }, 'navigator.allowlist: no contract code at navigatorAddress');
-    return false;
+  claimedDao: string,
+  postedRoot: string,
+): Promise<AllowlistVerification> {
+  // DB errors propagate — processor retries the block range.
+  const nav = await ctx.db.getNavigatorByAddress(navigatorAddress);
+  if (!nav) {
+    return { accepted: false, trust: null, daoId: null, reason: 'navigator not indexed' };
   }
 
-  // 2. Verify daoShip() matches claimed daoAddress (prevents cross-DAO spoofing)
-  let daoShipResult: string;
-  try {
-    daoShipResult = await ctx.blockchain.rawCall(navigatorAddress, DAOSHIP_SELECTOR);
-  } catch (err) {
-    logger.warn({ navigatorAddress, error: (err as Error).message },
-      'navigator.allowlist: daoShip() call failed (revert/timeout)');
-    return false;
-  }
-  // ABI-encoded address is exactly 0x + 64 hex chars (32 bytes, address in low 20)
-  if (!daoShipResult || daoShipResult.length !== 66) {
-    logger.warn({ navigatorAddress, len: daoShipResult?.length }, 'navigator.allowlist: daoShip() unexpected return length');
-    return false;
-  }
-  const onChainDaoShip = ('0x' + daoShipResult.slice(26)).toLowerCase();
-  if (onChainDaoShip !== daoAddress.toLowerCase()) {
-    logger.warn({ navigatorAddress, expected: daoAddress, onChain: onChainDaoShip },
-      'navigator.allowlist: daoShip mismatch — possible cross-DAO spoofing');
-    return false;
+  // The id encodes the navigator's declared daoShip as the 42-char prefix.
+  // Expected id = `${claimedDao}-${navigatorAddress}`; any mismatch means the
+  // post claims a DAO different from what the navigator contract committed to.
+  const expectedId = `${claimedDao}-${navigatorAddress}`;
+  if (nav.id !== expectedId) {
+    return { accepted: false, trust: null, daoId: null, reason: 'daoShip mismatch' };
   }
 
-  // 3. Verify allowlistRoot() matches posted root
-  let rootResult: string;
-  try {
-    rootResult = await ctx.blockchain.rawCall(navigatorAddress, ALLOWLIST_ROOT_SELECTOR);
-  } catch (err) {
-    logger.warn({ navigatorAddress, error: (err as Error).message },
-      'navigator.allowlist: allowlistRoot() call failed (revert/timeout)');
-    return false;
-  }
-  // ABI-encoded bytes32 is exactly 0x + 64 hex chars
-  if (!rootResult || rootResult.length !== 66) {
-    logger.warn({ navigatorAddress, len: rootResult?.length }, 'navigator.allowlist: allowlistRoot() unexpected return length');
-    return false;
-  }
-  const onChainRoot = ('0x' + rootResult.slice(2)).toLowerCase();
-  if (onChainRoot !== expectedRoot.toLowerCase()) {
-    logger.warn({ navigatorAddress, expected: expectedRoot, onChain: onChainRoot },
-      'navigator.allowlist: root mismatch');
-    return false;
+  if (!nav.deployer || nav.deployer !== user) {
+    return { accepted: false, trust: null, daoId: null, reason: 'user is not navigator deployer' };
   }
 
-  return true;
+  // Missing cached root → navigator's allowlistRoot() call failed at deploy
+  // time, or it's an open allowlist (stored as NULL). Either way, reject.
+  if (!nav.allowlist_root) {
+    return { accepted: false, trust: null, daoId: null, reason: 'no cached allowlist_root for navigator' };
+  }
+
+  if (nav.allowlist_root.toLowerCase() !== postedRoot.toLowerCase()) {
+    return { accepted: false, trust: null, daoId: null, reason: 'root mismatch' };
+  }
+
+  // Pass. Trust level depends on whether the navigator is currently registered
+  // (activated via NavigatorSet from a live DAOShip) or still an orphan.
+  return nav.dao_id
+    ? { accepted: true, trust: 'SEMI_TRUSTED', daoId: nav.dao_id }
+    : { accepted: true, trust: 'ON_CHAIN_PROVISIONAL', daoId: null };
 }
 
 // ── Tag-Specific Content Validators ─────────────────────────────
@@ -439,9 +435,9 @@ export async function handleNewPost(
   let preValidated: Record<string, unknown> | null = null;
 
   if (isNavigatorAllowlist && parsed?.daoAddress && parsed?.navigatorAddress && parsed?.root) {
-    // ── Navigator allowlist: on-chain verification path ────────
-    // The DAO may not exist yet (navigator deployed before DAO launch).
-    // Try normal path first; if DAO doesn't exist, verify on-chain.
+    // ── Navigator allowlist: DB-indexed verification (H1) ──────
+    // All verification is derived from the indexed NavigatorDeployed event.
+    // Zero RPC calls on the hot path — see verifyAllowlistFromIndex.
 
     const validator = TAG_VALIDATORS[tagName];
     preValidated = validator ? validator(parsed) : null;
@@ -454,39 +450,21 @@ export async function handleNewPost(
     const navAddr = String(preValidated.navigatorAddress).toLowerCase();
     const root = String(preValidated.root);
 
-    // Try normal DAO+trust path first (DB errors propagate — processor retries)
-    let normalPathSucceeded = false;
-    const dao = await ctx.db.getDao(claimedDao);
-    if (dao) {
-      daoId = claimedDao;
-      // M7: Pass pre-fetched DAO to avoid redundant DB call
-      const result = await determineTrustLevel(ctx, user, daoId, tagName, dao);
-      trustLevel = result.trust;
-      trustDao = result.dao;
-      if (meetsMinTrust(trustLevel, tagDef.minTrust)) {
-        normalPathSucceeded = true;
-      } else {
-        // DAO exists but trust insufficient — NO fallback to on-chain
-        logger.warn({ user, daoId, tag: tagName, trustLevel, requiredTrust: tagDef.minTrust },
-          'NewPost: insufficient trust level, skipping');
-        return;
-      }
+    const verdict = await verifyAllowlistFromIndex(ctx, user, navAddr, claimedDao, root);
+    if (!verdict.accepted) {
+      logger.warn(
+        { user, navigatorAddress: navAddr, daoAddress: claimedDao, reason: verdict.reason },
+        'navigator.allowlist: verification failed, skipping',
+      );
+      return;
     }
 
-    if (!normalPathSucceeded) {
-      // On-chain verification: getCode + daoShip() + allowlistRoot()
-      // Throws on transient RPC errors (processor retries block range).
-      const verified = await verifyAllowlistOnChain(ctx, navAddr, claimedDao, root);
-      if (!verified) {
-        logger.warn({ user, navigatorAddress: navAddr, daoAddress: claimedDao },
-          'navigator.allowlist: on-chain verification failed, skipping');
-        return;
-      }
-      daoId = null; // DAO doesn't exist yet — store as orphan
-      trustLevel = 'ON_CHAIN_PROVISIONAL';
-      logger.info({ daoAddress: claimedDao, navigatorAddress: navAddr },
-        'navigator.allowlist: verified via on-chain (pre-DAO)');
-    }
+    daoId = verdict.daoId;
+    trustLevel = verdict.trust!;
+    logger.info(
+      { user, daoAddress: claimedDao, navigatorAddress: navAddr, trustLevel },
+      'navigator.allowlist: verified against indexed navigator metadata',
+    );
   } else {
     // ── Normal path for all other tags ─────────────────────────
 

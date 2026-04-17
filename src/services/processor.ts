@@ -61,6 +61,16 @@ export class BlockProcessor {
     this.dispatcher = dispatcher;
   }
 
+  /**
+   * M4: Clear in-memory block cache. Called from the reorg recovery path
+   * because cached `{ timestamp, hash }` entries for blocks ≥ forkPoint
+   * reflect the pre-reorg chain and would re-appear as stale results from
+   * `getBlockTimestamp()` / the last-hash return in `processBlockRange`.
+   */
+  clearCaches(): void {
+    this.blockCache.clear();
+  }
+
   async processBlockRange(fromBlock: number, toBlock: number): Promise<{ lastBlockHash: string }> {
     if (fromBlock > toBlock) {
       throw new Error(`Invalid block range: fromBlock ${fromBlock} > toBlock ${toBlock}`);
@@ -82,7 +92,8 @@ export class BlockProcessor {
     // processing new logs may register further addresses (e.g., NavigatorSet in
     // the second pass registers navigators whose events need a third pass).
     const MAX_DISCOVERY_PASSES = 3;
-    for (let pass = 0; pass < MAX_DISCOVERY_PASSES; pass++) {
+    let pass = 0;
+    for (; pass < MAX_DISCOVERY_PASSES; pass++) {
       const currentAddresses = new Set([
         ...this.registry.getAllDaoShipAddresses(),
         ...this.registry.getAllTokenAddresses(),
@@ -104,6 +115,31 @@ export class BlockProcessor {
 
       // Add discovered addresses to known set for next iteration
       for (const addr of newAddresses) knownAddresses.add(addr);
+    }
+
+    // S2: If the cap was reached AND new addresses are still being discovered,
+    // events for those addresses have NOT been fetched yet. Silently advancing
+    // lastProcessedBlock would permanently drop those events. Throw to fail
+    // the block range so it retries — the retry starts with the now-expanded
+    // registry and converges in at most 1 pass. Dedup via ds_processed_logs
+    // prevents re-handling already-processed logs.
+    if (pass === MAX_DISCOVERY_PASSES) {
+      const currentAddresses = new Set([
+        ...this.registry.getAllDaoShipAddresses(),
+        ...this.registry.getAllTokenAddresses(),
+        ...this.registry.getAllNavigatorAddresses(),
+      ]);
+      const stillNew = [...currentAddresses].filter(a => !knownAddresses.has(a));
+      if (stillNew.length > 0) {
+        logger.error(
+          { fromBlock, toBlock, pendingCount: stillNew.length, sample: stillNew.slice(0, 5) },
+          'Discovery pass limit reached with addresses still pending — failing range for retry',
+        );
+        throw new Error(
+          `Discovery pass limit (${MAX_DISCOVERY_PASSES}) exceeded for range ${fromBlock}-${toBlock} ` +
+          `with ${stillNew.length} new addresses still pending`,
+        );
+      }
     }
 
     // Return the hash of the last block (may already be cached from getBlockTimestamp)
@@ -250,6 +286,13 @@ export class BlockProcessor {
     const registeredTopics = this.dispatcher.getRegisteredTopics();
     if (registeredTopics.length === 0) return [];
 
+    // Topics that need unfiltered scanning (no address filter) — e.g. NavigatorDeployed
+    const unfilteredTopics = this.dispatcher.getUnfilteredTopics();
+    // Address-scoped topics: everything except unfiltered ones
+    const scopedTopics = unfilteredTopics.length > 0
+      ? registeredTopics.filter(t => !unfilteredTopics.includes(t))
+      : registeredTopics;
+
     // All known addresses we want logs from
     const knownAddresses = new Set([
       ...Object.values(config.contracts),
@@ -258,20 +301,36 @@ export class BlockProcessor {
       ...this.registry.getAllNavigatorAddresses(),
     ]);
 
-    // Fetch logs matching our topic0 hashes, scoped to known addresses.
-    // Server-side address filter avoids pulling chain-wide Transfer events.
-    // Batch into chunks if address list exceeds RPC provider limits.
-    const addressFilter = [...knownAddresses];
-    if (addressFilter.length <= GET_LOGS_ADDRESS_CHUNK_SIZE) {
-      return this.blockchain.getLogs(addressFilter, fromBlock, toBlock, [registeredTopics]);
+    const allLogs: Log[] = [];
+
+    // 1. Address-scoped fetch (the majority of events)
+    if (scopedTopics.length > 0) {
+      const addressFilter = [...knownAddresses];
+      if (addressFilter.length <= GET_LOGS_ADDRESS_CHUNK_SIZE) {
+        const logs = await this.blockchain.getLogs(addressFilter, fromBlock, toBlock, [scopedTopics]);
+        allLogs.push(...logs);
+      } else {
+        for (let i = 0; i < addressFilter.length; i += GET_LOGS_ADDRESS_CHUNK_SIZE) {
+          const batch = addressFilter.slice(i, i + GET_LOGS_ADDRESS_CHUNK_SIZE);
+          const logs = await this.blockchain.getLogs(batch, fromBlock, toBlock, [scopedTopics]);
+          allLogs.push(...logs);
+        }
+      }
     }
 
-    const allLogs: Log[] = [];
-    for (let i = 0; i < addressFilter.length; i += GET_LOGS_ADDRESS_CHUNK_SIZE) {
-      const batch = addressFilter.slice(i, i + GET_LOGS_ADDRESS_CHUNK_SIZE);
-      const logs = await this.blockchain.getLogs(batch, fromBlock, toBlock, [registeredTopics]);
-      allLogs.push(...logs);
+    // 2. Unfiltered fetch (global topic0 scan, no address filter)
+    if (unfilteredTopics.length > 0) {
+      const logs = await this.blockchain.getLogs(null, fromBlock, toBlock, [unfilteredTopics]);
+      // Deduplicate: an unfiltered log may also match a known address from the scoped fetch
+      const seen = new Set(allLogs.map(l => `${l.transactionHash}-${l.index}`));
+      for (const log of logs) {
+        const key = `${log.transactionHash}-${log.index}`;
+        if (!seen.has(key)) {
+          allLogs.push(log);
+        }
+      }
     }
+
     return allLogs;
   }
 

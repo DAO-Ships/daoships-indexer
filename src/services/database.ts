@@ -31,6 +31,12 @@ export class DatabaseService {
   // Type uses `any` for schema because the schema name is dynamic (testnet, mainnet, dev)
   readonly client: SupabaseClient<any, string>;
 
+  // SC7: Highest cutoff we've successfully pruned processed_logs at, in memory.
+  // The cutoff moves forward with indexing; re-pruning at ≤ the same cutoff is
+  // always a no-op, so we skip the RTT. Resets to 0 on process restart which
+  // triggers exactly one redundant DELETE (acceptable).
+  private lastPrunedCutoff = 0;
+
   constructor() {
     this.client = createClient(
       config.supabaseUrl,
@@ -62,10 +68,13 @@ export class DatabaseService {
     blockNumber: number;
     blockHash: string | null;
     isSyncing: boolean;
+    requiresFullReindex: boolean;
+    reindexReason: string | null;
+    reindexFlaggedAt: string | null;
   }> {
     const { data, error } = await this.client
       .from('ds_indexer_state')
-      .select('last_block_number, last_block_hash, is_syncing')
+      .select('last_block_number, last_block_hash, is_syncing, requires_full_reindex, reindex_reason, reindex_flagged_at')
       .eq('id', 1)
       .single();
 
@@ -74,7 +83,42 @@ export class DatabaseService {
       blockNumber: data?.last_block_number ?? 0,
       blockHash: data?.last_block_hash ?? null,
       isSyncing: data?.is_syncing ?? false,
+      requiresFullReindex: data?.requires_full_reindex ?? false,
+      reindexReason: data?.reindex_reason ?? null,
+      reindexFlaggedAt: data?.reindex_flagged_at ?? null,
     };
+  }
+
+  // M2: Flag the indexer state as requiring a full reindex. Set by the reorg
+  // recovery path when a reorg exceeds the confirmation window — member
+  // balances cannot be rebuilt from the replay range alone, so totals may
+  // drift until operators run a full reindex. Surfaced via /health.
+  async setRequiresFullReindex(reason: string): Promise<void> {
+    const { error } = await this.client
+      .from('ds_indexer_state')
+      .update({
+        requires_full_reindex: true,
+        reindex_reason: reason,
+        reindex_flagged_at: new Date().toISOString(),
+      })
+      .eq('id', 1);
+
+    if (error) throw new Error(`Failed to set requires_full_reindex: ${error.message}`);
+    logger.warn({ reason }, 'Indexer flagged as requires_full_reindex');
+  }
+
+  async clearRequiresFullReindex(): Promise<void> {
+    const { error } = await this.client
+      .from('ds_indexer_state')
+      .update({
+        requires_full_reindex: false,
+        reindex_reason: null,
+        reindex_flagged_at: null,
+      })
+      .eq('id', 1);
+
+    if (error) throw new Error(`Failed to clear requires_full_reindex: ${error.message}`);
+    logger.info('Cleared requires_full_reindex flag');
   }
 
   async updateLastProcessedBlock(blockNumber: number, blockHash: string): Promise<void> {
@@ -167,6 +211,18 @@ export class DatabaseService {
     if (error) throw new Error(`Failed to upsert member ${member.id}: ${error.message}`);
   }
 
+  // E1: Counterpart to insertProposalIfAbsent for member stubs.
+  async insertMemberIfAbsent(member: MemberUpsert): Promise<boolean> {
+    const { data, error } = await this.withDbTimeout(
+      this.client.from('ds_members')
+        .upsert(member, { onConflict: 'id', ignoreDuplicates: true })
+        .select('id'),
+      'insertMemberIfAbsent',
+    );
+    if (error) throw new Error(`Failed to insert-if-absent member ${member.id}: ${error.message}`);
+    return (data?.length ?? 0) > 0;
+  }
+
   // ── Proposal Operations ────────────────────────────────────────
 
   async getProposal(proposalId: string): Promise<ProposalRow | null> {
@@ -186,6 +242,22 @@ export class DatabaseService {
       'upsertProposal',
     );
     if (error) throw new Error(`Failed to upsert proposal ${proposal.id}: ${error.message}`);
+  }
+
+  // E1: INSERT … ON CONFLICT DO NOTHING, returning whether the row was
+  // actually inserted. Used by vote/ragequit handlers to materialize a stub
+  // row when the canonical event (SubmitProposal / MintShares) landed in a
+  // failed block range. Callers get the insert/no-op signal so they can
+  // distinguish a legitimate data gap from a re-run.
+  async insertProposalIfAbsent(proposal: ProposalRow): Promise<boolean> {
+    const { data, error } = await this.withDbTimeout(
+      this.client.from('ds_proposals')
+        .upsert(proposal, { onConflict: 'id', ignoreDuplicates: true })
+        .select('id'),
+      'insertProposalIfAbsent',
+    );
+    if (error) throw new Error(`Failed to insert-if-absent proposal ${proposal.id}: ${error.message}`);
+    return (data?.length ?? 0) > 0;
   }
 
   async updateProposal(proposalId: string, updates: ProposalUpdate): Promise<void> {
@@ -331,6 +403,68 @@ export class DatabaseService {
     }
   }
 
+  async pruneOrphanedNavigators(retentionDays: number): Promise<void> {
+    const { data, error } = await this.withDbTimeout(
+      this.client.rpc('ds_prune_orphaned_navigators', { p_retention_days: retentionDays }),
+      'pruneOrphanedNavigators',
+    );
+    if (error) {
+      logger.warn({ retentionDays, error: error.message }, 'Failed to prune orphaned navigators (non-fatal)');
+      return;
+    }
+    if (data && data > 0) {
+      logger.info({ retentionDays, deleted: data }, 'Pruned orphaned navigators');
+    }
+  }
+
+  async findOrphanNavigator(navigatorAddress: string): Promise<Record<string, unknown> | null> {
+    const normalized = validateAndNormalizeAddress(navigatorAddress, 'navigatorAddress');
+    const { data, error } = await this.withDbTimeout(
+      this.client.from('ds_navigators')
+        .select('id, dao_id, deployer, navigator_type, name, description')
+        .eq('navigator_address', normalized)
+        .is('dao_id', null)
+        .limit(1),
+      'findOrphanNavigator',
+    );
+    if (error) {
+      logger.warn({ navigatorAddress: normalized, error: error.message }, 'Failed to find orphan navigator (non-fatal)');
+      return null;
+    }
+    return data && data.length > 0 ? data[0] as Record<string, unknown> : null;
+  }
+
+  /**
+   * H1: Look up a navigator by address, returning the fields needed to verify
+   * allowlist posts against cached on-chain metadata (deployer, daoShip
+   * encoded in the id prefix, cached allowlist_root, and current dao_id).
+   * Replaces the per-post on-chain RPC verification path.
+   *
+   * Returns null if no row exists (post should be rejected — NavigatorDeployed
+   * has not been indexed for this address).
+   */
+  async getNavigatorByAddress(navigatorAddress: string): Promise<{
+    id: string;
+    dao_id: string | null;
+    deployer: string | null;
+    allowlist_root: string | null;
+  } | null> {
+    const normalized = validateAndNormalizeAddress(navigatorAddress, 'navigatorAddress');
+    const { data, error } = await this.withDbTimeout(
+      this.client.from('ds_navigators')
+        .select('id, dao_id, deployer, allowlist_root')
+        .eq('navigator_address', normalized)
+        .limit(1),
+      'getNavigatorByAddress',
+    );
+    if (error) {
+      throw new Error(`Failed to look up navigator ${normalized}: ${error.message}`);
+    }
+    return data && data.length > 0
+      ? data[0] as { id: string; dao_id: string | null; deployer: string | null; allowlist_root: string | null }
+      : null;
+  }
+
   // ── Lookup Helpers ─────────────────────────────────────────────
 
   async *getAllDaosIterator(): AsyncGenerator<DaoSummary> {
@@ -456,6 +590,10 @@ export class DatabaseService {
   async pruneProcessedLogs(currentBlock: number, reorgWalkBack: number): Promise<void> {
     const cutoff = currentBlock - (reorgWalkBack * 2); // 2x safety margin
     if (cutoff <= 0) return;
+    // SC7: Skip the DELETE RTT if we've already pruned at this cutoff or
+    // higher. In steady-state polling the cutoff advances every range so this
+    // only fires on retries-after-failure (where `currentBlock` can repeat).
+    if (cutoff <= this.lastPrunedCutoff) return;
     try {
       const { error } = await this.client
         .from('ds_processed_logs')
@@ -464,6 +602,7 @@ export class DatabaseService {
       if (error) {
         logger.warn({ error: error.message, cutoff }, 'Failed to prune processed_logs');
       } else {
+        this.lastPrunedCutoff = cutoff;
         logger.debug({ cutoff }, 'Pruned processed_logs');
       }
     } catch (err) {

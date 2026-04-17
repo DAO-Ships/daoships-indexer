@@ -1,13 +1,65 @@
 [
   {
-    "type": "event",
-    "name": "NavigatorDeployed",
+    "anonymous": false,
     "inputs": [
-      { "name": "daoShip", "type": "address", "indexed": true },
-      { "name": "deployer", "type": "address", "indexed": true },
-      { "name": "navigatorType", "type": "string", "indexed": false },
-      { "name": "name", "type": "string", "indexed": false },
-      { "name": "description", "type": "string", "indexed": false }
-    ]
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "daoShip",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "deployer",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "string",
+        "name": "navigatorType",
+        "type": "string"
+      },
+      {
+        "indexed": false,
+        "internalType": "string",
+        "name": "name",
+        "type": "string"
+      },
+      {
+        "indexed": false,
+        "internalType": "string",
+        "name": "description",
+        "type": "string"
+      }
+    ],
+    "name": "NavigatorDeployed",
+    "type": "event"
+  },
+  {
+    "inputs": [],
+    "name": "deployer",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "navigatorType",
+    "outputs": [
+      {
+        "internalType": "string",
+        "name": "",
+        "type": "string"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
   }
 ]

@@ -119,21 +119,21 @@ export class BlockchainService {
   }
 
   async getLogs(
-    address: string | string[],
+    address: string | string[] | null,
     fromBlock: number,
     toBlock: number,
     topics?: Array<string | string[] | null>,
   ): Promise<Log[]> {
     await this.rateLimit();
+    const filter: Record<string, unknown> = {
+      fromBlock,
+      toBlock,
+      topics: topics as any,
+      nodeLocation: [0, 0],
+    };
+    if (address !== null) filter.address = address;
     return this.withTrackedRetry(
-      () => this.provider.getLogs({
-        address,
-        fromBlock,
-        toBlock,
-        // quais Filter type doesn't match our topics signature
-        topics: topics as any,
-        nodeLocation: [0, 0],
-      }),
+      () => this.provider.getLogs(filter as any),
       `getLogs(${fromBlock}-${toBlock})`,
     );
   }

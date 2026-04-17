@@ -230,14 +230,14 @@ BEGIN
     EXECUTE format('
         CREATE TABLE IF NOT EXISTS %I.ds_navigators (
             id VARCHAR(85) PRIMARY KEY,
-            dao_id VARCHAR(42) NOT NULL REFERENCES %I.ds_daos(id) ON DELETE CASCADE,
+            dao_id VARCHAR(42) REFERENCES %I.ds_daos(id) ON DELETE CASCADE,
             navigator_address VARCHAR(42) NOT NULL,
             deployer VARCHAR(42),
 
             created_at TIMESTAMPTZ NOT NULL,
 
-            permission INTEGER NOT NULL,
-            permission_label public.ds_navigator_permission NOT NULL,
+            permission INTEGER NOT NULL DEFAULT 0,
+            permission_label public.ds_navigator_permission NOT NULL DEFAULT ''none'',
 
             is_active BOOLEAN DEFAULT TRUE,
             paused BOOLEAN DEFAULT FALSE,
@@ -245,12 +245,17 @@ BEGIN
             name VARCHAR(255),
             description TEXT,
             config JSONB,
+            allowlist_root VARCHAR(66),
 
             tx_hash VARCHAR(66) NOT NULL,
             updated_at TIMESTAMPTZ DEFAULT NOW(),
 
             UNIQUE(dao_id, navigator_address)
         )', s, s);
+
+    -- H1: Additive migration for pre-existing ds_navigators tables so the
+    -- allowlist_root cache is available without a full schema rebuild.
+    EXECUTE format('ALTER TABLE %I.ds_navigators ADD COLUMN IF NOT EXISTS allowlist_root VARCHAR(66)', s);
 
     -- DS_RAGEQUITS
     EXECUTE format('
@@ -353,9 +358,18 @@ BEGIN
             last_indexed_at TIMESTAMPTZ,
             chain_id INTEGER NOT NULL DEFAULT 15000,
             is_syncing BOOLEAN NOT NULL DEFAULT false,
+            requires_full_reindex BOOLEAN NOT NULL DEFAULT false,
+            reindex_reason TEXT,
+            reindex_flagged_at TIMESTAMPTZ,
 
             CHECK (id = 1)
         )', s);
+
+    -- M2: Additive migration for pre-existing ds_indexer_state tables that
+    -- don''t yet have the requires_full_reindex columns. Safe to re-run.
+    EXECUTE format('ALTER TABLE %I.ds_indexer_state ADD COLUMN IF NOT EXISTS requires_full_reindex BOOLEAN NOT NULL DEFAULT false', s);
+    EXECUTE format('ALTER TABLE %I.ds_indexer_state ADD COLUMN IF NOT EXISTS reindex_reason TEXT', s);
+    EXECUTE format('ALTER TABLE %I.ds_indexer_state ADD COLUMN IF NOT EXISTS reindex_flagged_at TIMESTAMPTZ', s);
 
     EXECUTE format('
         INSERT INTO %I.ds_indexer_state (id, last_block_number)
@@ -399,6 +413,7 @@ BEGIN
     EXECUTE format('CREATE INDEX IF NOT EXISTS idx_ds_ragequits_block ON %I.ds_ragequits(block_number)', s);
     EXECUTE format('CREATE INDEX IF NOT EXISTS idx_ds_records_block ON %I.ds_records(block_number)', s);
     EXECUTE format('CREATE INDEX IF NOT EXISTS idx_ds_records_orphaned ON %I.ds_records(created_at) WHERE dao_id IS NULL', s);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS idx_ds_navigators_orphaned ON %I.ds_navigators(created_at) WHERE dao_id IS NULL', s);
     EXECUTE format('CREATE INDEX IF NOT EXISTS idx_ds_records_navigator_addr ON %I.ds_records((content_json->>''navigatorAddress'')) WHERE tag = ''daoships.navigator.allowlist''', s);
     EXECUTE format('CREATE INDEX IF NOT EXISTS idx_ds_proposals_block ON %I.ds_proposals(block_number)', s);
 
@@ -583,6 +598,23 @@ BEGIN
             deleted INTEGER;
         BEGIN
             DELETE FROM %I.ds_records
+            WHERE dao_id IS NULL
+              AND created_at < NOW() - (p_retention_days || '' days'')::INTERVAL;
+            GET DIAGNOSTICS deleted = ROW_COUNT;
+            RETURN deleted;
+        END;
+        $fn$ LANGUAGE plpgsql
+    ', s, s);
+
+    -- Prune orphaned navigators (dao_id IS NULL) older than retention period
+    EXECUTE format('
+        CREATE OR REPLACE FUNCTION %I.ds_prune_orphaned_navigators(
+            p_retention_days INTEGER
+        ) RETURNS INTEGER AS $fn$
+        DECLARE
+            deleted INTEGER;
+        BEGIN
+            DELETE FROM %I.ds_navigators
             WHERE dao_id IS NULL
               AND created_at < NOW() - (p_retention_days || '' days'')::INTERVAL;
             GET DIAGNOSTICS deleted = ROW_COUNT;
@@ -780,6 +812,7 @@ BEGIN
     EXECUTE format('DROP FUNCTION IF EXISTS %I.ds_adjust_dao_totals CASCADE', s);
     EXECUTE format('DROP FUNCTION IF EXISTS %I.ds_delete_events_after_block CASCADE', s);
     EXECUTE format('DROP FUNCTION IF EXISTS %I.ds_prune_orphaned_records CASCADE', s);
+    EXECUTE format('DROP FUNCTION IF EXISTS %I.ds_prune_orphaned_navigators CASCADE', s);
     EXECUTE format('DROP FUNCTION IF EXISTS %I.ds_reparent_orphaned_records CASCADE', s);
 
     -- 4. Drop the schema itself (only if empty after our cleanup)

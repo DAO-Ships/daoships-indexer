@@ -96,6 +96,11 @@
   },
   {
     "inputs": [],
+    "name": "InsufficientProcessGas",
+    "type": "error"
+  },
+  {
+    "inputs": [],
     "name": "InsufficientRetention",
     "type": "error"
   },
@@ -247,6 +252,11 @@
   {
     "inputs": [],
     "name": "TokensNotSorted",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "TooManyGuildTokens",
     "type": "error"
   },
   {
@@ -620,13 +630,13 @@
       {
         "indexed": false,
         "internalType": "uint32",
-        "name": "gracePeriod",
+        "name": "votingPeriod",
         "type": "uint32"
       },
       {
         "indexed": false,
         "internalType": "uint32",
-        "name": "votingPeriod",
+        "name": "gracePeriod",
         "type": "uint32"
       },
       {
@@ -652,6 +662,12 @@
         "internalType": "uint256",
         "name": "minRetentionPercent",
         "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint32",
+        "name": "defaultExpiryWindow",
+        "type": "uint32"
       },
       {
         "indexed": false,
@@ -906,6 +922,19 @@
         "internalType": "uint32",
         "name": "",
         "type": "uint32"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "MAX_GUILD_TOKENS",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
       }
     ],
     "stateMutability": "view",
@@ -1500,14 +1529,19 @@
         "type": "uint32"
       },
       {
-        "internalType": "bytes32",
-        "name": "proposalDataHash",
-        "type": "bytes32"
-      },
-      {
         "internalType": "address",
         "name": "sponsor",
         "type": "address"
+      },
+      {
+        "internalType": "uint32",
+        "name": "yesVotes",
+        "type": "uint32"
+      },
+      {
+        "internalType": "uint32",
+        "name": "noVotes",
+        "type": "uint32"
       },
       {
         "internalType": "address",
@@ -1535,14 +1569,14 @@
         "type": "uint40"
       },
       {
-        "internalType": "uint32",
-        "name": "yesVotes",
-        "type": "uint32"
+        "internalType": "uint8",
+        "name": "statusFlags",
+        "type": "uint8"
       },
       {
-        "internalType": "uint32",
-        "name": "noVotes",
-        "type": "uint32"
+        "internalType": "bytes32",
+        "name": "proposalDataHash",
+        "type": "bytes32"
       },
       {
         "internalType": "uint256",

@@ -21,8 +21,9 @@ interface HandlerEntry {
 
 export class HandlerDispatcher {
   private handlers: Map<string, HandlerEntry> = new Map();
+  private unfilteredTopicSet: Set<string> = new Set();
 
-  registerHandler(iface: Interface, eventName: string, handler: EventHandler): void {
+  registerHandler(iface: Interface, eventName: string, handler: EventHandler, unfiltered = false): void {
     const fragment = iface.getEvent(eventName);
     if (!fragment) throw new Error(`Event ${eventName} not found in interface`);
     const topic0 = fragment.topicHash;
@@ -33,6 +34,7 @@ export class HandlerDispatcher {
     }
 
     this.handlers.set(topic0, { iface, eventName, handler });
+    if (unfiltered) this.unfilteredTopicSet.add(topic0);
   }
 
   async dispatch(ctx: EventContext): Promise<{ handled: boolean; eventName?: string }> {
@@ -58,5 +60,9 @@ export class HandlerDispatcher {
 
   getRegisteredTopics(): string[] {
     return Array.from(this.handlers.keys());
+  }
+
+  getUnfilteredTopics(): string[] {
+    return Array.from(this.unfilteredTopicSet);
   }
 }

@@ -38,7 +38,8 @@ import {
   handleLockGovernor,
   handleConvertSharesToLoot,
   handleAdminConfigSet,
-  clearNavigatorMetadataCache,
+  handleNavigatorDeployed,
+  iNavIface,
 } from './handlers/daoship.js';
 
 import {
@@ -109,6 +110,9 @@ export function registerAllHandlers(dispatcher: HandlerDispatcher): void {
   dispatcher.registerHandler(posterIface, 'NewPost', handleNewPost);
 
   // Navigator events
+  // NavigatorDeployed is emitted by navigator contracts at construction time.
+  // Subscribed globally (unfiltered topic0 scan) — not scoped to known addresses.
+  dispatcher.registerHandler(iNavIface, 'NavigatorDeployed', handleNavigatorDeployed, true);
   // OnboarderNavigator and ERC20TributeNavigator emit the same Onboard(address,address,uint256,uint256,uint256)
   // signature → identical topic0. Register once; the handler distinguishes by emitting contract address.
   dispatcher.registerHandler(onboarderNavigatorIface, 'Onboard', handleOnboard);
@@ -190,6 +194,10 @@ async function main(): Promise<void> {
 
   // Wrap init in try/catch so health server is stopped on fatal init errors
   let lastProcessedBlock: number;
+  // M5: Track the last committed block hash in memory so we can detect reorgs
+  // inside the polling loop (not only at startup). Updated whenever we
+  // persist a block via updateLastProcessedBlock.
+  let lastCommittedBlockHash: string | null = null;
   try {
     // ── Wait for RPC connection ───────────────────────────────────
 
@@ -250,58 +258,22 @@ async function main(): Promise<void> {
     lastProcessedBlock = indexerState.blockNumber;
     const lastBlockHash = indexerState.blockHash;
 
-    if (lastProcessedBlock > 0 && lastBlockHash) {
-      let block: Awaited<ReturnType<typeof blockchain.getBlock>> | null = null;
-      try {
-        block = await blockchain.getBlock(lastProcessedBlock);
-      } catch (err) {
-        logger.error({ err }, 'Reorg check: block fetch failed, continuing from last saved block');
-      }
-
-      if (block && block.hash !== lastBlockHash) {
-        logger.warn(
-          { savedHash: lastBlockHash, chainHash: block.hash, block: lastProcessedBlock },
-          'Block hash mismatch detected — possible reorg',
-        );
-
-        const forkPoint = Math.max(0, lastProcessedBlock - config.reorgWalkBack);
-
-        logger.warn(
-          { forkPoint, lastProcessedBlock, walkBack: config.reorgWalkBack },
-          'Rewinding to safe fork point and cleaning up orphaned data',
-        );
-
-        // Fatal on failure — propagates to outer init try/catch.
-        // We must not continue with stale data after a detected reorg.
-        await db.deleteEventsAfterBlock(forkPoint);
-
-        // Clear navigator caches — they may contain stale mappings from
-        // pre-reorg events that are now being rolled back (I13, H3).
-        clearNavigatorDaoCache();
-        clearNavigatorMetadataCache();
-
-        // Rebuild the in-memory registry from surviving DB rows.
-        // The SQL cleanup deleted orphaned navigators/DAOs, so stale entries
-        // must be evicted before the replay pass re-registers what survived.
-        registry.clear();
-        for await (const dao of db.getAllDaosIterator()) {
-          registry.registerDao({
-            daoShipAddress: dao.id,
-            sharesAddress: dao.shares_address,
-            lootAddress: dao.loot_address,
-            avatar: dao.avatar,
-          });
-        }
-        for await (const nav of db.getActiveNavigatorsIterator()) {
-          registry.registerNavigator(nav.navigator_address, nav.dao_id);
-        }
-        logger.info(
-          { daos: registry.daoCount, navigators: registry.navigatorCount },
-          'Registry rebuilt from surviving DB rows after reorg',
-        );
-
-        lastProcessedBlock = forkPoint;
-      }
+    const newLastProcessed = await detectAndRecoverReorg(
+      lastProcessedBlock,
+      lastBlockHash,
+      blockchain,
+      db,
+      registry,
+      processor,
+      'startup',
+    );
+    if (newLastProcessed !== null) {
+      lastProcessedBlock = newLastProcessed;
+      // After rewind we have no trustworthy hash for the new tip — it will be
+      // populated again by the next successful processBlockRange.
+      lastCommittedBlockHash = null;
+    } else {
+      lastCommittedBlockHash = lastBlockHash;
     }
 
     // Use start block if we haven't indexed anything yet
@@ -329,6 +301,15 @@ async function main(): Promise<void> {
           health,
           () => true, // no shutdown signal during init
         );
+        // M5: Refresh the in-memory hash after init backfill so reorg
+        // detection in the polling loop has a valid baseline.
+        try {
+          const refreshed = await db.getLastProcessedBlock();
+          lastCommittedBlockHash = refreshed.blockHash;
+        } catch (err) {
+          logger.warn({ err }, 'Failed to refresh lastCommittedBlockHash after init backfill');
+          lastCommittedBlockHash = null;
+        }
       }
     }
   } catch (initErr) {
@@ -401,6 +382,27 @@ async function main(): Promise<void> {
         continue;
       }
 
+      // M5: In-loop reorg detection. Before advancing, verify the chain's
+      // hash at lastProcessedBlock still matches what we persisted. If not,
+      // a reorg landed between polls — rewind before indexing further.
+      if (lastCommittedBlockHash !== null) {
+        const newLastProcessed = await detectAndRecoverReorg(
+          lastProcessedBlock,
+          lastCommittedBlockHash,
+          blockchain,
+          db,
+          registry,
+          processor,
+          'poll-loop',
+        );
+        if (newLastProcessed !== null) {
+          lastProcessedBlock = newLastProcessed;
+          lastCommittedBlockHash = null;
+          // Restart this iteration with fresh start/safe block math.
+          continue;
+        }
+      }
+
       const blocksToIndex = safeBlock - startBlock + 1;
 
       // If gap exceeds maxBlockRange * 2, trigger backfill mode
@@ -438,6 +440,16 @@ async function main(): Promise<void> {
           health,
           () => running,
         );
+        // M5: Refresh the in-memory hash after backfill so reorg detection
+        // on the next poll has a valid baseline. processChunkedRange persists
+        // per-chunk but doesn't surface the final hash back here.
+        try {
+          const refreshed = await db.getLastProcessedBlock();
+          lastCommittedBlockHash = refreshed.blockHash;
+        } catch (err) {
+          logger.warn({ err }, 'Failed to refresh lastCommittedBlockHash after backfill');
+          lastCommittedBlockHash = null;
+        }
       } else {
         // Normal polling: process in chunks
         let from = startBlock;
@@ -448,7 +460,9 @@ async function main(): Promise<void> {
 
           await db.updateLastProcessedBlock(to, lastBlockHash);
           lastProcessedBlock = to;
-    
+          // M5: Track the committed hash so the next poll can detect reorgs.
+          lastCommittedBlockHash = lastBlockHash || null;
+
           // H4: Prune old dedup entries (best-effort, non-blocking)
           await db.pruneProcessedLogs(to, config.reorgWalkBack);
 
@@ -497,13 +511,14 @@ async function main(): Promise<void> {
       continue;
     }
 
-    // Daily orphan record pruning (pre-DAO allowlist records that were never claimed)
+    // Daily orphan pruning (pre-DAO allowlist records and navigator metadata that were never claimed)
     if (Date.now() - lastPruneTime > 86_400_000) {
       try {
         await db.pruneOrphanedRecords(config.orphanRetentionDays);
+        await db.pruneOrphanedNavigators(config.orphanRetentionDays);
         lastPruneTime = Date.now();
       } catch (err) {
-        logger.warn({ err }, 'Orphan record pruning failed (non-fatal)');
+        logger.warn({ err }, 'Orphan pruning failed (non-fatal)');
       }
     }
 
@@ -613,6 +628,94 @@ export async function processChunkedRange(
   }
 
   return lastProcessed;
+}
+
+/**
+ * M5: Reorg detection + recovery. Returns the new lastProcessedBlock if a
+ * reorg was detected and recovered from; returns null if no reorg (no change).
+ *
+ * Used from both the startup path and the in-loop polling path. On detection:
+ *  1. Delete indexed events after the fork point (SQL ds_delete_events_after_block).
+ *  2. Clear in-memory caches (navigator DAO cache, block cache) that may hold
+ *     pre-reorg mappings (M4).
+ *  3. Rebuild the registry from surviving DB rows.
+ *  4. Flag ds_indexer_state.requires_full_reindex (M2) — any detected reorg is
+ *     by construction deeper than confirmationBlocks, so member balance totals
+ *     may have drifted and require operator attention.
+ */
+async function detectAndRecoverReorg(
+  lastProcessedBlock: number,
+  lastBlockHash: string | null,
+  blockchain: BlockchainService,
+  db: DatabaseService,
+  registry: ContractRegistry,
+  processor: BlockProcessor,
+  origin: 'startup' | 'poll-loop',
+): Promise<number | null> {
+  if (lastProcessedBlock <= 0 || !lastBlockHash) return null;
+
+  let block: Awaited<ReturnType<typeof blockchain.getBlock>> | null = null;
+  try {
+    block = await blockchain.getBlock(lastProcessedBlock);
+  } catch (err) {
+    logger.error({ err, origin }, 'Reorg check: block fetch failed, continuing from last saved block');
+    return null;
+  }
+
+  if (!block || block.hash === lastBlockHash) return null;
+
+  logger.warn(
+    { savedHash: lastBlockHash, chainHash: block.hash, block: lastProcessedBlock, origin },
+    'Block hash mismatch detected — possible reorg',
+  );
+
+  const forkPoint = Math.max(0, lastProcessedBlock - config.reorgWalkBack);
+
+  logger.warn(
+    { forkPoint, lastProcessedBlock, walkBack: config.reorgWalkBack, origin },
+    'Rewinding to safe fork point and cleaning up orphaned data',
+  );
+
+  // Fatal on failure — must not continue with stale data after a detected reorg.
+  await db.deleteEventsAfterBlock(forkPoint);
+
+  // M2: Every detected reorg is deeper than confirmationBlocks by construction
+  // (the indexer only persists blocks at currentBlock - confirmationBlocks).
+  // Member balances cannot be rebuilt from the replay range alone — flag for
+  // operator attention. Best-effort: don't fail recovery if the flag write
+  // fails.
+  try {
+    await db.setRequiresFullReindex(
+      `${origin}: reorg detected at block ${lastProcessedBlock}, rewound to ${forkPoint}`,
+    );
+  } catch (err) {
+    logger.error({ err, origin }, 'Failed to set requires_full_reindex flag (continuing)');
+  }
+
+  // M4: Clear in-memory caches that may contain stale mappings from
+  // pre-reorg events now being rolled back.
+  clearNavigatorDaoCache();
+  processor.clearCaches();
+
+  // Rebuild the in-memory registry from surviving DB rows.
+  registry.clear();
+  for await (const dao of db.getAllDaosIterator()) {
+    registry.registerDao({
+      daoShipAddress: dao.id,
+      sharesAddress: dao.shares_address,
+      lootAddress: dao.loot_address,
+      avatar: dao.avatar,
+    });
+  }
+  for await (const nav of db.getActiveNavigatorsIterator()) {
+    registry.registerNavigator(nav.navigator_address, nav.dao_id);
+  }
+  logger.info(
+    { daos: registry.daoCount, navigators: registry.navigatorCount, origin },
+    'Registry rebuilt from surviving DB rows after reorg',
+  );
+
+  return forkPoint;
 }
 
 async function doBackfill(

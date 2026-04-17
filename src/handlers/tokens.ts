@@ -68,7 +68,7 @@ export async function handleTransfer(
 
   // ── Debit sender (skip for mints where from is zero address) ──
 
-  if (hasSender) {
+  const debitSender = async (): Promise<void> => {
     const senderOldBalance = (sender?.[field] as string) || '0';
     const senderOtherBalance = (sender?.[otherField] as string) || '0';
     if (wouldClamp(senderOldBalance, valueStr)) {
@@ -89,11 +89,11 @@ export async function handleTransfer(
       updated_at: now,
       last_activity_at: now,
     });
-  }
+  };
 
   // ── Credit receiver (skip for burns where to is zero address) ─
 
-  if (hasReceiver) {
+  const creditReceiver = async (): Promise<void> => {
     const receiverOldBalance = (receiver?.[field] as string) || '0';
     const receiverOtherBalance = (receiver?.[otherField] as string) || '0';
     const receiverNewBalance = addNumericStrings(receiverOldBalance, valueStr);
@@ -111,6 +111,19 @@ export async function handleTransfer(
       updated_at: now,
       last_activity_at: now,
     });
+  };
+
+  // E6: Parallelize when both sides exist and are distinct members. The
+  // synchronous `activeMemberDelta` math in each body runs BEFORE its await,
+  // so Promise.all yields deterministic aggregate delta (both +/- increments
+  // apply regardless of promise completion order). Self-transfers
+  // (from === to) must stay sequential to avoid read-modify-write on the
+  // same row.
+  if (hasSender && hasReceiver && from !== to) {
+    await Promise.all([debitSender(), creditReceiver()]);
+  } else {
+    if (hasSender) await debitSender();
+    if (hasReceiver) await creditReceiver();
   }
 
   // Atomically update DAO active member count if transitions occurred (best-effort — non-critical counter).

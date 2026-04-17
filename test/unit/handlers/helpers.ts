@@ -28,8 +28,10 @@ export function makeMockDb() {
     upsertDao: vi.fn().mockResolvedValue(undefined),
     getMember: vi.fn().mockResolvedValue(null),
     upsertMember: vi.fn().mockResolvedValue(undefined),
+    insertMemberIfAbsent: vi.fn().mockResolvedValue(false),
     getProposal: vi.fn().mockResolvedValue(null),
     upsertProposal: vi.fn().mockResolvedValue(undefined),
+    insertProposalIfAbsent: vi.fn().mockResolvedValue(false),
     updateProposal: vi.fn().mockResolvedValue(undefined),
     upsertVote: vi.fn().mockResolvedValue(undefined),
     upsert: vi.fn().mockResolvedValue(undefined),
@@ -42,6 +44,9 @@ export function makeMockDb() {
     updateNavigator: vi.fn().mockResolvedValue(undefined),
     reparentOrphanedRecords: vi.fn().mockResolvedValue(undefined),
     pruneOrphanedRecords: vi.fn().mockResolvedValue(undefined),
+    findOrphanNavigator: vi.fn().mockResolvedValue(null),
+    getNavigatorByAddress: vi.fn().mockResolvedValue(null),
+    pruneOrphanedNavigators: vi.fn().mockResolvedValue(undefined),
   };
 }
 

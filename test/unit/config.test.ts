@@ -137,6 +137,29 @@ describe('config', () => {
     expect(config.supabaseSchema).toBe('testnet');
   });
 
+  it('accepts all whitelisted SUPABASE_SCHEMA values', async () => {
+    for (const schema of ['testnet', 'mainnet', 'dev', 'public']) {
+      vi.resetModules();
+      clearConfigEnvVars();
+      setRequiredEnv();
+      process.env.SUPABASE_SCHEMA = schema;
+      const config = await loadConfig();
+      expect(config.supabaseSchema).toBe(schema);
+    }
+  });
+
+  it('rejects SUPABASE_SCHEMA not in whitelist', async () => {
+    setRequiredEnv();
+    process.env.SUPABASE_SCHEMA = 'pg_catalog';
+    await expect(loadConfig()).rejects.toThrow(/Invalid SUPABASE_SCHEMA/);
+  });
+
+  it('rejects SUPABASE_SCHEMA with arbitrary string', async () => {
+    setRequiredEnv();
+    process.env.SUPABASE_SCHEMA = 'production';
+    await expect(loadConfig()).rejects.toThrow(/Invalid SUPABASE_SCHEMA/);
+  });
+
   it('lowercases contract addresses', async () => {
     setRequiredEnv();
     // Must be a valid Quai address (Cyprus1 shard prefix 0x00)

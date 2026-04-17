@@ -38,6 +38,9 @@ export interface HealthStatus {
     lastIndexedBlock: number | null;
     blocksBehind: number | null;
     isSyncing: boolean;
+    requiresFullReindex: boolean;
+    reindexReason: string | null;
+    reindexFlaggedAt: string | null;
   };
 }
 
@@ -265,10 +268,16 @@ export class HealthService {
     let lastIndexedBlock: number | null = null;
     let blocksBehind: number | null = null;
     let isSyncing = false;
+    let requiresFullReindex = false;
+    let reindexReason: string | null = null;
+    let reindexFlaggedAt: string | null = null;
 
     if (indexerState) {
       lastIndexedBlock = indexerState.blockNumber;
       isSyncing = indexerState.isSyncing;
+      requiresFullReindex = indexerState.requiresFullReindex;
+      reindexReason = indexerState.reindexReason;
+      reindexFlaggedAt = indexerState.reindexFlaggedAt;
     }
 
     if (currentBlock !== null && lastIndexedBlock !== null) {
@@ -286,6 +295,17 @@ export class HealthService {
       indexerCheck = { status: 'fail', message: 'Indexer is not running' };
     }
 
+    // M2: Flag unhealthy when a reorg past the confirmation window has
+    // occurred and operators haven't yet run a reindex. Data is indexing
+    // correctly from this point forward, but member balance totals may
+    // have drifted.
+    if (requiresFullReindex && indexerCheck.status === 'pass') {
+      indexerCheck = {
+        status: 'fail',
+        message: `Full reindex required: ${reindexReason ?? 'unknown reason'}`,
+      };
+    }
+
     const checks = { quaiRpc: quaiRpcCheck, supabase: supabaseCheck, indexer: indexerCheck };
     const allPassing = Object.values(checks).every((c) => c.status === 'pass');
 
@@ -298,6 +318,9 @@ export class HealthService {
         lastIndexedBlock,
         blocksBehind,
         isSyncing,
+        requiresFullReindex,
+        reindexReason,
+        reindexFlaggedAt,
       },
     };
   }
@@ -335,7 +358,13 @@ export class HealthService {
 
   private async checkSupabase(): Promise<{
     supabaseCheck: CheckResult;
-    indexerState: { blockNumber: number; isSyncing: boolean } | null;
+    indexerState: {
+      blockNumber: number;
+      isSyncing: boolean;
+      requiresFullReindex: boolean;
+      reindexReason: string | null;
+      reindexFlaggedAt: string | null;
+    } | null;
   }> {
     if (!this.db) {
       return {
@@ -352,7 +381,13 @@ export class HealthService {
       );
       return {
         supabaseCheck: { status: 'pass' },
-        indexerState: { blockNumber: state.blockNumber, isSyncing: state.isSyncing },
+        indexerState: {
+          blockNumber: state.blockNumber,
+          isSyncing: state.isSyncing,
+          requiresFullReindex: state.requiresFullReindex,
+          reindexReason: state.reindexReason,
+          reindexFlaggedAt: state.reindexFlaggedAt,
+        },
       };
     } catch (err) {
       logger.error({ err }, 'Database health check failed');

@@ -41,6 +41,18 @@ function validateLogLevel(value: string): string {
   return value;
 }
 
+// Mirrors the whitelist in supabase/migrations/schema.sql create_ds_schema().
+// Prevents a misconfigured env from pointing at an arbitrary schema (including
+// system schemas like pg_catalog) or cross-writing dev data into mainnet.
+const VALID_SCHEMAS = ['testnet', 'mainnet', 'dev', 'public'] as const;
+
+function validateSupabaseSchema(value: string): string {
+  if (!VALID_SCHEMAS.includes(value as typeof VALID_SCHEMAS[number])) {
+    throw new Error(`Invalid SUPABASE_SCHEMA "${value}". Valid schemas: ${VALID_SCHEMAS.join(', ')}`);
+  }
+  return value;
+}
+
 function validateCorsOrigins(raw: string): string[] {
   const origins = raw.split(',').map(s => s.trim()).filter(Boolean);
   for (const origin of origins) {
@@ -64,7 +76,7 @@ export const config = {
   // Supabase
   supabaseUrl: requireEnv('SUPABASE_URL'),
   supabaseServiceRoleKey: requireEnv('SUPABASE_SERVICE_ROLE_KEY'),
-  supabaseSchema: process.env.SUPABASE_SCHEMA || 'public',
+  supabaseSchema: validateSupabaseSchema(process.env.SUPABASE_SCHEMA || 'public'),
 
   // Contract Addresses (validated + lowercase)
   contracts: {

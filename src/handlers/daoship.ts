@@ -1,6 +1,6 @@
 import type { EventContext, EventHandler } from './index.js';
 import { logger } from '../utils/logger.js';
-import { Interface } from 'quais';
+import { Interface, id as keccak256 } from 'quais';
 import { safeBigInt, strictBigInt } from '../utils/bigint.js';
 import {
   validateEventArgs,
@@ -24,23 +24,14 @@ import INavigatorAbi from '../abis/INavigator.json' with { type: 'json' };
 import DAOShipAbi from '../abis/DAOShip.json' with { type: 'json' };
 
 export const daoShipIface = new Interface(DAOShipAbi);
-const iNavIface = new Interface(INavigatorAbi);
+export const iNavIface = new Interface(INavigatorAbi);
 
-// H3: Cache NavigatorDeployed metadata (immutable constructor data) to avoid
-// repeated getLogs scans for the same navigator across permission changes.
-type NavigatorMetadata = {
-  deployer: string;
-  navigatorType: string | null;
-  name: string | null;
-  description: string | null;
-} | null;
-const navigatorMetadataCache = new Map<string, NavigatorMetadata>();
-const NAVIGATOR_METADATA_CACHE_MAX = 500;
-
-/** Clear the NavigatorDeployed metadata cache (for reorg recovery and tests). */
-export function clearNavigatorMetadataCache(): void {
-  navigatorMetadataCache.clear();
-}
+// H1: selector for the optional `allowlistRoot()` view. Navigators that
+// implement it expose a bytes32 — we cache it at deployment time so allowlist
+// posts (poster.ts) can be verified against the DB instead of an RPC call.
+// Zero root (0x000…) signals an open allowlist; we normalize it to NULL.
+const ALLOWLIST_ROOT_SELECTOR = keccak256('allowlistRoot()').slice(0, 10);
+const BYTES32_ZERO = '0x' + '0'.repeat(64);
 
 const MAX_DETAILS_SIZE = 65536; // 64KB — matches poster content limit
 
@@ -113,7 +104,7 @@ export const handleSetupComplete: EventHandler = async (
   args: Record<string, unknown>,
 ): Promise<void> => {
   const daoId = ctx.log.address.toLowerCase();
-  validateEventArgs(args, ['lootPaused', 'sharesPaused', 'gracePeriod', 'votingPeriod', 'proposalOffering', 'quorumPercent', 'sponsorThreshold', 'minRetentionPercent', 'name', 'symbol', 'lootName', 'lootSymbol', 'guildTokens', 'totalShares', 'totalLoot'], 'SetupComplete');
+  validateEventArgs(args, ['lootPaused', 'sharesPaused', 'votingPeriod', 'gracePeriod', 'proposalOffering', 'quorumPercent', 'sponsorThreshold', 'minRetentionPercent', 'defaultExpiryWindow', 'name', 'symbol', 'lootName', 'lootSymbol', 'guildTokens', 'totalShares', 'totalLoot'], 'SetupComplete');
 
   const lootPaused = Boolean(args.lootPaused);
   const sharesPaused = Boolean(args.sharesPaused);
@@ -123,6 +114,7 @@ export const handleSetupComplete: EventHandler = async (
   const quorumPercent = safeBigInt(args.quorumPercent).toString();
   const sponsorThreshold = safeBigInt(args.sponsorThreshold).toString();
   const minRetentionPercent = safeBigInt(args.minRetentionPercent).toString();
+  const defaultExpiryWindow = safeNumber(args.defaultExpiryWindow, 'SetupComplete.defaultExpiryWindow');
   const name = String(args.name).slice(0, 255);
   const symbol = String(args.symbol).slice(0, 32);
   const guildTokens: string[] = validateArray(args.guildTokens, 'guildTokens').map((a) => String(a).toLowerCase());
@@ -145,6 +137,7 @@ export const handleSetupComplete: EventHandler = async (
     quorum_percent: quorumPercent,
     sponsor_threshold: sponsorThreshold,
     min_retention_percent: minRetentionPercent,
+    default_expiry_window: defaultExpiryWindow,
     total_shares: totalShares,
     total_loot: totalLoot,
     loot_token_name: lootTokenName,
@@ -304,11 +297,12 @@ export const handleSubmitVote: EventHandler = async (
 
   const now = new Date(ctx.blockTimestamp * 1000).toISOString();
 
-  // Ensure proposal exists (may be missing if SubmitProposal was in a failed block range).
-  const existingProposal = await ctx.db.getProposal(proposalId);
-  if (!existingProposal) {
-    logger.error({ proposalId, daoId }, 'Proposal not found — creating stub for orphaned vote (data gap detected)');
-    await ctx.db.upsertProposal({
+  // E1: Ensure proposal and member rows exist via parallel insert-if-absent.
+  // No pre-read — the DB enforces "don't clobber an existing row" via the
+  // ignoreDuplicates path. The returned booleans let us preserve the
+  // operational data-gap warning when a stub is actually materialized.
+  const [proposalInserted, memberInserted] = await Promise.all([
+    ctx.db.insertProposalIfAbsent({
       id: proposalId,
       dao_id: daoId,
       proposal_id: proposalIdNum,
@@ -328,13 +322,8 @@ export const handleSubmitVote: EventHandler = async (
       no_votes: 0,
       max_total_shares_and_loot_at_vote: '0',
       details: '_stub:true',
-    });
-  }
-
-  // Ensure member exists (they must hold shares to vote, but we upsert defensively).
-  const existingMember = await ctx.db.getMember(memberId);
-  if (!existingMember) {
-    await ctx.db.upsertMember({
+    }),
+    ctx.db.insertMemberIfAbsent({
       id: memberId,
       dao_id: daoId,
       member_address: memberAddress,
@@ -342,7 +331,13 @@ export const handleSubmitVote: EventHandler = async (
       loot: '0',
       created_at: now,
       updated_at: now,
-    });
+    }),
+  ]);
+  if (proposalInserted) {
+    logger.error({ proposalId, daoId }, 'Proposal not found — created stub for orphaned vote (data gap detected)');
+  }
+  if (memberInserted) {
+    logger.warn({ memberId, daoId }, 'Member not found — created stub for orphaned vote');
   }
 
   await ctx.db.upsertVote({
@@ -461,19 +456,18 @@ export const handleRagequit: EventHandler = async (
     'Ragequit',
   );
 
-  // Ensure member exists (may be missing if MintShares was in a failed block range).
-  const existing = await ctx.db.getMember(memberId);
-  if (!existing) {
-    logger.error({ memberId, daoId }, 'Member not found — creating stub for orphaned ragequit (data gap detected)');
-    await ctx.db.upsertMember({
-      id: memberId,
-      dao_id: daoId,
-      member_address: memberAddress,
-      shares: '0',
-      loot: '0',
-      created_at: now,
-      updated_at: now,
-    });
+  // E1: Ensure member row exists via insert-if-absent (no pre-read).
+  const memberStubInserted = await ctx.db.insertMemberIfAbsent({
+    id: memberId,
+    dao_id: daoId,
+    member_address: memberAddress,
+    shares: '0',
+    loot: '0',
+    created_at: now,
+    updated_at: now,
+  });
+  if (memberStubInserted) {
+    logger.error({ memberId, daoId }, 'Member not found — created stub for orphaned ragequit (data gap detected)');
   }
 
   // Record the ragequit event.
@@ -506,6 +500,68 @@ export const handleRagequit: EventHandler = async (
 };
 
 // ---------------------------------------------------------------------------
+// 7b. NavigatorDeployed (INavigator — emitted once in constructor)
+// Writes an orphan row (dao_id = NULL) into ds_navigators. Metadata is
+// provisional until a subsequent NavigatorSet from a registered DAOShip
+// promotes the row by setting dao_id and permission.
+// ---------------------------------------------------------------------------
+
+export const handleNavigatorDeployed: EventHandler = async (
+  ctx: EventContext,
+  args: Record<string, unknown>,
+): Promise<void> => {
+  const navigatorAddress = ctx.log.address.toLowerCase();
+  validateEventArgs(args, ['daoShip', 'deployer', 'navigatorType', 'name', 'description'], 'NavigatorDeployed');
+
+  const daoShip = validateAndNormalizeAddress(args.daoShip, 'NavigatorDeployed.daoShip');
+  const deployerAddress = validateAndNormalizeAddress(args.deployer, 'NavigatorDeployed.deployer');
+  const navigatorType = sanitizeStr(String(args.navigatorType), 50);
+  const navName = sanitizeStr(String(args.name), 255);
+  const navDescription = sanitizeStr(String(args.description), 1000);
+
+  const id = makeNavigatorId(daoShip, navigatorAddress);
+  const now = new Date(ctx.blockTimestamp * 1000).toISOString();
+
+  // H1: Best-effort cache of allowlistRoot() so allowlist NewPost events can
+  // be verified against the DB instead of making per-post RPC calls. The
+  // selector may revert on navigators that don't implement it — that's
+  // deterministic and expected, not a transient failure.
+  let allowlistRoot: string | null = null;
+  try {
+    const raw = await ctx.blockchain.rawCall(navigatorAddress, ALLOWLIST_ROOT_SELECTOR);
+    if (raw && raw.length === 66) {
+      const normalized = raw.toLowerCase();
+      if (normalized !== BYTES32_ZERO) allowlistRoot = normalized;
+    }
+  } catch (err) {
+    logger.debug(
+      { navigatorAddress, err: (err as Error).message },
+      'NavigatorDeployed: allowlistRoot() not available (navigator type has no allowlist)',
+    );
+  }
+
+  logger.info(
+    { navigatorAddress, daoShip, navigatorType, deployer: deployerAddress, hasAllowlist: allowlistRoot !== null },
+    'NavigatorDeployed (orphan)',
+  );
+
+  await ctx.db.upsert('ds_navigators', {
+    id,
+    dao_id: null,
+    navigator_address: navigatorAddress,
+    deployer: deployerAddress,
+    navigator_type: navigatorType,
+    name: navName,
+    description: navDescription,
+    is_active: false,
+    allowlist_root: allowlistRoot,
+    created_at: now,
+    tx_hash: ctx.log.transactionHash,
+    updated_at: now,
+  });
+};
+
+// ---------------------------------------------------------------------------
 // 8. NavigatorSet
 // ---------------------------------------------------------------------------
 
@@ -530,88 +586,34 @@ export const handleNavigatorSet: EventHandler = async (
     'NavigatorSet',
   );
 
-  // Fetch NavigatorDeployed event from the navigator contract.
-  // All INavigator-compliant navigators emit this once in their constructor.
-  // Targeted getLogs scoped to this address — not added to global topic polling.
+  // Promote orphan row from NavigatorDeployed (if one exists for this navigator).
+  // The orphan row was written by handleNavigatorDeployed with dao_id = NULL.
+  // We verify the orphan's claimed daoShip matches the DAOShip emitting this event.
   let deployerAddress: string | null = null;
   let navigatorType: string | null = null;
   let navName: string | null = null;
   let navDescription: string | null = null;
 
   if (permission > 0) {
-    // H3: Check metadata cache first (NavigatorDeployed is immutable constructor data).
-    const cachedMeta = navigatorMetadataCache.get(navigatorAddress);
-    if (cachedMeta !== undefined) {
-      if (cachedMeta !== null) {
-        deployerAddress = cachedMeta.deployer;
-        navigatorType = cachedMeta.navigatorType;
-        navName = cachedMeta.name;
-        navDescription = cachedMeta.description;
-      }
-      // cachedMeta === null means we already searched and found nothing — skip RPC.
-    } else {
-      try {
-        const topic0 = iNavIface.getEvent('NavigatorDeployed')!.topicHash;
-        // H3: Search backwards from the NavigatorSet block — the deploy event always
-        // precedes NavigatorSet (often in the same block or very close). This avoids
-        // scanning from startBlock on mature chains.
-        const MAX_LOG_RANGE = 10_000;
-        const searchStart = ctx.log.blockNumber;
-        // Search backwards from the NavigatorSet block down to startBlock (or 0).
-        // Use the lower of startBlock and searchStart as the floor to handle cases
-        // where startBlock is ahead of the event block (e.g., re-indexing).
-        const searchEnd = Math.min(Math.max(config.startBlock, 0), searchStart);
-        let logs: Awaited<ReturnType<typeof ctx.blockchain.getLogs>> = [];
-        for (let to = searchStart; to >= searchEnd; to -= MAX_LOG_RANGE) {
-          const from = Math.max(to - MAX_LOG_RANGE + 1, searchEnd);
-          const chunk = await ctx.blockchain.getLogs(navigatorAddress, from, to, [[topic0]]);
-          if (chunk.length > 0) {
-            logs = chunk;
-            break; // NavigatorDeployed is a constructor event — only need the first match
-          }
-        }
-        if (logs.length > 1) {
-          logger.warn({ navigatorAddress, count: logs.length },
-            'Multiple NavigatorDeployed logs found — using first');
-        }
-        let metadata: NavigatorMetadata = null;
-        if (logs.length > 0) {
-          const parsed = iNavIface.parseLog({
-            topics: logs[0].topics as string[],
-            data: logs[0].data,
-          });
-          if (parsed) {
-            const eventDaoShip = String(parsed.args.daoShip).toLowerCase();
-            if (eventDaoShip === daoId) {
-              deployerAddress = String(parsed.args.deployer).toLowerCase();
-              navigatorType = sanitizeStr(String(parsed.args.navigatorType), 50);
-              navName = sanitizeStr(String(parsed.args.name), 255);
-              navDescription = sanitizeStr(String(parsed.args.description), 1000);
-              metadata = { deployer: deployerAddress, navigatorType, name: navName, description: navDescription };
-            } else {
-              logger.warn({ navigatorAddress, eventDaoShip, expectedDaoId: daoId },
-                'NavigatorDeployed daoShip mismatch — ignoring deploy event');
-            }
-          }
-        }
-        // Cache result (including null for "not found") to avoid repeat scans.
-        if (navigatorMetadataCache.size >= NAVIGATOR_METADATA_CACHE_MAX) {
-          const oldest = navigatorMetadataCache.keys().next().value;
-          if (oldest !== undefined) navigatorMetadataCache.delete(oldest);
-        }
-        navigatorMetadataCache.set(navigatorAddress, metadata);
-      } catch (err) {
-        logger.warn({ navigatorAddress, error: (err as Error).message },
-          'NavigatorDeployed log fetch failed (non-fatal)');
+    const orphan = await ctx.db.findOrphanNavigator(navigatorAddress);
+    if (orphan) {
+      // The orphan's id encodes the claimed daoShip — verify it matches
+      const expectedId = makeNavigatorId(daoId, navigatorAddress);
+      if (orphan.id === expectedId) {
+        deployerAddress = orphan.deployer as string | null;
+        navigatorType = orphan.navigator_type as string | null;
+        navName = orphan.name as string | null;
+        navDescription = orphan.description as string | null;
+        logger.info({ navigatorAddress, daoId }, 'Promoting orphan navigator metadata');
+      } else {
+        logger.warn({ navigatorAddress, orphanId: orphan.id, expectedId },
+          'NavigatorDeployed daoShip mismatch — discarding orphan metadata');
       }
     }
   }
 
   const now = new Date(ctx.blockTimestamp * 1000).toISOString();
 
-  // Base fields for all upserts (INSERT needs created_at; UPDATE preserves it via
-  // the existing row — Supabase upsert overwrites provided columns, so we always
-  // include created_at for the INSERT path but accept the overwrite on UPDATE).
   const baseFields: Record<string, unknown> = {
     id,
     dao_id: daoId,
@@ -624,8 +626,6 @@ export const handleNavigatorSet: EventHandler = async (
     updated_at: now,
   };
 
-  // Only include metadata fields when they were successfully fetched (non-null).
-  // Omitting them from the upsert preserves existing values on the UPDATE path.
   if (deployerAddress !== null) baseFields.deployer = deployerAddress;
   if (navigatorType !== null) baseFields.navigator_type = navigatorType;
   if (navName !== null) baseFields.name = navName;
@@ -721,120 +721,65 @@ export const handleSetGuildTokens: EventHandler = async (
 };
 
 // ---------------------------------------------------------------------------
-// 11. MintShares
+// 11-14. MintShares / MintLoot / BurnShares / BurnLoot (SU1)
 // ---------------------------------------------------------------------------
 
-export const handleMintShares: EventHandler = async (
-  ctx: EventContext,
-  args: Record<string, unknown>,
-): Promise<void> => {
-  const daoId = ctx.log.address.toLowerCase();
-  validateEventArgs(args, ['to', 'amount'], 'MintShares');
-  const addresses: string[] = validateArray(args.to, 'to').map((a, i) => validateAndNormalizeAddress(a, `to[${i}]`));
-  const amounts: bigint[] = validateArray(args.amount, 'amount').map((a, i) => strictBigInt(a, `MintShares.amount[${i}]`));
+/**
+ * Factory for the four near-identical mint/burn event handlers. Each one
+ * reads a parallel `{addresses, amounts}` array pair from a single named arg
+ * and delegates to handleMintOrBurn for DAO-total adjustment.
+ */
+function makeMintBurnHandler(opts: {
+  eventName: 'MintShares' | 'MintLoot' | 'BurnShares' | 'BurnLoot';
+  addrField: 'to' | 'from';
+  tokenType: 'shares' | 'loot';
+  operation: 'mint' | 'burn';
+}): EventHandler {
+  const { eventName, addrField, tokenType, operation } = opts;
+  return async (ctx, args) => {
+    const daoId = ctx.log.address.toLowerCase();
+    validateEventArgs(args, [addrField, 'amount'], eventName);
+    const addresses: string[] = validateArray(args[addrField], addrField)
+      .map((a, i) => validateAndNormalizeAddress(a, `${addrField}[${i}]`));
+    const amounts: bigint[] = validateArray(args.amount, 'amount')
+      .map((a, i) => strictBigInt(a, `${eventName}.amount[${i}]`));
 
-  logger.info({ daoId, count: addresses.length }, 'MintShares');
-  await handleMintOrBurn(ctx, daoId, addresses, amounts, 'shares', 'mint');
-};
+    logger.info({ daoId, count: addresses.length }, eventName);
+    await handleMintOrBurn(ctx, daoId, addresses, amounts, tokenType, operation);
+  };
+}
 
-// ---------------------------------------------------------------------------
-// 12. MintLoot
-// ---------------------------------------------------------------------------
-
-export const handleMintLoot: EventHandler = async (
-  ctx: EventContext,
-  args: Record<string, unknown>,
-): Promise<void> => {
-  const daoId = ctx.log.address.toLowerCase();
-  validateEventArgs(args, ['to', 'amount'], 'MintLoot');
-  const addresses: string[] = validateArray(args.to, 'to').map((a, i) => validateAndNormalizeAddress(a, `to[${i}]`));
-  const amounts: bigint[] = validateArray(args.amount, 'amount').map((a, i) => strictBigInt(a, `MintLoot.amount[${i}]`));
-
-  logger.info({ daoId, count: addresses.length }, 'MintLoot');
-  await handleMintOrBurn(ctx, daoId, addresses, amounts, 'loot', 'mint');
-};
-
-// ---------------------------------------------------------------------------
-// 13. BurnShares
-// ---------------------------------------------------------------------------
-
-export const handleBurnShares: EventHandler = async (
-  ctx: EventContext,
-  args: Record<string, unknown>,
-): Promise<void> => {
-  const daoId = ctx.log.address.toLowerCase();
-  validateEventArgs(args, ['from', 'amount'], 'BurnShares');
-  const addresses: string[] = validateArray(args.from, 'from').map((a, i) => validateAndNormalizeAddress(a, `from[${i}]`));
-  const amounts: bigint[] = validateArray(args.amount, 'amount').map((a, i) => strictBigInt(a, `BurnShares.amount[${i}]`));
-
-  logger.info({ daoId, count: addresses.length }, 'BurnShares');
-  await handleMintOrBurn(ctx, daoId, addresses, amounts, 'shares', 'burn');
-};
+export const handleMintShares = makeMintBurnHandler({ eventName: 'MintShares', addrField: 'to', tokenType: 'shares', operation: 'mint' });
+export const handleMintLoot = makeMintBurnHandler({ eventName: 'MintLoot', addrField: 'to', tokenType: 'loot', operation: 'mint' });
+export const handleBurnShares = makeMintBurnHandler({ eventName: 'BurnShares', addrField: 'from', tokenType: 'shares', operation: 'burn' });
+export const handleBurnLoot = makeMintBurnHandler({ eventName: 'BurnLoot', addrField: 'from', tokenType: 'loot', operation: 'burn' });
 
 // ---------------------------------------------------------------------------
-// 14. BurnLoot
+// 15-17. LockAdmin / LockManager / LockGovernor (SU2)
 // ---------------------------------------------------------------------------
 
-export const handleBurnLoot: EventHandler = async (
-  ctx: EventContext,
-  args: Record<string, unknown>,
-): Promise<void> => {
-  const daoId = ctx.log.address.toLowerCase();
-  validateEventArgs(args, ['from', 'amount'], 'BurnLoot');
-  const addresses: string[] = validateArray(args.from, 'from').map((a, i) => validateAndNormalizeAddress(a, `from[${i}]`));
-  const amounts: bigint[] = validateArray(args.amount, 'amount').map((a, i) => strictBigInt(a, `BurnLoot.amount[${i}]`));
+/**
+ * Factory for the three near-identical lock event handlers. Each one sets a
+ * single boolean column on ds_daos based on the `lock` arg.
+ */
+function makeLockHandler(opts: {
+  eventName: 'LockAdmin' | 'LockManager' | 'LockGovernor';
+  field: 'admin_locked' | 'manager_locked' | 'governor_locked';
+}): EventHandler {
+  const { eventName, field } = opts;
+  return async (ctx, args) => {
+    const daoId = ctx.log.address.toLowerCase();
+    validateEventArgs(args, ['lock'], eventName);
+    const lock = Boolean(args.lock);
 
-  logger.info({ daoId, count: addresses.length }, 'BurnLoot');
-  await handleMintOrBurn(ctx, daoId, addresses, amounts, 'loot', 'burn');
-};
+    logger.info({ daoId, lock }, eventName);
+    await ctx.db.updateDao(daoId, { [field]: lock });
+  };
+}
 
-// ---------------------------------------------------------------------------
-// 15. LockAdmin
-// ---------------------------------------------------------------------------
-
-export const handleLockAdmin: EventHandler = async (
-  ctx: EventContext,
-  args: Record<string, unknown>,
-): Promise<void> => {
-  const daoId = ctx.log.address.toLowerCase();
-  validateEventArgs(args, ['lock'], 'LockAdmin');
-  const lock = Boolean(args.lock);
-
-  logger.info({ daoId, lock }, 'LockAdmin');
-  await ctx.db.updateDao(daoId, { admin_locked: lock });
-};
-
-// ---------------------------------------------------------------------------
-// 16. LockManager
-// ---------------------------------------------------------------------------
-
-export const handleLockManager: EventHandler = async (
-  ctx: EventContext,
-  args: Record<string, unknown>,
-): Promise<void> => {
-  const daoId = ctx.log.address.toLowerCase();
-  validateEventArgs(args, ['lock'], 'LockManager');
-  const lock = Boolean(args.lock);
-
-  logger.info({ daoId, lock }, 'LockManager');
-  await ctx.db.updateDao(daoId, { manager_locked: lock });
-};
-
-// ---------------------------------------------------------------------------
-// 17. LockGovernor
-// ---------------------------------------------------------------------------
-
-export const handleLockGovernor: EventHandler = async (
-  ctx: EventContext,
-  args: Record<string, unknown>,
-): Promise<void> => {
-  const daoId = ctx.log.address.toLowerCase();
-  validateEventArgs(args, ['lock'], 'LockGovernor');
-  const lock = Boolean(args.lock);
-
-  logger.info({ daoId, lock }, 'LockGovernor');
-  await ctx.db.updateDao(daoId, { governor_locked: lock });
-};
+export const handleLockAdmin = makeLockHandler({ eventName: 'LockAdmin', field: 'admin_locked' });
+export const handleLockManager = makeLockHandler({ eventName: 'LockManager', field: 'manager_locked' });
+export const handleLockGovernor = makeLockHandler({ eventName: 'LockGovernor', field: 'governor_locked' });
 
 // ---------------------------------------------------------------------------
 // 18. ConvertSharesToLoot

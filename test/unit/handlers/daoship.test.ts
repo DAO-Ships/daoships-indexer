@@ -8,6 +8,7 @@ import {
   handleCancelProposal,
   handleRagequit,
   handleNavigatorSet,
+  handleNavigatorDeployed,
   handleGovernanceConfigSet,
   handleSetGuildTokens,
   handleMintShares,
@@ -19,7 +20,6 @@ import {
   handleLockGovernor,
   handleConvertSharesToLoot,
   handleAdminConfigSet,
-  clearNavigatorMetadataCache,
 } from '../../../src/handlers/daoship.js';
 import {
   DAOSHIP, SHARES, LOOT, MEMBER1, MEMBER2, NAVIGATOR, LAUNCHER, TOKEN_A, TX_HASH,
@@ -37,7 +37,6 @@ const MOCK_DAO = {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  clearNavigatorMetadataCache();
 });
 
 // ── handleSetupComplete ─────────────────────────────────────────
@@ -59,6 +58,7 @@ describe('handleSetupComplete', () => {
       quorumPercent: 20n,
       sponsorThreshold: 0n,
       minRetentionPercent: 66n,
+      defaultExpiryWindow: 0n,
       name: 'My DAO Shares',
       symbol: 'MDS',
       lootName: 'DAO Loot',
@@ -217,8 +217,9 @@ describe('handleSponsorProposal', () => {
 describe('handleSubmitVote', () => {
   it('upserts vote, increments tallies, and creates stub proposal if missing', async () => {
     const db = makeMockDb();
-    db.getProposal.mockResolvedValue(null);   // trigger stub creation
-    db.getMember.mockResolvedValue({ id: `${DAOSHIP}-${MEMBER1}` });
+    // E1: stub path uses insertProposalIfAbsent (no pre-read)
+    db.insertProposalIfAbsent.mockResolvedValue(true);  // true = actually inserted
+    db.insertMemberIfAbsent.mockResolvedValue(false);   // member already exists
     const ctx = makeCtx({ db, log: { address: DAOSHIP } });
 
     await handleSubmitVote(ctx, {
@@ -228,7 +229,7 @@ describe('handleSubmitVote', () => {
       approved: true,
     });
 
-    expect(db.upsertProposal).toHaveBeenCalledWith(expect.objectContaining({
+    expect(db.insertProposalIfAbsent).toHaveBeenCalledWith(expect.objectContaining({
       details: '_stub:true',
     }));
     expect(db.upsertVote).toHaveBeenCalledWith(expect.objectContaining({
@@ -242,19 +243,37 @@ describe('handleSubmitVote', () => {
 
   it('creates stub member when voter not found', async () => {
     const db = makeMockDb();
-    db.getProposal.mockResolvedValue({ id: `${DAOSHIP}-1` });
-    db.getMember.mockResolvedValue(null); // trigger stub creation
+    // E1: stub path uses insertMemberIfAbsent (no pre-read)
+    db.insertProposalIfAbsent.mockResolvedValue(false); // proposal exists
+    db.insertMemberIfAbsent.mockResolvedValue(true);    // member stub inserted
     const ctx = makeCtx({ db, log: { address: DAOSHIP } });
 
     await handleSubmitVote(ctx, {
       member: MEMBER1, balance: 50n, proposal: 1n, approved: false,
     });
 
-    expect(db.upsertMember).toHaveBeenCalledWith(expect.objectContaining({
+    expect(db.insertMemberIfAbsent).toHaveBeenCalledWith(expect.objectContaining({
       member_address: MEMBER1,
       shares: '0',
       loot: '0',
     }));
+  });
+
+  it('does not warn when both proposal and member already exist', async () => {
+    const db = makeMockDb();
+    db.insertProposalIfAbsent.mockResolvedValue(false);
+    db.insertMemberIfAbsent.mockResolvedValue(false);
+    const ctx = makeCtx({ db, log: { address: DAOSHIP } });
+
+    await handleSubmitVote(ctx, {
+      member: MEMBER1, balance: 50n, proposal: 1n, approved: true,
+    });
+
+    // Still records the vote
+    expect(db.upsertVote).toHaveBeenCalled();
+    // No stub paths fired
+    expect(db.upsertMember).not.toHaveBeenCalled();
+    expect(db.upsertProposal).not.toHaveBeenCalled();
   });
 });
 
@@ -339,7 +358,8 @@ describe('handleRagequit', () => {
 
   it('creates stub member if member not found', async () => {
     const db = makeMockDb();
-    db.getMember.mockResolvedValue(null); // trigger stub
+    // E1: stub path uses insertMemberIfAbsent (no pre-read)
+    db.insertMemberIfAbsent.mockResolvedValue(true);
     db.getDao.mockResolvedValue(MOCK_DAO);
     const ctx = makeCtx({ db, log: { address: DAOSHIP } });
 
@@ -347,7 +367,7 @@ describe('handleRagequit', () => {
       member: MEMBER1, to: MEMBER2, lootToBurn: 0n, sharesToBurn: 50n, tokens: [], amounts: [],
     });
 
-    expect(db.upsertMember).toHaveBeenCalledWith(expect.objectContaining({
+    expect(db.insertMemberIfAbsent).toHaveBeenCalledWith(expect.objectContaining({
       member_address: MEMBER1,
       shares: '0',
     }));
@@ -445,37 +465,23 @@ describe('handleNavigatorSet', () => {
     expect(db.upsert).not.toHaveBeenCalled();
   });
 
-  it('populates deployer, name, description from NavigatorDeployed event', async () => {
+  it('promotes orphan navigator when IDs match', async () => {
     const db = makeMockDb();
-    const blockchain = makeMockBlockchain();
-    const iface = new (await import('quais')).Interface([{
-      type: 'event', name: 'NavigatorDeployed',
-      inputs: [
-        { name: 'daoShip', type: 'address', indexed: true },
-        { name: 'deployer', type: 'address', indexed: true },
-        { name: 'navigatorType', type: 'string', indexed: false },
-        { name: 'name', type: 'string', indexed: false },
-        { name: 'description', type: 'string', indexed: false },
-      ],
-    }]);
-    const fragment = iface.getEvent('NavigatorDeployed')!;
-    const encoded = iface.encodeEventLog(fragment, [DAOSHIP, MEMBER1, 'OnboarderNavigator', 'My Nav', 'Does things']);
-    blockchain.getLogs.mockResolvedValue([{
-      topics: encoded.topics,
-      data: encoded.data,
-      address: NAVIGATOR,
-      blockNumber: 50,
-      transactionHash: TX_HASH,
-      index: 0,
-      transactionIndex: 0,
-    }]);
+    const expectedId = `${DAOSHIP}-${NAVIGATOR}`;
+    db.findOrphanNavigator.mockResolvedValue({
+      id: expectedId,
+      deployer: MEMBER1,
+      navigator_type: 'OnboarderNavigator',
+      name: 'My Nav',
+      description: 'Does things',
+    });
     const registry = makeMockRegistry();
     registry.getDaoByDaoShipAddress.mockReturnValue({ daoShipAddress: DAOSHIP });
-    const ctx = makeCtx({ db, blockchain, registry, log: { address: DAOSHIP } });
+    const ctx = makeCtx({ db, registry, log: { address: DAOSHIP } });
 
     await handleNavigatorSet(ctx, { navigator: NAVIGATOR, permission: 4n });
 
-    expect(blockchain.getLogs).toHaveBeenCalled();
+    expect(db.findOrphanNavigator).toHaveBeenCalledWith(NAVIGATOR);
     expect(db.upsert).toHaveBeenCalledWith('ds_navigators', expect.objectContaining({
       deployer: MEMBER1,
       navigator_type: 'OnboarderNavigator',
@@ -484,50 +490,39 @@ describe('handleNavigatorSet', () => {
     }));
   });
 
-  it('rejects NavigatorDeployed when daoShip does not match', async () => {
+  it('discards orphan metadata when IDs mismatch (spoofed daoShip)', async () => {
     const db = makeMockDb();
-    const blockchain = makeMockBlockchain();
-    const iface = new (await import('quais')).Interface([{
-      type: 'event', name: 'NavigatorDeployed',
-      inputs: [
-        { name: 'daoShip', type: 'address', indexed: true },
-        { name: 'deployer', type: 'address', indexed: true },
-        { name: 'navigatorType', type: 'string', indexed: false },
-        { name: 'name', type: 'string', indexed: false },
-        { name: 'description', type: 'string', indexed: false },
-      ],
-    }]);
-    const fragment = iface.getEvent('NavigatorDeployed')!;
-    const wrongDao = '0x0000000000000000000000000000000000000099';
-    const encoded = iface.encodeEventLog(fragment, [wrongDao, MEMBER1, 'OnboarderNavigator', 'Fake', 'Bad']);
-    blockchain.getLogs.mockResolvedValue([{
-      topics: encoded.topics, data: encoded.data,
-      address: NAVIGATOR, blockNumber: 50, transactionHash: TX_HASH, index: 0, transactionIndex: 0,
-    }]);
+    const wrongDaoShip = '0x0000000000000000000000000000000000000099';
+    db.findOrphanNavigator.mockResolvedValue({
+      id: `${wrongDaoShip}-${NAVIGATOR}`,
+      deployer: MEMBER1,
+      navigator_type: 'OnboarderNavigator',
+      name: 'Fake',
+      description: 'Bad',
+    });
     const registry = makeMockRegistry();
     registry.getDaoByDaoShipAddress.mockReturnValue({ daoShipAddress: DAOSHIP });
-    const ctx = makeCtx({ db, blockchain, registry, log: { address: DAOSHIP } });
+    const ctx = makeCtx({ db, registry, log: { address: DAOSHIP } });
 
     await handleNavigatorSet(ctx, { navigator: NAVIGATOR, permission: 4n });
 
-    // Metadata fields omitted when fetch returns mismatched daoShip — preserves existing data
+    // Metadata fields omitted when orphan ID mismatches
     const upsertData = db.upsert.mock.calls[0][1];
     expect(upsertData).not.toHaveProperty('deployer');
     expect(upsertData).not.toHaveProperty('name');
     expect(upsertData).not.toHaveProperty('description');
   });
 
-  it('handles missing NavigatorDeployed gracefully', async () => {
+  it('works when no orphan exists (findOrphanNavigator returns null)', async () => {
     const db = makeMockDb();
-    const blockchain = makeMockBlockchain();
-    blockchain.getLogs.mockResolvedValue([]);
+    db.findOrphanNavigator.mockResolvedValue(null);
     const registry = makeMockRegistry();
     registry.getDaoByDaoShipAddress.mockReturnValue({ daoShipAddress: DAOSHIP });
-    const ctx = makeCtx({ db, blockchain, registry, log: { address: DAOSHIP } });
+    const ctx = makeCtx({ db, registry, log: { address: DAOSHIP } });
 
     await handleNavigatorSet(ctx, { navigator: NAVIGATOR, permission: 4n });
 
-    // Metadata fields omitted when no NavigatorDeployed logs found — preserves existing data
+    // Metadata fields omitted when no orphan found
     const upsertData = db.upsert.mock.calls[0][1];
     expect(upsertData).not.toHaveProperty('deployer');
     expect(upsertData).not.toHaveProperty('navigator_type');
@@ -535,16 +530,15 @@ describe('handleNavigatorSet', () => {
     expect(upsertData).not.toHaveProperty('description');
   });
 
-  it('skips NavigatorDeployed fetch when permission=0', async () => {
+  it('skips orphan lookup when permission=0', async () => {
     const db = makeMockDb();
-    const blockchain = makeMockBlockchain();
     const registry = makeMockRegistry();
     registry.getDaoByDaoShipAddress.mockReturnValue({ daoShipAddress: DAOSHIP });
-    const ctx = makeCtx({ db, blockchain, registry, log: { address: DAOSHIP } });
+    const ctx = makeCtx({ db, registry, log: { address: DAOSHIP } });
 
     await handleNavigatorSet(ctx, { navigator: NAVIGATOR, permission: 0n });
 
-    expect(blockchain.getLogs).not.toHaveBeenCalled();
+    expect(db.findOrphanNavigator).not.toHaveBeenCalled();
   });
 
   it('upserts to DB but skips registry when daoship not in registry', async () => {
@@ -783,6 +777,160 @@ describe('handleGovernanceConfigSet (default_expiry_window)', () => {
 
     expect(db.updateDao).toHaveBeenCalledWith(DAOSHIP, expect.objectContaining({
       default_expiry_window: 86400,
+    }));
+  });
+});
+
+// ── handleSetupComplete: default_expiry_window ──────────────────
+
+describe('handleSetupComplete (default_expiry_window)', () => {
+  it('decodes defaultExpiryWindow and writes default_expiry_window to DB', async () => {
+    const db = makeMockDb();
+    const ctx = makeCtx({
+      db,
+      log: { address: DAOSHIP },
+    });
+
+    await handleSetupComplete(ctx, {
+      lootPaused: false,
+      sharesPaused: false,
+      gracePeriod: 3600n,
+      votingPeriod: 7200n,
+      proposalOffering: 0n,
+      quorumPercent: 20n,
+      sponsorThreshold: 0n,
+      minRetentionPercent: 66n,
+      defaultExpiryWindow: 86400n,
+      name: 'My DAO Shares',
+      symbol: 'MDS',
+      lootName: 'DAO Loot',
+      lootSymbol: 'DL',
+      guildTokens: [TOKEN_A],
+      totalShares: 1000n,
+      totalLoot: 500n,
+    });
+
+    expect(db.updateDao).toHaveBeenCalledWith(DAOSHIP, expect.objectContaining({
+      default_expiry_window: 86400,
+    }));
+  });
+});
+
+// ── handleNavigatorDeployed ────────────────────────────────────
+
+describe('handleNavigatorDeployed', () => {
+  const VALID_ROOT = '0x' + 'ab'.repeat(32);
+  const BYTES32_ZERO = '0x' + '0'.repeat(64);
+
+  it('writes an orphan row with dao_id: null', async () => {
+    const db = makeMockDb();
+    const blockchain = makeMockBlockchain();
+    // Default: rawCall rejects — navigator has no allowlistRoot()
+    blockchain.rawCall.mockRejectedValue(new Error('execution reverted'));
+    const ctx = makeCtx({
+      db,
+      blockchain,
+      log: { address: NAVIGATOR },
+    });
+
+    await handleNavigatorDeployed(ctx, {
+      daoShip: DAOSHIP,
+      deployer: MEMBER1,
+      navigatorType: 'OnboarderNavigator',
+      name: 'My Nav',
+      description: 'Does things',
+    });
+
+    expect(db.upsert).toHaveBeenCalledWith('ds_navigators', expect.objectContaining({
+      id: `${DAOSHIP}-${NAVIGATOR}`,
+      dao_id: null,
+      navigator_address: NAVIGATOR,
+      deployer: MEMBER1,
+      navigator_type: 'OnboarderNavigator',
+      name: 'My Nav',
+      description: 'Does things',
+      is_active: false,
+      allowlist_root: null, // no allowlist — rawCall reverted
+    }));
+  });
+
+  // H1: allowlistRoot() is best-effort cached at deploy time so allowlist
+  // NewPost events can be verified without further RPC calls.
+  it('caches allowlist_root from rawCall when navigator has a non-zero allowlist', async () => {
+    const db = makeMockDb();
+    const blockchain = makeMockBlockchain();
+    blockchain.rawCall.mockResolvedValue(VALID_ROOT);
+    const ctx = makeCtx({ db, blockchain, log: { address: NAVIGATOR } });
+
+    await handleNavigatorDeployed(ctx, {
+      daoShip: DAOSHIP,
+      deployer: MEMBER1,
+      navigatorType: 'OnboarderNavigator',
+      name: 'Nav',
+      description: 'x',
+    });
+
+    expect(db.upsert).toHaveBeenCalledWith('ds_navigators', expect.objectContaining({
+      allowlist_root: VALID_ROOT,
+    }));
+  });
+
+  it('normalizes zero allowlist root to NULL (open allowlist)', async () => {
+    const db = makeMockDb();
+    const blockchain = makeMockBlockchain();
+    blockchain.rawCall.mockResolvedValue(BYTES32_ZERO);
+    const ctx = makeCtx({ db, blockchain, log: { address: NAVIGATOR } });
+
+    await handleNavigatorDeployed(ctx, {
+      daoShip: DAOSHIP,
+      deployer: MEMBER1,
+      navigatorType: 'OnboarderNavigator',
+      name: 'Nav',
+      description: 'x',
+    });
+
+    expect(db.upsert).toHaveBeenCalledWith('ds_navigators', expect.objectContaining({
+      allowlist_root: null,
+    }));
+  });
+
+  it('leaves allowlist_root NULL when rawCall reverts (deterministic)', async () => {
+    const db = makeMockDb();
+    const blockchain = makeMockBlockchain();
+    blockchain.rawCall.mockRejectedValue(new Error('execution reverted'));
+    const ctx = makeCtx({ db, blockchain, log: { address: NAVIGATOR } });
+
+    await handleNavigatorDeployed(ctx, {
+      daoShip: DAOSHIP,
+      deployer: MEMBER1,
+      navigatorType: 'SomeNavigatorWithoutAllowlist',
+      name: 'Nav',
+      description: 'x',
+    });
+
+    expect(db.upsert).toHaveBeenCalledWith('ds_navigators', expect.objectContaining({
+      allowlist_root: null,
+    }));
+    // The write should still succeed — allowlistRoot() absence is expected.
+    expect(db.upsert).toHaveBeenCalled();
+  });
+
+  it('leaves allowlist_root NULL on unexpected rawCall return length', async () => {
+    const db = makeMockDb();
+    const blockchain = makeMockBlockchain();
+    blockchain.rawCall.mockResolvedValue('0x1234'); // too short
+    const ctx = makeCtx({ db, blockchain, log: { address: NAVIGATOR } });
+
+    await handleNavigatorDeployed(ctx, {
+      daoShip: DAOSHIP,
+      deployer: MEMBER1,
+      navigatorType: 'OnboarderNavigator',
+      name: 'Nav',
+      description: 'x',
+    });
+
+    expect(db.upsert).toHaveBeenCalledWith('ds_navigators', expect.objectContaining({
+      allowlist_root: null,
     }));
   });
 });
