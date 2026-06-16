@@ -54,10 +54,54 @@ import {
 import { posterIface, handleNewPost } from './handlers/poster.js';
 
 import {
+  signalNavigatorIface,
+  handlePollCreated,
+  handleVoted,
+  handlePollCancelled,
+} from './handlers/signal.js';
+
+import {
   onboarderNavigatorIface,
+  nftGatedNavigatorIface,
   handleOnboard,
+  handleNFTClaimed,
   clearNavigatorDaoCache,
 } from './handlers/navigators.js';
+
+import {
+  timelockNavigatorIface,
+  handleChangeQueued,
+  handleChangeExecuted,
+  handleChangeCancelled,
+} from './handlers/timelock.js';
+
+import {
+  vestingNavigatorIface,
+  handleScheduleCreated,
+  handleTokensClaimed,
+  handleScheduleRevoked,
+} from './handlers/vesting.js';
+
+import {
+  budgetNavigatorIface,
+  handleBudgetCreated,
+  handleDisbursed,
+  handleManagerUpdated,
+  handleBudgetCancelled,
+} from './handlers/budget.js';
+
+import {
+  avatarModulesIface,
+  handleEnabledModule,
+  handleDisabledModule,
+} from './handlers/vault-modules.js';
+
+import {
+  subscriptionNavigatorIface,
+  handleMemberEnrolled,
+  handleFeePaid,
+  handleFeeCollected,
+} from './handlers/subscription.js';
 
 // ── Circuit Breaker ─────────────────────────────────────────────
 
@@ -72,42 +116,69 @@ const FORCE_SHUTDOWN_MS = 15000;
 
 // ── Bootstrap ───────────────────────────────────────────────────
 
-/** Register all event handlers on a dispatcher (shared by index.ts and backfill.ts) */
+/**
+ * Register all event handlers on a dispatcher (shared by index.ts and backfill.ts).
+ *
+ * ── Fetch-mode strategy ─────────────────────────────────────────
+ * The 4th arg to `registerHandler` flips topic0 fetching to unfiltered
+ * (chain-wide scan, no address filter). Default is `true` ("unfiltered")
+ * for every topic except three collision-prone OpenZeppelin-standard
+ * signatures that are emitted by every contract on chain:
+ *
+ *   - Transfer(address,address,uint256)  — every ERC-20/ERC-721
+ *   - Paused(address)                    — every OZ Pausable
+ *   - Unpaused(address)                  — every OZ Pausable
+ *
+ * Those three stay SCOPED (`unfiltered: false`) to avoid pulling
+ * chain-wide volume we'd just filter out in-process. Re-evaluate via
+ * `npm run measure:log-volume` once Quai's ERC-20 ecosystem fills in.
+ *
+ * At 10k DAOs the scoped path costs ~400 getLogs/range; the unfiltered
+ * path for the 27 flipped topics costs a flat ~27 getLogs/range — the
+ * primary scalability win per docs/PERF_BATCH_DB_ROUNDTRIPS.md.
+ */
 export function registerAllHandlers(dispatcher: HandlerDispatcher): void {
-  // Launcher events
-  dispatcher.registerHandler(daoShipAndVaultLauncherIface, 'LaunchDAOShipAndVault', handleLaunchDAOShipAndVault);
-  dispatcher.registerHandler(daoShipLauncherIface, 'LaunchDAOShip', handleLaunchDAOShip);
+  // Launcher events — only emitted by 2 known launcher contracts; flip
+  // for consistency (saves them from the address-filter list).
+  dispatcher.registerHandler(daoShipAndVaultLauncherIface, 'LaunchDAOShipAndVault', handleLaunchDAOShipAndVault, true);
+  dispatcher.registerHandler(daoShipLauncherIface, 'LaunchDAOShip', handleLaunchDAOShip, true);
 
-  // DAOShip governance events (19 total)
-  dispatcher.registerHandler(daoShipIface, 'SetupComplete', handleSetupComplete);
-  dispatcher.registerHandler(daoShipIface, 'SubmitProposal', handleSubmitProposal);
-  dispatcher.registerHandler(daoShipIface, 'SponsorProposal', handleSponsorProposal);
-  dispatcher.registerHandler(daoShipIface, 'SubmitVote', handleSubmitVote);
-  dispatcher.registerHandler(daoShipIface, 'ProcessProposal', handleProcessProposal);
-  dispatcher.registerHandler(daoShipIface, 'CancelProposal', handleCancelProposal);
-  dispatcher.registerHandler(daoShipIface, 'Ragequit', handleRagequit);
-  dispatcher.registerHandler(daoShipIface, 'NavigatorSet', handleNavigatorSet);
-  dispatcher.registerHandler(daoShipIface, 'GovernanceConfigSet', handleGovernanceConfigSet);
-  dispatcher.registerHandler(daoShipIface, 'SetGuildTokens', handleSetGuildTokens);
-  dispatcher.registerHandler(daoShipIface, 'MintShares', handleMintShares);
-  dispatcher.registerHandler(daoShipIface, 'MintLoot', handleMintLoot);
-  dispatcher.registerHandler(daoShipIface, 'BurnShares', handleBurnShares);
-  dispatcher.registerHandler(daoShipIface, 'BurnLoot', handleBurnLoot);
-  dispatcher.registerHandler(daoShipIface, 'LockAdmin', handleLockAdmin);
-  dispatcher.registerHandler(daoShipIface, 'LockManager', handleLockManager);
-  dispatcher.registerHandler(daoShipIface, 'LockGovernor', handleLockGovernor);
-  dispatcher.registerHandler(daoShipIface, 'ConvertSharesToLoot', handleConvertSharesToLoot);
-  dispatcher.registerHandler(daoShipIface, 'AdminConfigSet', handleAdminConfigSet);
+  // DAOShip governance events (19 total) — only DAOShip contracts we've
+  // registered can emit these. Flipping to unfiltered drops ~1 DAOShip
+  // address per DAO from the scoped filter list.
+  dispatcher.registerHandler(daoShipIface, 'SetupComplete', handleSetupComplete, true);
+  dispatcher.registerHandler(daoShipIface, 'SubmitProposal', handleSubmitProposal, true);
+  dispatcher.registerHandler(daoShipIface, 'SponsorProposal', handleSponsorProposal, true);
+  dispatcher.registerHandler(daoShipIface, 'SubmitVote', handleSubmitVote, true);
+  dispatcher.registerHandler(daoShipIface, 'ProcessProposal', handleProcessProposal, true);
+  dispatcher.registerHandler(daoShipIface, 'CancelProposal', handleCancelProposal, true);
+  dispatcher.registerHandler(daoShipIface, 'Ragequit', handleRagequit, true);
+  dispatcher.registerHandler(daoShipIface, 'NavigatorSet', handleNavigatorSet, true);
+  dispatcher.registerHandler(daoShipIface, 'GovernanceConfigSet', handleGovernanceConfigSet, true);
+  dispatcher.registerHandler(daoShipIface, 'SetGuildTokens', handleSetGuildTokens, true);
+  dispatcher.registerHandler(daoShipIface, 'MintShares', handleMintShares, true);
+  dispatcher.registerHandler(daoShipIface, 'MintLoot', handleMintLoot, true);
+  dispatcher.registerHandler(daoShipIface, 'BurnShares', handleBurnShares, true);
+  dispatcher.registerHandler(daoShipIface, 'BurnLoot', handleBurnLoot, true);
+  dispatcher.registerHandler(daoShipIface, 'LockAdmin', handleLockAdmin, true);
+  dispatcher.registerHandler(daoShipIface, 'LockManager', handleLockManager, true);
+  dispatcher.registerHandler(daoShipIface, 'LockGovernor', handleLockGovernor, true);
+  dispatcher.registerHandler(daoShipIface, 'ConvertSharesToLoot', handleConvertSharesToLoot, true);
+  dispatcher.registerHandler(daoShipIface, 'AdminConfigSet', handleAdminConfigSet, true);
 
-  // Token events
+  // Token events.
+  // Transfer / Paused / Unpaused use universally-common topic0s (every
+  // ERC-20 / every OZ Pausable on chain). STAY SCOPED until measurement
+  // confirms Quai-wide volume is tractable.
   dispatcher.registerHandler(sharesIface, 'Transfer', handleTransfer);
-  dispatcher.registerHandler(sharesIface, 'DelegateChanged', handleDelegateChanged);
-  dispatcher.registerHandler(sharesIface, 'DelegateVotesChanged', handleDelegateVotesChanged);
   dispatcher.registerHandler(sharesIface, 'Paused', handlePaused);
   dispatcher.registerHandler(sharesIface, 'Unpaused', handleUnpaused);
+  // Delegate events have DAO-Ships-specific signatures (not ERC-20).
+  dispatcher.registerHandler(sharesIface, 'DelegateChanged', handleDelegateChanged, true);
+  dispatcher.registerHandler(sharesIface, 'DelegateVotesChanged', handleDelegateVotesChanged, true);
 
-  // Poster events
-  dispatcher.registerHandler(posterIface, 'NewPost', handleNewPost);
+  // Poster — single global contract; flip for consistency.
+  dispatcher.registerHandler(posterIface, 'NewPost', handleNewPost, true);
 
   // Navigator events
   // NavigatorDeployed is emitted by navigator contracts at construction time.
@@ -115,7 +186,63 @@ export function registerAllHandlers(dispatcher: HandlerDispatcher): void {
   dispatcher.registerHandler(iNavIface, 'NavigatorDeployed', handleNavigatorDeployed, true);
   // OnboarderNavigator and ERC20TributeNavigator emit the same Onboard(address,address,uint256,uint256,uint256)
   // signature → identical topic0. Register once; the handler distinguishes by emitting contract address.
-  dispatcher.registerHandler(onboarderNavigatorIface, 'Onboard', handleOnboard);
+  dispatcher.registerHandler(onboarderNavigatorIface, 'Onboard', handleOnboard, true);
+  // NFTGatedNavigator additionally emits NFTClaimed (unique topic0, carries the spent tokenId).
+  // Flipped unfiltered to match Onboard — both are navigator-only signatures and the
+  // unfiltered scan is a flat ~1 getLogs/range regardless of navigator count.
+  dispatcher.registerHandler(nftGatedNavigatorIface, 'NFTClaimed', handleNFTClaimed, true);
+
+  // SignalNavigator events (read-only polls). Unfiltered topic0 scan — like Onboard/NFTClaimed,
+  // these are navigator-only signatures and the navigator is discovered via NavigatorDeployed,
+  // never NavigatorSet. Handlers self-gate on trust_status (only sanctioned navs materialize).
+  dispatcher.registerHandler(signalNavigatorIface, 'PollCreated', handlePollCreated, true);
+  dispatcher.registerHandler(signalNavigatorIface, 'Voted', handleVoted, true);
+  dispatcher.registerHandler(signalNavigatorIface, 'PollCancelled', handlePollCancelled, true);
+
+  // TimelockNavigator events (GOVERNOR-permissioned governance-config timelock). Unfiltered
+  // topic0 scan like the other navigator-specific signatures — the navigator is discovered via
+  // NavigatorSet, and unfiltered fetch guarantees ChangeExecuted is always in pass 1 so the
+  // same-tx bypass pairing with GovernanceConfigSet resolves in one range.
+  dispatcher.registerHandler(timelockNavigatorIface, 'ChangeQueued', handleChangeQueued, true);
+  dispatcher.registerHandler(timelockNavigatorIface, 'ChangeExecuted', handleChangeExecuted, true);
+  dispatcher.registerHandler(timelockNavigatorIface, 'ChangeCancelled', handleChangeCancelled, true);
+
+  // VestingNavigator events (MANAGER-permissioned cliff+linear vesting). Unfiltered topic0 scan.
+  dispatcher.registerHandler(vestingNavigatorIface, 'ScheduleCreated', handleScheduleCreated, true);
+  dispatcher.registerHandler(vestingNavigatorIface, 'TokensClaimed', handleTokensClaimed, true);
+  dispatcher.registerHandler(vestingNavigatorIface, 'ScheduleRevoked', handleScheduleRevoked, true);
+
+  // BudgetNavigator events (treasury budgets; vault-MODULE authority, no NavigatorSet). Unfiltered
+  // topic0 scan like the other navigator-specific signatures. Handlers self-gate on trust_status
+  // (only navigators the vault has ENABLED materialize — see vault-modules below). Paused/Unpaused/
+  // NavigatorDeployed are shared topic0s handled elsewhere — NOT re-registered (would collide).
+  dispatcher.registerHandler(budgetNavigatorIface, 'BudgetCreated', handleBudgetCreated, true);
+  dispatcher.registerHandler(budgetNavigatorIface, 'Disbursed', handleDisbursed, true);
+  dispatcher.registerHandler(budgetNavigatorIface, 'ManagerUpdated', handleManagerUpdated, true);
+  dispatcher.registerHandler(budgetNavigatorIface, 'BudgetCancelled', handleBudgetCancelled, true);
+
+  // Vault (QuaiVault / IAvatar) module events — the BudgetNavigator trust signal. These Zodiac
+  // standard events are emitted by every safe, so the unfiltered scan is paired with an
+  // authenticated in-handler filter (emitter == a known DAO's avatar AND module == a BudgetNavigator
+  // bound to that DAO). EnabledModule → sanctioned + active + backfill; DisabledModule → unsanctioned.
+  //
+  // ⚠️ SCALABILITY WATCH-ITEM: unlike every other unfiltered topic above (DAOShips-specific, rare),
+  // EnabledModule/DisabledModule are the Gnosis-Safe/Zodiac STANDARD signatures emitted by EVERY safe
+  // on chain, so their getLogs volume scales with the whole Safe ecosystem — not with DAOShips usage.
+  // Negligible today; track via `npm run measure:log-volume` (both are flagged collision-prone there).
+  // If they dominate, flip these two to scoped (`unfiltered:false`) and add the registry's avatar
+  // addresses to the fetch set — the one address-class the scoped fetcher does not track today.
+  dispatcher.registerHandler(avatarModulesIface, 'EnabledModule', handleEnabledModule, true);
+  dispatcher.registerHandler(avatarModulesIface, 'DisabledModule', handleDisabledModule, true);
+
+  // SubscriptionNavigator events (MANAGER-permissioned recurring membership dues). Unfiltered
+  // topic0 scan like the other navigator-specific signatures. Permissioned (standard NavigatorSet
+  // discovery), so handlers resolve the DAO from NavigatorDeployed with no defer/backfill gate —
+  // trust is enforced in the app. Paused/Unpaused/NavigatorDeployed are shared topic0s handled
+  // elsewhere — NOT re-registered (would collide).
+  dispatcher.registerHandler(subscriptionNavigatorIface, 'MemberEnrolled', handleMemberEnrolled, true);
+  dispatcher.registerHandler(subscriptionNavigatorIface, 'FeePaid', handleFeePaid, true);
+  dispatcher.registerHandler(subscriptionNavigatorIface, 'FeeCollected', handleFeeCollected, true);
 
   logger.info(
     { handlerCount: dispatcher.getRegisteredTopics().length },
@@ -178,19 +305,21 @@ async function main(): Promise<void> {
   const dispatcher = new HandlerDispatcher();
   health = new HealthService();
 
-  health.setServices(blockchain, db);
-
   // ── Register event handlers ─────────────────────────────────
 
   registerAllHandlers(dispatcher);
 
-  // ── Start health server ───────────────────────────────────────
-
-  await health.start();
-
   // ── Create block processor ──────────────────────────────────
 
   const processor = new BlockProcessor(blockchain, db, registry, dispatcher);
+
+  // Wire services into the health server BEFORE starting it so the first
+  // /health probe can include RangeCache stats via processor.recentRangeStats.
+  health.setServices(blockchain, db, processor);
+
+  // ── Start health server ───────────────────────────────────────
+
+  await health.start();
 
   // Wrap init in try/catch so health server is stopped on fatal init errors
   let lastProcessedBlock: number;
@@ -199,9 +328,23 @@ async function main(): Promise<void> {
   // persist a block via updateLastProcessedBlock.
   let lastCommittedBlockHash: string | null = null;
   try {
+    // Flip the health flag BEFORE init-phase backfill. Backfill can take
+    // hours for deep chains — during that window the indexer IS running
+    // and making forward progress, so reporting "not running" is misleading
+    // to ops. If init fails fatally, the catch block below flips the flag
+    // back to false. The fatal handlers (SIGINT, uncaughtException) also
+    // flip it to false on real process exit.
+    health.setIndexerRunning(true);
+
     // ── Wait for RPC connection ───────────────────────────────────
 
     await waitForRpcConnection(blockchain);
+
+    // ── Wait for DB connection ────────────────────────────────────
+    // Gate init on Supabase reachability so a transient `fetch failed` blip
+    // during startup waits-and-retries instead of crashing the process at the
+    // first unguarded DB call below.
+    await waitForDbConnection(db);
 
     // ── Clear stale is_syncing flag from previous crash (I5) ────
     // If the indexer crashed during backfill, is_syncing may still be true.
@@ -314,6 +457,7 @@ async function main(): Promise<void> {
     }
   } catch (initErr) {
     logger.fatal({ err: initErr }, 'Fatal error during initialization — stopping health server');
+    health.setIndexerRunning(false);
     await health.stop();
     throw initErr;
   }
@@ -344,7 +488,9 @@ async function main(): Promise<void> {
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
-  health.setIndexerRunning(true);
+  // `setIndexerRunning(true)` already fired at the top of init so /health
+  // reports healthy during backfill. Keep no-op here to preserve the
+  // existing ordering contract for any callers relying on it.
 
   const pollRetryTracker = new RetryTracker();
   const circuitBreaker = { failures: 0, isOpen: false, openUntil: 0 };
@@ -514,8 +660,14 @@ async function main(): Promise<void> {
     // Daily orphan pruning (pre-DAO allowlist records and navigator metadata that were never claimed)
     if (Date.now() - lastPruneTime > 86_400_000) {
       try {
+        // Navigator pruning reaps non-read-only navigators never granted a permission
+        // within ORPHAN_RETENTION_DAYS, whether or not their DAO exists. Only deletes when
+        // caught up to chain head — until head, an unprocessed NavigatorSet that would grant
+        // permission may still be pending, so the RPC no-ops unless atChainHead is true.
+        const chainHead = await blockchain.getBlockNumber().catch(() => lastProcessedBlock);
+        const atChainHead = lastProcessedBlock >= chainHead - config.confirmationBlocks;
         await db.pruneOrphanedRecords(config.orphanRetentionDays);
-        await db.pruneOrphanedNavigators(config.orphanRetentionDays);
+        await db.pruneOrphanedNavigators(config.orphanRetentionDays, atChainHead);
         lastPruneTime = Date.now();
       } catch (err) {
         logger.warn({ err }, 'Orphan pruning failed (non-fatal)');
@@ -576,6 +728,43 @@ async function waitForRpcConnection(
 
       if (attempt === maxAttempts) {
         throw new Error(`Failed to connect to RPC after ${maxAttempts} attempts: ${(err as Error).message}`);
+      }
+
+      await sleep(delay);
+      delay = Math.min(delay * 1.5, maxDelay);
+    }
+  }
+}
+
+/**
+ * DB-readiness gate, mirror of waitForRpcConnection. A transient Supabase blip
+ * (`TypeError: fetch failed`) during init would otherwise crash the process at
+ * the first unguarded DB call (getLastProcessedBlock / registry hydration),
+ * even though the DB recovers seconds later. Probe is getLastProcessedBlock():
+ * ds_indexer_state always has a seeded id=1 row (schema.sql), so the only way
+ * this throws is the DB being unreachable — exactly the condition to wait on.
+ */
+async function waitForDbConnection(
+  db: DatabaseService,
+  maxAttempts = 30,
+  initialDelayMs = 2000,
+): Promise<void> {
+  let delay = initialDelayMs;
+  const maxDelay = 30000;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const { blockNumber } = await db.getLastProcessedBlock();
+      logger.info({ lastProcessedBlock: blockNumber, attempts: attempt }, 'Database connection established');
+      return;
+    } catch (err) {
+      logger.warn(
+        { attempt, maxAttempts, nextRetryMs: delay, err: (err as Error).message },
+        'Waiting for database connection...',
+      );
+
+      if (attempt === maxAttempts) {
+        throw new Error(`Failed to connect to database after ${maxAttempts} attempts: ${(err as Error).message}`);
       }
 
       await sleep(delay);
@@ -676,20 +865,43 @@ async function detectAndRecoverReorg(
     'Rewinding to safe fork point and cleaning up orphaned data',
   );
 
+  // Check whether the rewound window actually contained any processed events
+  // BEFORE deletion (deleteEventsAfterBlock cascades through ds_processed_logs).
+  // Zero processed logs ⇒ no Transfer/Mint/Burn/Ragequit/etc. was ever recorded
+  // on the abandoned fork ⇒ no balance drift possible ⇒ skip the flag. This
+  // is best-effort; on query failure we fall through to the conservative path
+  // (flag set) to match pre-existing behavior.
+  let rewoundLogCount: number | null = null;
+  try {
+    rewoundLogCount = await db.countProcessedLogsAfterBlock(forkPoint);
+  } catch (err) {
+    logger.warn({ err, origin, forkPoint }, 'Clean-window check failed; falling back to setting reindex flag');
+  }
+
   // Fatal on failure — must not continue with stale data after a detected reorg.
   await db.deleteEventsAfterBlock(forkPoint);
 
-  // M2: Every detected reorg is deeper than confirmationBlocks by construction
+  // M2: A reorg is deeper than confirmationBlocks by construction
   // (the indexer only persists blocks at currentBlock - confirmationBlocks).
-  // Member balances cannot be rebuilt from the replay range alone — flag for
-  // operator attention. Best-effort: don't fail recovery if the flag write
-  // fails.
-  try {
-    await db.setRequiresFullReindex(
-      `${origin}: reorg detected at block ${lastProcessedBlock}, rewound to ${forkPoint}`,
+  // Member balances cannot be rebuilt from the replay range alone IF any
+  // balance-affecting event was recorded in the window. When the dedupe log
+  // shows zero processed rows in the rewound range, the reorg only moved
+  // empty blocks and there is no drift to recover from — skip the flag.
+  // Best-effort: don't fail recovery if the flag write fails.
+  if (rewoundLogCount === 0) {
+    logger.info(
+      { forkPoint, lastProcessedBlock, origin },
+      'Reorg window had zero processed logs — skipping requires_full_reindex flag',
     );
-  } catch (err) {
-    logger.error({ err, origin }, 'Failed to set requires_full_reindex flag (continuing)');
+  } else {
+    try {
+      await db.setRequiresFullReindex(
+        `${origin}: reorg detected at block ${lastProcessedBlock}, rewound to ${forkPoint}` +
+          (rewoundLogCount !== null ? ` (${rewoundLogCount} processed logs in window)` : ''),
+      );
+    } catch (err) {
+      logger.error({ err, origin }, 'Failed to set requires_full_reindex flag (continuing)');
+    }
   }
 
   // M4: Clear in-memory caches that may contain stale mappings from

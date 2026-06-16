@@ -59,7 +59,9 @@ function makeHarness(opts: {
   const db = {
     getProcessedLogKeys: vi.fn().mockResolvedValue(opts.processedKeys ?? new Set()),
     markLogProcessed: vi.fn().mockResolvedValue(undefined),
+    markLogsProcessedBatch: vi.fn().mockResolvedValue(undefined),
     recordEventTransaction: vi.fn().mockResolvedValue(undefined),
+    recomputeDaoTotals: vi.fn().mockResolvedValue(undefined),
   } as any;
 
   const registry = {
@@ -101,11 +103,13 @@ describe('BlockProcessor.processBlockRange validation', () => {
 // ── Happy path ─────────────────────────────────────────────────
 
 describe('BlockProcessor.processBlockRange happy path', () => {
-  it('dispatches each log and marks it processed', async () => {
+  it('dispatches each log and marks it processed (batched under Option B)', async () => {
     const logs = [
       makeLog({ index: 0, transactionHash: TX1 }),
       makeLog({ index: 1, transactionHash: TX1 }),
     ];
+    // Default dispatch omits `idempotent` (undefined) → processor treats
+    // it as idempotent and batches the marks at end-of-range.
     const dispatch = vi.fn().mockResolvedValue({ handled: true, eventName: 'E' });
     const { blockchain, db, registry, dispatcher } = makeHarness({ logs, dispatch });
     const p = new BlockProcessor(blockchain, db, registry, dispatcher);
@@ -113,9 +117,27 @@ describe('BlockProcessor.processBlockRange happy path', () => {
     await p.processBlockRange(100, 100);
 
     expect(dispatch).toHaveBeenCalledTimes(2);
-    expect(db.markLogProcessed).toHaveBeenCalledTimes(2);
-    expect(db.markLogProcessed).toHaveBeenNthCalledWith(1, TX1, 0, 100);
-    expect(db.markLogProcessed).toHaveBeenNthCalledWith(2, TX1, 1, 100);
+    // Per-log marks are replaced by a single end-of-range batch.
+    expect(db.markLogProcessed).not.toHaveBeenCalled();
+    expect(db.markLogsProcessedBatch).toHaveBeenCalledTimes(1);
+    const batchRows = db.markLogsProcessedBatch.mock.calls[0][0];
+    expect(batchRows).toEqual([
+      { txHash: TX1, logIndex: 0, blockNumber: 100 },
+      { txHash: TX1, logIndex: 1, blockNumber: 100 },
+    ]);
+  });
+
+  it('falls back to per-log markLogProcessed when a handler is non-idempotent', async () => {
+    const logs = [makeLog({ index: 0, transactionHash: TX1 })];
+    const dispatch = vi.fn().mockResolvedValue({ handled: true, eventName: 'E', idempotent: false });
+    const { blockchain, db, registry, dispatcher } = makeHarness({ logs, dispatch });
+    const p = new BlockProcessor(blockchain, db, registry, dispatcher);
+
+    await p.processBlockRange(100, 100);
+
+    expect(db.markLogProcessed).toHaveBeenCalledTimes(1);
+    // Batch still gets called (with 0 rows → early-return no-op inside db).
+    // Handler's flip is only protective against widening the replay window.
   });
 
   it('deduplicates event-transaction records per tx hash', async () => {
@@ -169,8 +191,12 @@ describe('BlockProcessor.processBlockRange dedup', () => {
     await p.processBlockRange(100, 100);
 
     expect(dispatch).toHaveBeenCalledTimes(1); // only the second log
-    expect(db.markLogProcessed).toHaveBeenCalledTimes(1);
-    expect(db.markLogProcessed).toHaveBeenCalledWith(TX1, 1, 100);
+    // Batched under Option B; the skipped log is not in the batch.
+    expect(db.markLogProcessed).not.toHaveBeenCalled();
+    expect(db.markLogsProcessedBatch).toHaveBeenCalledTimes(1);
+    expect(db.markLogsProcessedBatch.mock.calls[0][0]).toEqual([
+      { txHash: TX1, logIndex: 1, blockNumber: 100 },
+    ]);
   });
 });
 
@@ -270,9 +296,12 @@ describe('BlockProcessor.processBlockRange error handling', () => {
     await p.processBlockRange(100, 100);
 
     expect(dispatch).toHaveBeenCalledTimes(2);
-    // Only the successful log is marked
-    expect(db.markLogProcessed).toHaveBeenCalledTimes(1);
-    expect(db.markLogProcessed).toHaveBeenCalledWith(TX1, 1, 100);
+    // Only the successful log shows up in the end-of-range batch.
+    expect(db.markLogProcessed).not.toHaveBeenCalled();
+    expect(db.markLogsProcessedBatch).toHaveBeenCalledTimes(1);
+    expect(db.markLogsProcessedBatch.mock.calls[0][0]).toEqual([
+      { txHash: TX1, logIndex: 1, blockNumber: 100 },
+    ]);
   });
 
   it('does not fall into infinite discovery loop when registry is stable', async () => {
@@ -319,5 +348,70 @@ describe('BlockProcessor.processBlockRange block-hash return', () => {
 
     const { lastBlockHash } = await p.processBlockRange(100, 100);
     expect(lastBlockHash).toBe('');
+  });
+});
+
+// ── RangeCache scope ───────────────────────────────────────────
+
+describe('BlockProcessor.processBlockRange — RangeCache', () => {
+  it('injects a RangeCache into every EventContext and records range stats', async () => {
+    const logs = [
+      makeLog({ index: 0, transactionHash: TX1 }),
+      makeLog({ index: 1, transactionHash: TX1 }),
+    ];
+    const seenCaches: unknown[] = [];
+    const dispatch = vi.fn().mockImplementation(async (ctx: any) => {
+      seenCaches.push(ctx.cache);
+      return { handled: true, eventName: 'E' };
+    });
+    const { blockchain, db, registry, dispatcher } = makeHarness({ logs, dispatch });
+    const p = new BlockProcessor(blockchain, db, registry, dispatcher);
+
+    await p.processBlockRange(100, 100);
+
+    // Same cache instance is threaded through every log in the range.
+    expect(seenCaches).toHaveLength(2);
+    expect(seenCaches[0]).toBeDefined();
+    expect(seenCaches[0]).toBe(seenCaches[1]);
+
+    // The range stats ring buffer captured this call.
+    expect(p.recentRangeStats).toHaveLength(1);
+    expect(p.recentRangeStats[0]).toMatchObject({
+      fromBlock: 100,
+      toBlock: 100,
+      logCount: 2,
+    });
+    expect(p.recentRangeStats[0].cache).toBeDefined();
+  });
+
+  it('creates a fresh cache per processBlockRange call (no cross-range carryover)', async () => {
+    const logs = [makeLog({ index: 0, transactionHash: TX1 })];
+    const seenCaches: unknown[] = [];
+    const dispatch = vi.fn().mockImplementation(async (ctx: any) => {
+      seenCaches.push(ctx.cache);
+      return { handled: true, eventName: 'E' };
+    });
+    const { blockchain, db, registry, dispatcher } = makeHarness({ logs, dispatch });
+    const p = new BlockProcessor(blockchain, db, registry, dispatcher);
+
+    await p.processBlockRange(100, 100);
+    await p.processBlockRange(101, 101);
+
+    // Two ranges → two distinct cache instances.
+    expect(seenCaches).toHaveLength(2);
+    expect(seenCaches[0]).not.toBe(seenCaches[1]);
+  });
+
+  it('ring buffer retains at most the last 10 ranges', async () => {
+    const { blockchain, db, registry, dispatcher } = makeHarness({ logs: [] });
+    const p = new BlockProcessor(blockchain, db, registry, dispatcher);
+
+    for (let i = 0; i < 15; i++) {
+      await p.processBlockRange(100 + i, 100 + i);
+    }
+    expect(p.recentRangeStats).toHaveLength(10);
+    // Oldest retained range should be #5, newest #14.
+    expect(p.recentRangeStats[0].fromBlock).toBe(105);
+    expect(p.recentRangeStats[p.recentRangeStats.length - 1].fromBlock).toBe(114);
   });
 });

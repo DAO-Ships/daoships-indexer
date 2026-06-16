@@ -15,7 +15,7 @@
  * Run with: npm run test:e2e
  */
 
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
 import * as quais from 'quais';
 import { Shard } from 'quais';
 import { createClient } from '@supabase/supabase-js';
@@ -44,26 +44,54 @@ const MIN_VOTING_PERIOD_SEC = 60;
 
 // ── Timeouts ───────────────────────────────────────────────────────────
 // Voting/grace periods are read from env vars but clamped to contract minimums.
+// Default is 180s (3× contract minimum) because running right at the 60s floor
+// is flaky: the ~20s checkpoint sleep + quais tx latency + test-runner slack
+// can push `submitVote`'s estimateGas past `votingEnds`, reverting with
+// `NotVoting()`. 180s gives comfortable headroom. Override with VOTING_PERIOD=60
+// if you need to stress-test the lower bound.
 const votingPeriodSec = Math.max(
-  parseInt(process.env.VOTING_PERIOD || '60'),
+  parseInt(process.env.VOTING_PERIOD || '180'),
   MIN_VOTING_PERIOD_SEC,
 );
 const gracePeriodSec = parseInt(process.env.GRACE_PERIOD || '60');
 const totalWaitSec = votingPeriodSec + gracePeriodSec;
 
-// Per-proposal timeout: voting + grace + 60s buffer for tx confirmation & indexer catch-up
-const perProposalMs = (totalWaitSec + 60) * 1000;
+// ── Block-time-variance hardening ────────────────────────────────────────
+// Orchard block time is NOT a dependable 5s — it ranges 5s..>15s with occasional
+// multi-minute stalls. During a stall the chain mines no blocks, so block.timestamp —
+// and every state()/isExecutable/vested view that reads it — FREEZES while wall-clock
+// keeps running. Any wait that must watch the contract clock cross a fixed span of
+// EVM-time therefore budgets that span PLUS this slack. Raise CHAIN_STALL_SLACK_MS on a
+// slow day; it only delays a genuine hang's surfacing, never makes a passing run slower
+// (the waits are state-gated and return the instant the condition is met).
+const CHAIN_STALL_SLACK_MS = parseInt(process.env.CHAIN_STALL_SLACK_MS || '480000'); // 8 min
+
+// Ready-wait budget: a proposal needs the full voting+grace span to elapse on the contract
+// clock before it is processable. Budget the span + stall slack. (Was (totalWaitSec+60)s,
+// which left no room for slow/stalled blocks → "ready PX: timed out after 480s".)
+const readyWaitMs = totalWaitSec * 1000 + CHAIN_STALL_SLACK_MS;
+
+// Per-proposal it() timeout: submit + waitPastVotingStarts + votes + readyWait + process +
+// indexer wait — each step can independently stall, so add another slack over readyWait.
+const perProposalMs = readyWaitMs + CHAIN_STALL_SLACK_MS;
 // Extra overhead per proposal phase for retries, waitForIndexer polling, etc.
 const proposalPhaseOverhead = 300_000; // 5 minutes
-// Non-proposal phase timeout: enough for tx send/confirm + waitForIndexer
-const simplePhaseTimeout = 300_000; // 5 minutes
+// Non-proposal phase timeout: some phases do TWO txs + TWO indexer waits (e.g. Phase 9
+// pause+unpause), each of which can stall — budget 2× receipt slack + 2× indexer-wait.
+const simplePhaseTimeout = 2 * CHAIN_STALL_SLACK_MS + 720_000; // ~24 min
 // Per-attempt timeouts — quais RPC calls can hang indefinitely if the node
 // accepts the request but never sends a response.  These prevent that.
 const TX_SEND_TIMEOUT_MS = 30_000;   // 30s for a single tx submission attempt
-const TX_WAIT_TIMEOUT_MS = 60_000;   // 60s for a single receipt polling attempt
 const RPC_CALL_TIMEOUT_MS = 120_000; // 2 min safety net for any other RPC call
-const baseOverheadMs = 300_000; // 5 minutes for salt mining, deployments
+// (receipt-polling cadence lives in waitForReceipt's local perRoundWaitMs)
+const baseOverheadMs = 420_000; // 7 minutes: salt mining + 4 navigator/token deployments (incl. MockERC721 + NFTGatedNavigator) + launch
 const SUITE_TIMEOUT = 4 * (perProposalMs + proposalPhaseOverhead) + baseOverheadMs;
+
+// NFTGatedNavigator (free-mint) config — shared between Phase 1 deploy and the
+// NFT-claim phase. sharesPerHolder is fixed per claim; mintCap is the mandatory
+// (>0) dilution backstop the contract enforces.
+const nftSharesPerHolder = quais.parseQuai('10');
+const nftMintCap = quais.parseQuai('1000');
 
 // Indexer catch-up polling: must be long enough for the indexer to process
 // ~votingPeriod blocks after a proposal sleep. Enforce a minimum of 1 minute.
@@ -72,6 +100,100 @@ const INDEXER_POLL_TIMEOUT = Math.max(
   120_000,
 );
 const INDEXER_POLL_INTERVAL = parseInt(process.env.INDEXER_POLL_INTERVAL_MS || '3000');
+
+// Indexer /health endpoint — used by waitForIndexer to distinguish a slow
+// indexer (still making forward progress) from a stalled/crashed one (RPC
+// circuit breaker open, requires_full_reindex flagged, process not running).
+// The indexer binds 0.0.0.0:8080 by default (HEALTH_CHECK_PORT); connect via
+// 127.0.0.1. Override the whole URL with INDEXER_HEALTH_URL for remote runs.
+const INDEXER_HEALTH_URL =
+  process.env.INDEXER_HEALTH_URL ||
+  `http://127.0.0.1:${process.env.HEALTH_CHECK_PORT || '8080'}/health`;
+// If last_block_number hasn't advanced for this long AND /health reports a
+// failing check, waitForIndexer aborts early instead of burning the full
+// timeout on an indexer that will never catch up.
+const INDEXER_STALL_GRACE_MS = parseInt(process.env.INDEXER_STALL_GRACE_MS || '45000');
+
+// Bounded re-poll for a single Supabase row after the indexer checkpoint has
+// advanced. In correct operation the row is already committed once
+// last_block_number >= targetBlock, but Supabase read-replica lag (or a row
+// written microseconds after the checkpoint) can briefly return null. This
+// gives the read a short retry window so a transient miss doesn't flake the
+// assertion. NOTE: it does NOT mask a genuinely dropped event — a permanently
+// missing row simply times out here and still fails the phase, with a clearer
+// "row never appeared" log line than a bare `expected null to be truthy`.
+const ROW_POLL_TIMEOUT_MS = parseInt(process.env.ROW_POLL_TIMEOUT_MS || '20000');
+const ROW_POLL_INTERVAL_MS = parseInt(process.env.ROW_POLL_INTERVAL_MS || '2000');
+
+interface IndexerHealthSnapshot {
+  status?: string;
+  checks?: {
+    quaiRpc?: { status?: string; message?: string };
+    supabase?: { status?: string; message?: string };
+    indexer?: { status?: string; message?: string };
+  };
+  details?: {
+    currentBlock?: number | null;
+    lastIndexedBlock?: number | null;
+    blocksBehind?: number | null;
+    isSyncing?: boolean;
+    requiresFullReindex?: boolean;
+    reindexReason?: string | null;
+  };
+}
+
+/**
+ * Best-effort fetch of the indexer's /health snapshot. Returns null if the
+ * endpoint is unreachable or the request times out — callers treat a null
+ * snapshot as "no liveness signal available" rather than a failure (the
+ * indexer may simply have HEALTH_CHECK_ENABLED=false).
+ */
+async function fetchIndexerHealth(timeoutMs = 5000): Promise<IndexerHealthSnapshot | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(INDEXER_HEALTH_URL, { signal: controller.signal });
+    // /health returns 503 when unhealthy — still a valid, parseable body.
+    return (await res.json()) as IndexerHealthSnapshot;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Compact one-line summary of a /health snapshot for failure diagnostics. */
+function summarizeHealth(h: IndexerHealthSnapshot | null): string {
+  if (!h) return 'health endpoint unreachable (HEALTH_CHECK_ENABLED=false or indexer down)';
+  const c = h.checks ?? {};
+  const d = h.details ?? {};
+  const failing = (['quaiRpc', 'supabase', 'indexer'] as const)
+    .map((k) => {
+      const check = c[k];
+      return check && check.status !== 'pass' ? `${k}=${check.message ?? 'fail'}` : null;
+    })
+    .filter(Boolean);
+  const parts = [
+    `status=${h.status ?? '?'}`,
+    `lastIndexed=${d.lastIndexedBlock ?? '?'}`,
+    `currentBlock=${d.currentBlock ?? '?'}`,
+    `blocksBehind=${d.blocksBehind ?? '?'}`,
+    `isSyncing=${d.isSyncing ?? '?'}`,
+  ];
+  if (d.requiresFullReindex) parts.push(`requiresFullReindex=true(${d.reindexReason ?? 'unknown'})`);
+  if (failing.length) parts.push(`failingChecks=[${failing.join('; ')}]`);
+  return parts.join(' ');
+}
+
+/** True when /health reports a check that means "this indexer will not catch up on its own". */
+function healthIsTerminal(h: IndexerHealthSnapshot | null): boolean {
+  if (!h) return false; // no signal — don't abort early on an unreachable endpoint
+  const c = h.checks ?? {};
+  const indexerDown = c.indexer?.status === 'fail'
+    && /not running|reindex/i.test(c.indexer?.message ?? '');
+  const rpcBrokenLong = c.quaiRpc?.status === 'fail';
+  return Boolean(indexerDown || rpcBrokenLong || h.details?.requiresFullReindex);
+}
 
 // ── IPFS CID Extraction ────────────────────────────────────────────────
 // Quai Network requires a 46-char IPFS v0 CID for contract deployment.
@@ -219,6 +341,83 @@ async function withTestRetry(
 }
 
 /**
+ * Robustly acquire a tx receipt once the tx is in the mempool.
+ *
+ * `tx.wait()`'s internal poller can stall on Quai testnet even after the tx has
+ * mined (the cause of the Phase 10 ".wait() timeout" failure) — re-`wait()`ing the
+ * same hung promise can't recover it. On each wait-timeout we fall back to a DIRECT
+ * `getTransactionReceipt(hash)`, which returns the receipt the poller missed. We only
+ * give up (genuinely dropped tx) after several rounds with no receipt anywhere.
+ *
+ * Returns the receipt. Throws on a real on-chain revert (status 0) or a dropped tx.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function waitForReceipt(tx: any, label: string, rounds = 7): Promise<any> {
+  // `provider` is describe-scoped; tx.provider is always set on a quais TransactionResponse,
+  // so the `?? provider` branch is never evaluated (and must not be — provider isn't in scope here).
+  const prov = tx.provider;
+  const hash = tx.hash;
+  // Tolerate Orchard's variable block time (5s..>15s) and short stalls: a tx may need
+  // minutes to mine. ~7×(45s race + 15s sleep) ≈ 420s before declaring it dropped. The
+  // direct getTransactionReceipt probe returns the instant it mines, so a fast chain pays
+  // nothing. (Vote callers also have a memberVoted safety net in sendVote if a slow receipt
+  // is mis-declared dropped.)
+  const perRoundWaitMs = 45_000;
+
+  // Kick off the normal poller ONCE. We never re-`wait()` (re-waiting a hung promise
+  // can't recover a mined-but-stalled receipt) — subsequent rounds use direct probes.
+  // Guard against an unhandled rejection if this loses the race and rejects later
+  // (e.g. the tx reverts after we've already returned via a probe): record the verdict.
+  let waitDone = false;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let waitReceipt: any = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let waitError: any = null;
+  const waitP = Promise.resolve()
+    .then(() => tx.wait())
+    .then((r: any) => { waitReceipt = r; }, (e: any) => { waitError = e; })
+    .finally(() => { waitDone = true; });
+
+  for (let attempt = 1; attempt <= rounds; attempt++) {
+    // 1) Time-box the poller. A real revert surfaces here as CALL_EXCEPTION.
+    await Promise.race([
+      waitP,
+      new Promise((resolve) => setTimeout(resolve, perRoundWaitMs)),
+    ]);
+    if (waitDone) {
+      if (waitError) {
+        const msg: string = waitError?.message ?? String(waitError);
+        // Genuine on-chain revert reported by tx.wait() — propagate, never retry.
+        if (waitError?.code === 'CALL_EXCEPTION' || msg.includes('execution reverted')) throw waitError;
+        // else a transient poller error — fall through to the direct probe.
+      } else if (waitReceipt) {
+        return waitReceipt;
+      }
+    }
+    // 2) Direct receipt probe — recovers a receipt the poller stalled on.
+    try {
+      const receipt = await prov.getTransactionReceipt(hash);
+      if (receipt) {
+        if (receipt.status === 0) {
+          throw new Error(`${label}: tx ${hash} reverted on-chain (status 0, block ${receipt.blockNumber})`);
+        }
+        console.log(`   [recover] ${label}: receipt found via direct probe (block ${receipt.blockNumber}, attempt ${attempt}/${rounds})`);
+        return receipt;
+      }
+    } catch (err: any) {
+      // Re-throw only our explicit status-0 verdict; a probe RPC blip just means "retry".
+      if (String(err?.message ?? '').includes('reverted on-chain')) throw err;
+    }
+    if (attempt < rounds) {
+      console.log(`   [wait] ${label}: no receipt yet (attempt ${attempt}/${rounds}) — re-checking in 15s...`);
+      await sleep(15_000);
+    }
+  }
+  // No receipt after every round AND no direct probe ever saw it: genuinely dropped.
+  throw new Error(`${label}: receipt never appeared after ${rounds} rounds — tx ${hash} likely dropped (re-run; resend is unsafe for votes)`);
+}
+
+/**
  * Send a transaction and wait for its receipt, with retry on both steps.
  * Retries the entire send+wait cycle on generic CALL_EXCEPTION reverts
  * (Quai testnet flakiness: random txs revert with no decoded reason due
@@ -233,7 +432,10 @@ async function sendTx(
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const tx = await withTestRetry(fn, label, 3, 5000, TX_SEND_TIMEOUT_MS);
-      return await withTestRetry(() => tx.wait(), `${label} .wait()`, 3, 5000, TX_WAIT_TIMEOUT_MS);
+      // Robust receipt acquisition: time-boxed tx.wait() with a direct
+      // getTransactionReceipt(hash) fallback that recovers a mined-but-stalled
+      // receipt (Phase 10), instead of re-waiting the same hung promise.
+      return await waitForReceipt(tx, `${label} .wait()`);
     } catch (err: any) {
       const msg = err?.message ?? String(err);
       const data = err?.data ?? '';
@@ -252,6 +454,18 @@ async function sendTx(
         );
         await sleep(15_000);
       } else {
+        // Final failure — surface the receipt/decoded-error context so a
+        // status-0 revert (e.g. Phases 4/10/12) isn't an opaque wall of hex.
+        console.log(`   [FAIL] ${label}: giving up after attempt ${attempt}/${maxAttempts}`);
+        if (err?.code) console.log(`   [FAIL] code: ${err.code}`);
+        if (err?.reason) console.log(`   [FAIL] reason: ${err.reason}`);
+        if (data && data !== '0x') console.log(`   [FAIL] revert data/selector: ${String(data).slice(0, 74)}`);
+        if (err?.receipt) {
+          console.log(
+            `   [FAIL] tx status: ${err.receipt.status}, gasUsed: ${err.receipt.gasUsed}, ` +
+            `logs: ${err.receipt.logs?.length ?? 0}, hash: ${err.receipt.hash}`,
+          );
+        }
         throw err;
       }
     }
@@ -286,7 +500,7 @@ async function sendProcessProposal(
       signer.provider ?? signer,
     )).isModuleEnabled(daoShipAddr);
     const proposalState = await daoShip.state(proposalId);
-    const stateNames = ['Unborn', 'Submitted', 'Voting', 'Grace', 'Ready', 'Processed', 'Cancelled', 'Defeated', 'Expired'];
+    const stateNames = ['Unborn', 'Submitted', 'Voting', 'Cancelled', 'Grace', 'Ready', 'Processed', 'Defeated', 'Expired'];
     console.log(`   [diag] ${label}: proposalId=${proposalId}, state=${stateNames[Number(proposalState)] ?? proposalState}, isModuleEnabled=${isModuleEnabled}, daoShip=${daoShipAddr}, avatar=${avatarAddr}`);
   } catch (diagErr: any) {
     console.log(`   [diag] ${label}: pre-flight diagnostics failed: ${diagErr.message}`);
@@ -311,7 +525,7 @@ async function sendProcessProposal(
         let stateInfo = '';
         try {
           const s = await daoShip.state(proposalId);
-          const names = ['Unborn', 'Submitted', 'Voting', 'Grace', 'Ready', 'Processed', 'Cancelled', 'Defeated', 'Expired'];
+          const names = ['Unborn', 'Submitted', 'Voting', 'Cancelled', 'Grace', 'Ready', 'Processed', 'Defeated', 'Expired'];
           stateInfo = ` (state=${names[Number(s)] ?? s})`;
         } catch { /* ignore */ }
         console.log(
@@ -336,6 +550,298 @@ async function sendProcessProposal(
 }
 
 /**
+ * Submit a vote with state-aware retry. The generic `sendTx` treats the
+ * NotVoting() selector (0x44e7e7a8) as a timing error and blindly waits 15s
+ * before retrying — correct when the voting window hasn't OPENED yet (RPC head
+ * skew / block.timestamp lag after waitForProposalState returned Voting), but
+ * actively harmful once voting has CLOSED, where every retry just burns 15s on
+ * a vote that can never succeed.
+ *
+ * This wrapper inspects on-chain state() when a NotVoting revert surfaces:
+ *   - state < Voting (Unborn/Submitted): window not open yet → short wait, retry.
+ *   - state == Voting (2):               estimateGas raced a lagging replica → retry.
+ *   - state >= Grace (3+):               window CLOSED → fail fast, no point retrying.
+ * Non-NotVoting reverts propagate straight to sendTx's own retry/throw logic.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function sendVote(
+  daoShip: any,
+  signer: any,
+  proposalId: any,
+  approve: boolean,
+  label: string,
+  maxAttempts = 6,
+): Promise<any> {
+  const names = ['Unborn', 'Submitted', 'Voting', 'Cancelled', 'Grace', 'Ready', 'Processed', 'Defeated', 'Expired'];
+  // `provider` is describe-scoped; derive it from the contract runner (see waitPastVotingStarts).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const prov: any = (daoShip.runner as any)?.provider ?? daoShip.runner;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      // Single-attempt send (sendTx's own NotVoting retry is disabled here by
+      // catching below; we keep its network-retry + receipt handling).
+      return await sendTx(
+        () => daoShip.connect(signer).submitVote(proposalId, approve),
+        label,
+        1,
+      );
+    } catch (err: any) {
+      const msg: string = err?.message ?? String(err);
+      const data: string = err?.data ?? '';
+
+      // Did the vote actually land — on this attempt or a prior one? A status-0 revert can
+      // mask AlreadyVoted, and a "reverted" send can still race a real confirmation. The
+      // on-chain memberVoted flag (public getter) is authoritative; if set, we're done.
+      try {
+        const voter: string = await signer.getAddress();
+        if (await daoShip.memberVoted(voter, proposalId)) {
+          console.log(`   ${label}: vote already recorded on-chain (memberVoted=true) — treating as success`);
+          return;
+        }
+      } catch { /* view blip — fall through to retry logic */ }
+
+      const isNotVoting = data.startsWith('0x44e7e7a8') || msg.includes('0x44e7e7a8') || msg.includes('NotVoting');
+      // "DAOShipVotes: not yet determined" — a STRING revert (Error(string), 0x08c379a0),
+      // distinct from NotVoting(). The vote-weight checkpoint hasn't matured: at the
+      // votingStarts boundary, estimateGas runs against a block where the snapshot
+      // timepoint >= block.timestamp, so getPriorVotes reverts. Same transient race as
+      // NotVoting — clears once the chain timestamp advances a block. Retry it identically.
+      const isSnapshotNotReady = msg.includes('not yet determined');
+      // A status-0 on-chain revert with NO decoded reason (estimateGas passed, then the tx
+      // reverted when mined). On Quai this is the window closing between send and mine during
+      // a slow-block spell — i.e. NotVoting() that the receipt didn't decode. We confirmed
+      // just above that the vote did NOT land, so it's safe to re-send if still in Voting.
+      const isOpaqueRevert = (err?.code === 'CALL_EXCEPTION' && !err?.reason && (!data || data === '0x'))
+        || msg.includes('execution reverted') || msg.includes('reverted on-chain');
+      const isVoteTimingRace = isNotVoting || isSnapshotNotReady || isOpaqueRevert;
+      if (!isVoteTimingRace || attempt >= maxAttempts) throw err;
+
+      let state = -1;
+      try { state = Number(await daoShip.state(proposalId)); } catch { /* RPC blip — treat as not-open */ }
+
+      if (state >= 3) {
+        // Voting window has closed (Grace/Ready/terminal). Retrying is futile.
+        throw new Error(
+          `${label}: voting window CLOSED (proposal state=${names[state] ?? state}) — ` +
+          `vote cannot land. This is a test-timing gap between waitPastVotingStarts ` +
+          `and submitVote (window overshot), not an indexer issue. Original revert: ${msg.slice(0, 120)}`,
+        );
+      }
+
+      const reason = isSnapshotNotReady ? 'snapshot not yet determined' : isNotVoting ? 'NotVoting' : 'opaque on-chain revert';
+      console.log(
+        `   [retry] ${label}: ${reason}, on-chain state=${names[state] ?? state} ` +
+        `(vote-timing race on this RPC view) — attempt ${attempt}/${maxAttempts}, waiting for next block...`,
+      );
+      // Wait for a NEW block before re-estimating: both NotVoting and "not yet determined"
+      // clear only once block.timestamp advances. Re-estimating against the SAME (possibly
+      // stalled) block just reverts again — wasting attempts during a Quai slow-block spell.
+      // Cap the per-attempt wait so a hard stall doesn't hang; the wide 360s window tolerates it.
+      try {
+        const before = Number(await prov.getBlockNumber(Shard.Cyprus1));
+        const blockDeadline = Date.now() + 30_000;
+        for (;;) {
+          await sleep(5_000);
+          const cur = Number(await prov.getBlockNumber(Shard.Cyprus1));
+          if (cur > before || Date.now() > blockDeadline) break;
+        }
+      } catch {
+        await sleep(10_000); // getBlockNumber blip — fall back to a flat wait
+      }
+    }
+  }
+  throw new Error(`${label}: all ${maxAttempts} attempts failed`);
+}
+
+/**
+ * Cast multiple votes CONCURRENTLY. Voting sequentially on a slow Quai testnet lets the
+ * first voter's confirmation time eat into the finite voting window, starving the second
+ * voter → "voting window CLOSED (state=Grace)". Firing all sends at once gives every voter
+ * the full window. Voters have independent nonces, so concurrency is safe. allSettled (not
+ * Promise.all) avoids an unhandled rejection from the loser when one vote fails; we re-throw
+ * the first failure after all settle.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function castVotes(daoShip: any, proposalId: any, votes: { signer: any; label: string }[]): Promise<void> {
+  const results = await Promise.allSettled(
+    votes.map((v) => sendVote(daoShip, v.signer, proposalId, true, v.label)),
+  );
+  const failed = results.find((r) => r.status === 'rejected');
+  if (failed) throw (failed as PromiseRejectedResult).reason;
+}
+
+/**
+ * Run a full governance proposal end-to-end: submit → wait for Voting → cast votes →
+ * wait for Ready → process. Returns the processProposal receipt. Mirrors the inline flow
+ * used by Phases 4/6/10/12; factored out for the navigator phases that each need one.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function runProposal(
+  daoShip: any,
+  proposer: any,
+  voters: any[],
+  proposalData: string,
+  details: string,
+  label: string,
+): Promise<any> {
+  const submitReceipt = await sendTx(
+    () => daoShip.connect(proposer).submitProposal(proposalData, 0, details),
+    `submitProposal ${label}`,
+  );
+  const proposalEvent = submitReceipt.logs.find((log: any) => {
+    try { return daoShip.interface.parseLog(log)?.name === 'SubmitProposal'; } catch { return false; }
+  });
+  const proposalId = daoShip.interface.parseLog(proposalEvent!)?.args[0];
+  console.log(`   ${label}: proposal ID ${proposalId}`);
+
+  await waitPastVotingStarts(daoShip, proposalId, `voting window ${label}`);
+  await castVotes(daoShip, proposalId, voters.map((v, i) => ({ signer: v, label: `submitVote ${label} #${i}` })));
+  await waitForProposalState(daoShip, proposalId, [5], `ready ${label}`, readyWaitMs);
+  return sendProcessProposal(daoShip, proposer, proposalId, proposalData, `processProposal ${label}`);
+}
+
+/**
+ * Poll the proposal's on-chain state() until it reaches one of the target
+ * values. Replaces fixed wall-clock sleeps in proposal phases — the contract
+ * is the source of truth for when voting opens and when a proposal becomes
+ * processable, so we wait for the actual state transition instead of guessing
+ * based on block.timestamp math that lags wall-clock on Quai testnet.
+ *
+ * State enum (AUTHORITATIVE — DAOShip.sol:228, "Ordering is significant"):
+ *   0 Unborn  1 Submitted  2 Voting  3 Cancelled  4 Grace
+ *   5 Ready   6 Processed  7 Defeated 8 Expired
+ *
+ * Throws if the proposal reaches a terminal state (3 Cancelled, 6 Processed,
+ * 7 Defeated, 8 Expired) before hitting a target, or if the max wait elapses.
+ * NOTE: Ready is 5 (not 4) and Grace is 4 (not 3) — an earlier version of this
+ * file had the enum off by one from Cancelled onward, so it waited on Grace while
+ * calling it "Ready" and misclassified the real Ready(5) as terminal.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function waitForProposalState(
+  daoShip: any,
+  proposalId: any,
+  acceptableStates: number[],
+  label: string,
+  maxWaitMs: number,
+  pollIntervalMs = 5_000,
+): Promise<number> {
+  const names = ['Unborn', 'Submitted', 'Voting', 'Cancelled', 'Grace', 'Ready', 'Processed', 'Defeated', 'Expired'];
+  const terminalStates = new Set([3, 6, 7, 8]); // Cancelled, Processed, Defeated, Expired
+  const start = Date.now();
+  let lastLoggedState = -1;
+
+  while (Date.now() - start < maxWaitMs) {
+    let state: number;
+    try {
+      state = Number(await daoShip.state(proposalId));
+    } catch {
+      // Transient RPC failure — keep polling until maxWaitMs.
+      await sleep(pollIntervalMs);
+      continue;
+    }
+    if (acceptableStates.includes(state)) {
+      console.log(`   ${label}: state=${names[state] ?? state} reached after ${((Date.now() - start) / 1000).toFixed(1)}s`);
+      return state;
+    }
+    if (terminalStates.has(state) && !acceptableStates.includes(state)) {
+      throw new Error(
+        `${label}: proposal reached terminal state ${names[state] ?? state} before hitting target [${acceptableStates.map(s => names[s] ?? s).join(',')}]`,
+      );
+    }
+    if (state !== lastLoggedState) {
+      console.log(`   ${label}: state=${names[state] ?? state} (waiting for ${acceptableStates.map(s => names[s] ?? s).join('|')})`);
+      lastLoggedState = state;
+    }
+    await sleep(pollIntervalMs);
+  }
+  throw new Error(
+    `${label}: timed out after ${(maxWaitMs / 1000).toFixed(0)}s waiting for state in [${acceptableStates.map(s => names[s] ?? s).join(',')}]`,
+  );
+}
+
+/**
+ * Wait until a proposal is open for voting AND a further block has been mined, so a
+ * vote tx executes STRICTLY after `votingStarts`.
+ *
+ * Why this exists (mirrors daoships-contracts `waitPastVotingStarts`): the contract
+ * computes vote weight via `getPriorVotes(voter, prop.votingStarts)`, and
+ * `getPriorVotes` requires `timepoint < block.timestamp` STRICTLY (DAOShipVotes.sol:91,
+ * "not yet determined"). But `state()` flips to Voting at `block.timestamp >= votingStarts`.
+ * So at the exact boundary the proposal is "Voting" yet the vote reverts
+ * "DAOShipVotes: not yet determined". Waiting only for state==Voting (the old behavior)
+ * raced straight into that boundary. We additionally wait for one more mined block, then
+ * re-confirm the window is still open. Also avoids the Quai woHeader-vs-EVM clock skew by
+ * gating on `state()` (EVM clock), exactly as the vote tx does.
+ *
+ * Throws loudly if the proposal already left Voting (window overshot) — a too-short
+ * VOTING_PERIOD vs. PoW block-time variance must fail visibly, not silently skip a vote.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function waitPastVotingStarts(
+  daoShip: any,
+  proposalId: any,
+  label: string,
+  // votingStarts is set at sponsor and Voting opens ~immediately after — but a stall right
+  // after submit can delay it, so budget stall slack (was a flat 120s).
+  maxWaitMs = CHAIN_STALL_SLACK_MS + 120_000,
+): Promise<void> {
+  const names = ['Unborn', 'Submitted', 'Voting', 'Cancelled', 'Grace', 'Ready', 'Processed', 'Defeated', 'Expired'];
+  const STATE_SUBMITTED = 1;
+  const STATE_VOTING = 2;
+  // `provider` is describe-scoped, not visible to this module-level helper. The base
+  // daoShip was created as `new quais.Contract(addr, abi, provider)`, so its runner IS
+  // that provider (a signer-connected contract would expose it as runner.provider).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const prov: any = (daoShip.runner as any)?.provider ?? daoShip.runner;
+  const prop = await withTestRetry(() => daoShip.proposals(proposalId), `${label} proposals()`, 3, 5000);
+  if (Number(prop.votingStarts) === 0) {
+    throw new Error(`${label}: proposal ${proposalId} not sponsored (votingStarts==0) — cannot open voting`);
+  }
+
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    let state: number;
+    try {
+      state = Number(await daoShip.state(proposalId));
+    } catch {
+      await sleep(5_000);
+      continue;
+    }
+
+    if (state === STATE_VOTING) {
+      // Mine past the current block so the vote lands strictly after votingStarts,
+      // then re-confirm the window is still open (PoW block-time variance can overshoot).
+      const seenAt = await withTestRetry(() => prov.getBlockNumber(Shard.Cyprus1), `${label} blockNo`, 3, 5000);
+      while (Date.now() < deadline) {
+        const now = await withTestRetry(() => prov.getBlockNumber(Shard.Cyprus1), `${label} blockNo`, 3, 5000);
+        if (now > seenAt) break;
+        await sleep(3_000);
+      }
+      const recheck = Number(await daoShip.state(proposalId));
+      if (recheck === STATE_VOTING) {
+        console.log(`   ${label}: open for voting (state=Voting, block>${seenAt})`);
+        return;
+      }
+      if (recheck !== STATE_SUBMITTED) {
+        throw new Error(
+          `${label}: proposal ${proposalId} left Voting (state=${names[recheck] ?? recheck}) while confirming the ` +
+          `window — VOTING_PERIOD is too short for PoW block-time variance.`,
+        );
+      }
+      // recheck === Submitted (re-sponsor race) — keep polling.
+    } else if (state !== STATE_SUBMITTED) {
+      throw new Error(
+        `${label}: proposal ${proposalId} left Voting before a vote could be cast (state=${names[state] ?? state}). ` +
+        `Voting window overshot — VOTING_PERIOD too short for PoW block-time variance.`,
+      );
+    }
+    await sleep(3_000);
+  }
+  throw new Error(`${label}: timed out after ${(maxWaitMs / 1000).toFixed(0)}s waiting for proposal ${proposalId} to open for voting`);
+}
+
+/**
  * Poll Supabase until the indexer has processed at least `targetBlock`.
  * Accounts for confirmation lag — the indexer's `last_block_number` needs
  * to be >= targetBlock.
@@ -348,6 +854,14 @@ async function waitForIndexer(
   const start = Date.now();
   const tag = label ? ` [${label}]` : '';
 
+  // Liveness tracking: remember the highest last_block_number we've seen and
+  // when it last advanced. A slow-but-progressing indexer keeps moving this
+  // forward; a stalled one does not. Combined with /health, this lets us fail
+  // fast with a root cause instead of silently burning the full timeout.
+  let highestSeen = -1;
+  let lastProgressAt = start;
+  let lastHealth: IndexerHealthSnapshot | null = null;
+
   while (Date.now() - start < INDEXER_POLL_TIMEOUT) {
     const { data } = await supabase
       .from('ds_indexer_state')
@@ -355,20 +869,95 @@ async function waitForIndexer(
       .eq('id', 1)
       .single();
 
-    if (data && data.last_block_number >= targetBlock) {
+    const lastBlock = data?.last_block_number ?? -1;
+    if (lastBlock > highestSeen) {
+      highestSeen = lastBlock;
+      lastProgressAt = Date.now();
+    }
+
+    if (lastBlock >= targetBlock) {
       console.log(
-        `   Indexer caught up to block ${targetBlock}${tag} (at ${data.last_block_number})`,
+        `   Indexer caught up to block ${targetBlock}${tag} (at ${lastBlock})`,
       );
       return;
+    }
+
+    // No forward progress for INDEXER_STALL_GRACE_MS → consult /health. If it
+    // reports a terminal condition (process not running, RPC circuit breaker
+    // open, requires_full_reindex), the indexer will not recover on its own —
+    // abort now with the diagnosis rather than waiting out the full timeout.
+    const stalledMs = Date.now() - lastProgressAt;
+    if (stalledMs >= INDEXER_STALL_GRACE_MS) {
+      lastHealth = await fetchIndexerHealth();
+      if (healthIsTerminal(lastHealth)) {
+        throw new Error(
+          `Indexer stalled before reaching block ${targetBlock}${tag}: ` +
+          `no progress for ${(stalledMs / 1000).toFixed(0)}s (stuck at ${highestSeen}). ` +
+          `Health: ${summarizeHealth(lastHealth)}`,
+        );
+      }
+      // Not terminal — log the snapshot once per stall window and keep waiting.
+      console.log(
+        `   [waitForIndexer]${tag} no progress for ${(stalledMs / 1000).toFixed(0)}s ` +
+        `(at ${highestSeen}, target ${targetBlock}) — ${summarizeHealth(lastHealth)}`,
+      );
+      // Reset the stall clock so we re-probe health roughly once per grace window
+      // instead of on every poll.
+      lastProgressAt = Date.now();
     }
 
     await sleep(INDEXER_POLL_INTERVAL);
   }
 
+  // Final timeout — attach the freshest /health snapshot so the failure says
+  // WHY (slow vs crashed vs reindex-required) instead of just "didn't reach".
+  const finalHealth = (await fetchIndexerHealth()) ?? lastHealth;
   throw new Error(
-    `Indexer did not reach block ${targetBlock}${tag} within ${INDEXER_POLL_TIMEOUT}ms`,
+    `Indexer did not reach block ${targetBlock}${tag} within ${INDEXER_POLL_TIMEOUT}ms ` +
+    `(highest seen: ${highestSeen}). Health: ${summarizeHealth(finalHealth)}`,
   );
 }
+
+/**
+ * Bounded re-poll of a single-row Supabase read. Re-runs `queryFn` until it
+ * returns a truthy `data`, or ROW_POLL_TIMEOUT_MS elapses. Returns the last
+ * observed `data` (possibly null) so the caller's existing
+ * `expect(row).toBeTruthy()` still fails — just after giving read-replica lag
+ * a chance to settle. Each call builds a fresh query (PostgREST builders are
+ * single-use thenables).
+ */
+async function waitForRow<T = unknown>(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  queryFn: () => PromiseLike<{ data: T | null; error: any }>,
+  label: string,
+  timeoutMs = ROW_POLL_TIMEOUT_MS,
+  intervalMs = ROW_POLL_INTERVAL_MS,
+): Promise<T | null> {
+  const start = Date.now();
+  let last: T | null = null;
+  for (;;) {
+    const { data } = await queryFn();
+    last = data;
+    if (data) return data;
+    if (Date.now() - start >= timeoutMs) {
+      console.log(
+        `   [waitForRow] ${label}: row still absent after ${(timeoutMs / 1000).toFixed(0)}s ` +
+        `(indexer checkpoint passed this block — event may have been dropped, not just delayed)`,
+      );
+      return last;
+    }
+    await sleep(intervalMs);
+  }
+}
+
+// ── Phase result tracking ──────────────────────────────────────────────
+// The Summary test used to be pure console.log — it asserted nothing, so it
+// always "passed" and printed "All 24 events triggered, indexed, and verified"
+// even when phases failed (false confidence). We record each phase's real
+// pass/fail outcome here via onTestFinished (which receives the final result)
+// so Summary can assert the suite actually succeeded.
+const passedPhases: string[] = [];
+const failedPhases: string[] = [];
 
 // ── Test Suite ─────────────────────────────────────────────────────────
 
@@ -390,6 +979,27 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
   let vault: string;
   let onboarderNavigator: any;
   let erc20TributeNavigator: any;
+  let nftGatedNavigator: any;
+  let nftGateToken: any; // MockERC721 gate collection
+  // SignalNavigator (read-only, permissionless) — deployed AFTER launch so the DAO
+  // is already indexed (the resolution gate drops read-only deploys for unknown DAOs).
+  let signalNavigator: any;
+  let signalNavAddr: string;        // lowercase
+  let signalNavDeployBlock: number; // NavigatorDeployed block — backfill lower bound
+  let signalPollId: bigint;
+  // TimelockNavigator (GOVERNOR) + VestingNavigator (MANAGER) — permissioned, deployed
+  // AFTER launch and registered via NavigatorSet (before Phase 12 locks governance).
+  let timelockNavigator: any;
+  let timelockAddr: string;         // lowercase
+  let vestingNavigator: any;
+  let vestingAddr: string;          // lowercase
+  let budgetNavigator: any;
+  let budgetAddr: string;           // lowercase
+  let budgetNavDeployBlock: number; // NavigatorDeployed block — backfill lower bound
+  // TimelockNavigator delay — MIN_DELAY is 10 min on-chain; the executeChange path must
+  // wait it out in real wall-clock (no testnet time-travel), so it's opt-in via env.
+  const TIMELOCK_DELAY_SEC = 600;   // MIN_DELAY (10 minutes)
+  const TIMELOCK_EXPIRY_SEC = 86_400; // 1 day executable window (within [1h, 3650d])
   // Addresses — checksummed for contract calls, lowercase `daoId` for DB queries
   let daoShipAddress: string;   // EIP-55 checksummed (for contract calls)
   let daoId: string;            // lowercase (for Supabase queries — indexer stores lowercase)
@@ -403,11 +1013,28 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
   let DAOShipAndVaultLauncherABI: any;
   let OnboarderNavigatorABI: any;
   let ERC20TributeNavigatorABI: any;
+  let NFTGatedNavigatorABI: any;
+  let MockERC721ABI: any;
+  let SignalNavigatorABI: any;
   let PosterABI: any;
 
   // QuaiVault artifacts
   let QuaiVaultJson: any;
   let QuaiVaultProxyJson: any;
+
+  // Record each phase's true outcome. `onTestFinished` runs after the test
+  // body completes and receives the final TaskResult, so it reflects real
+  // pass/fail (an in-body assertion failure → result.state === 'fail'). The
+  // Summary test reads these arrays to assert the suite actually succeeded.
+  beforeEach((ctx) => {
+    const name = ctx.task.name;
+    ctx.onTestFinished((result) => {
+      // Don't let Summary grade itself.
+      if (name.startsWith('Summary')) return;
+      if (result.state === 'fail') failedPhases.push(name);
+      else passedPhases.push(name);
+    });
+  });
 
   // ── Setup ──────────────────────────────────────────────────────────
 
@@ -467,6 +1094,30 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
         path.join(
           ARTIFACTS_DIR,
           'navigators/ERC20TributeNavigator.sol/ERC20TributeNavigator.json',
+        ),
+        'utf-8',
+      ),
+    ).abi;
+    NFTGatedNavigatorABI = JSON.parse(
+      fs.readFileSync(
+        path.join(
+          ARTIFACTS_DIR,
+          'navigators/NFTGatedNavigator.sol/NFTGatedNavigator.json',
+        ),
+        'utf-8',
+      ),
+    ).abi;
+    MockERC721ABI = JSON.parse(
+      fs.readFileSync(
+        path.join(ARTIFACTS_DIR, 'test/MockERC721.sol/MockERC721.json'),
+        'utf-8',
+      ),
+    ).abi;
+    SignalNavigatorABI = JSON.parse(
+      fs.readFileSync(
+        path.join(
+          ARTIFACTS_DIR,
+          'navigators/SignalNavigator.sol/SignalNavigator.json',
         ),
         'utf-8',
       ),
@@ -804,8 +1455,70 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
       const erc20TributeAddr = await erc20TributeInstance.getAddress();
       console.log(`   ERC20TributeNavigator: ${erc20TributeAddr}`);
 
+      // ── Deploy MockERC721 gate collection + NFTGatedNavigator ──
+      // Free-mint ERC-721 gate: holding a token of the gate collection lets you
+      // claim a fixed amount of shares exactly once per tokenId.
+      const MockERC721Json = JSON.parse(
+        fs.readFileSync(
+          path.join(ARTIFACTS_DIR, 'test/MockERC721.sol/MockERC721.json'),
+          'utf-8',
+        ),
+      );
+      const NFTGatedNavigatorJson = JSON.parse(
+        fs.readFileSync(
+          path.join(
+            ARTIFACTS_DIR,
+            'navigators/NFTGatedNavigator.sol/NFTGatedNavigator.json',
+          ),
+          'utf-8',
+        ),
+      );
+      const mockErc721IpfsHash = extractIPFSHash(MockERC721Json.bytecode);
+      const nftGatedIpfsHash = extractIPFSHash(NFTGatedNavigatorJson.bytecode);
+
+      console.log('  Deploying MockERC721 gate collection...');
+      const MockERC721Factory = new quais.ContractFactory(
+        MockERC721ABI,
+        MockERC721Json.bytecode,
+        deployer,
+        mockErc721IpfsHash,
+      );
+      const nftGateTokenInstance = await MockERC721Factory.deploy();
+      await nftGateTokenInstance.waitForDeployment();
+      const nftGateTokenAddr = await nftGateTokenInstance.getAddress();
+      console.log(`   MockERC721 (gate): ${nftGateTokenAddr}`);
+
+      console.log('  Deploying NFTGatedNavigator...');
+      const NFTGatedFactory = new quais.ContractFactory(
+        NFTGatedNavigatorABI,
+        NFTGatedNavigatorJson.bytecode,
+        deployer,
+        nftGatedIpfsHash,
+      );
+      // NFTGatedNavigator(daoShip, gateToken, sharesPerHolder, lootPerHolder,
+      //   requireTribute, tributeAmount, expiry, mintCap, perAddressCap, allowlistRoot, name, description)
+      const nftGatedInstance = await NFTGatedFactory.deploy(
+        predictedDaoShipAddress,
+        nftGateTokenAddr,         // gateToken (the deployed ERC-721)
+        nftSharesPerHolder,       // sharesPerHolder
+        0,                        // lootPerHolder
+        false,                    // requireTribute (free mint)
+        0,                        // tributeAmount (must be 0 in free-mint mode)
+        0,                        // expiry (0 = no expiry)
+        nftMintCap,               // mintCap (MANDATORY, > 0 — dilution backstop)
+        0,                        // perAddressCap (0 = unlimited)
+        '0x' + '00'.repeat(32),   // allowlistRoot (0 = open)
+        'Test NFT Gate',          // name
+        'NFT-gated navigator for E2E tests', // description
+      );
+      await nftGatedInstance.waitForDeployment();
+      const nftGatedAddr = await nftGatedInstance.getAddress();
+      console.log(`   NFTGatedNavigator: ${nftGatedAddr}`);
+
       onboarderNavigator = onboarderInstance;
       erc20TributeNavigator = erc20TributeInstance;
+      nftGatedNavigator = nftGatedInstance;
+      nftGateToken = nftGateTokenInstance;
 
       // ── Launch DAO ────────────────────────────────────────────
 
@@ -843,9 +1556,10 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
       const navigators = [
         onboarderAddr,
         erc20TributeAddr,
+        nftGatedAddr,
         deployer.address,
       ];
-      const navigatorPermissions = [2, 2, 7]; // onboarder: MANAGER, erc20tribute: MANAGER, deployer: ALL (ADMIN+MANAGER+GOVERNOR)
+      const navigatorPermissions = [2, 2, 2, 7]; // onboarder/erc20tribute/nftgated: MANAGER, deployer: ALL (ADMIN+MANAGER+GOVERNOR)
 
       const initializationParams = quais.AbiCoder.defaultAbiCoder().encode(
         [
@@ -995,11 +1709,10 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
       await waitForIndexer(supabase, lastBlock, 'Phase 1');
 
       // Check DAO record
-      const { data: dao } = await supabase
-        .from('ds_daos')
-        .select('*')
-        .eq('id', daoId)
-        .single();
+      const dao = await waitForRow<any>(
+        () => supabase.from('ds_daos').select('*').eq('id', daoId).single(),
+        'dao P1',
+      );
 
       expect(dao).toBeTruthy();
       expect(dao!.shares_address).toBe(sharesAddress.toLowerCase());
@@ -1011,17 +1724,15 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
       const deployerMemberId = `${daoId}-${deployer.address.toLowerCase()}`;
       const aliceMemberId = `${daoId}-${alice.address.toLowerCase()}`;
 
-      const { data: deployerMember } = await supabase
-        .from('ds_members')
-        .select('*')
-        .eq('id', deployerMemberId)
-        .single();
+      const deployerMember = await waitForRow<any>(
+        () => supabase.from('ds_members').select('*').eq('id', deployerMemberId).single(),
+        'deployerMember P1',
+      );
 
-      const { data: aliceMember } = await supabase
-        .from('ds_members')
-        .select('*')
-        .eq('id', aliceMemberId)
-        .single();
+      const aliceMember = await waitForRow<any>(
+        () => supabase.from('ds_members').select('*').eq('id', aliceMemberId).single(),
+        'aliceMember P1',
+      );
 
       expect(deployerMember).toBeTruthy();
       expect(BigInt(deployerMember!.shares)).toBe(quais.parseQuai('100'));
@@ -1037,7 +1748,7 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
         .eq('dao_id', daoId);
 
       expect(navigatorsData).toBeTruthy();
-      expect(navigatorsData!.length).toBeGreaterThanOrEqual(3);
+      expect(navigatorsData!.length).toBeGreaterThanOrEqual(4);
 
       // Verify NavigatorDeployed metadata was indexed
       const onboarderNav = navigatorsData!.find((n: any) => n.navigator_type === 'OnboarderNavigator');
@@ -1054,6 +1765,13 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
         expect(erc20Nav.deployer).toBeTruthy();
         console.log(`   ERC20TributeNavigator metadata verified (deployer: ${erc20Nav.deployer})`);
       }
+      const nftGatedNav = navigatorsData!.find((n: any) => n.navigator_type === 'NFTGatedNavigator');
+      expect(nftGatedNav, 'NFTGatedNavigator should be indexed via NavigatorDeployed').toBeTruthy();
+      expect(nftGatedNav.name).toBe('Test NFT Gate');
+      expect(nftGatedNav.description).toBe('NFT-gated navigator for E2E tests');
+      expect(nftGatedNav.deployer).toBeTruthy();
+      expect(nftGatedNav.permission).toBe(2); // MANAGER
+      console.log(`   NFTGatedNavigator metadata verified (deployer: ${nftGatedNav.deployer})`);
       console.log(`   Navigators verified (${navigatorsData!.length} registered)`);
 
       // Check governance params are populated (from SetupComplete)
@@ -1095,11 +1813,10 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
       await waitForIndexer(supabase, blockNum, 'Phase 2');
 
       const bobMemberId = `${daoId}-${bob.address.toLowerCase()}`;
-      const { data: bobMember } = await supabase
-        .from('ds_members')
-        .select('*')
-        .eq('id', bobMemberId)
-        .single();
+      const bobMember = await waitForRow<any>(
+        () => supabase.from('ds_members').select('*').eq('id', bobMemberId).single(),
+        'bobMember P2',
+      );
 
       expect(bobMember).toBeTruthy();
       expect(BigInt(bobMember!.shares)).toBeGreaterThan(0n);
@@ -1180,11 +1897,10 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
       await waitForIndexer(supabase, blockNum, 'Phase 3');
 
       const carolMemberId = `${daoId}-${carol.address.toLowerCase()}`;
-      const { data: carolMember } = await supabase
-        .from('ds_members')
-        .select('*')
-        .eq('id', carolMemberId)
-        .single();
+      const carolMember = await waitForRow<any>(
+        () => supabase.from('ds_members').select('*').eq('id', carolMemberId).single(),
+        'carolMember P3',
+      );
 
       expect(carolMember).toBeTruthy();
       expect(BigInt(carolMember!.shares)).toBeGreaterThan(0n);
@@ -1202,6 +1918,93 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
       console.log('   Onboard navigator event verified');
 
       console.log('  Phase 3 PASSED\n');
+    },
+    simplePhaseTimeout,
+  );
+
+  // ════════════════════════════════════════════════════════════════════
+  // PHASE 3b: Alice Onboards via NFTGatedNavigator (per-token NFT claim)
+  // ════════════════════════════════════════════════════════════════════
+
+  it(
+    'Phase 3b: Alice onboards via NFTGatedNavigator (NFT claim)',
+    async () => {
+      console.log('\n== PHASE 3b: Alice Onboards (NFTGatedNavigator) ==\n');
+
+      const tokenId = 1n;
+      const nftGatedAddr = (await nftGatedNavigator.getAddress()).toLowerCase();
+
+      // Mint a gate NFT to Alice (deployer can mint on the mock collection),
+      // then claim membership with it (free mint, one claim per tokenId forever).
+      await sendTx(
+        () => nftGateToken.connect(deployer).mint(alice.address, tokenId),
+        'mint gate NFT P3b',
+      );
+      console.log(`   Minted gate NFT #${tokenId} to Alice`);
+
+      const aliceSharesBefore = await shares.balanceOf(alice.address);
+
+      // onboard is overloaded (onboard(uint256) / onboard(uint256,bytes32[])) —
+      // use the explicit signature to select the no-allowlist entry point.
+      const receipt = await sendTx(
+        () => nftGatedNavigator.connect(alice)['onboard(uint256)'](tokenId),
+        'nft onboard P3b',
+      );
+      const blockNum = receipt.blockNumber;
+      console.log(`   Confirmed in block ${blockNum}`);
+
+      // On-chain: shares minted, and the tokenId is now permanently spent.
+      const aliceSharesAfter = await shares.balanceOf(alice.address);
+      expect(aliceSharesAfter).toBe(aliceSharesBefore + nftSharesPerHolder);
+      expect(await nftGatedNavigator.claimed(tokenId)).toBe(true);
+      console.log(
+        `   Alice shares: ${quais.formatQuai(aliceSharesBefore)} → ${quais.formatQuai(aliceSharesAfter)} (+${quais.formatQuai(nftSharesPerHolder)} via NFT gate)`,
+      );
+
+      // ── INDEXER VERIFICATION ────────────────────────────────
+
+      console.log('\n  Verifying indexer...');
+      await waitForIndexer(supabase, blockNum, 'Phase 3b');
+
+      // Member balance reflects the mint (via the paired Onboard/Transfer path).
+      const aliceMemberId = `${daoId}-${alice.address.toLowerCase()}`;
+      const aliceMember = await waitForRow<any>(
+        () => supabase.from('ds_members').select('*').eq('id', aliceMemberId).single(),
+        'aliceMember P3b',
+      );
+      expect(aliceMember).toBeTruthy();
+      expect(BigInt(aliceMember!.shares)).toBe(aliceSharesAfter);
+      console.log('   Alice member balance verified');
+
+      // The generic Onboard row lands in ds_navigator_events (additive — NFTClaimed
+      // does not replace it). Filter by navigator_address to isolate this claim.
+      const { data: onboardEvents } = await supabase
+        .from('ds_navigator_events')
+        .select('*')
+        .eq('dao_id', daoId)
+        .eq('navigator_address', nftGatedAddr)
+        .eq('event_type', 'onboard');
+      expect(onboardEvents).toBeTruthy();
+      expect(onboardEvents!.length).toBeGreaterThanOrEqual(1);
+      console.log('   Onboard navigator event verified');
+
+      // The new per-token claim row: keyed {navigator}-{tokenId}, carries the
+      // tokenId dimension Onboard cannot.
+      const claimId = `${nftGatedAddr}-${tokenId.toString()}`;
+      const nftClaim = await waitForRow<any>(
+        () => supabase.from('ds_nft_claims').select('*').eq('id', claimId).single(),
+        'nftClaim P3b',
+      );
+      expect(nftClaim, 'ds_nft_claims row should exist for the spent tokenId').toBeTruthy();
+      expect(nftClaim!.dao_id).toBe(daoId);
+      expect(nftClaim!.navigator_address).toBe(nftGatedAddr);
+      expect(BigInt(nftClaim!.token_id)).toBe(tokenId);
+      expect(nftClaim!.holder).toBe(alice.address.toLowerCase());
+      expect(BigInt(nftClaim!.shares)).toBe(nftSharesPerHolder);
+      expect(BigInt(nftClaim!.loot)).toBe(0n);
+      console.log(`   NFT claim row verified (tokenId #${tokenId} → ${nftClaim!.holder})`);
+
+      console.log('  Phase 3b PASSED\n');
     },
     simplePhaseTimeout,
   );
@@ -1251,27 +2054,22 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
       const proposalId = parsedEvent?.args[0];
       console.log(`   Proposal ID: ${proposalId}`);
 
-      // Wait for checkpoints
-      console.log('   Waiting for checkpoints (20s)...');
-      await sleep(20_000);
+      // Wait for the voting window to open on-chain instead of sleeping
+      // wall-clock seconds — Quai block.timestamp lags wall-clock, so a
+      // fixed sleep reliably races `submitVote` against `votingStarts` and
+      // reverts with NotVoting(). Poll state() until it flips to Voting.
+      await waitPastVotingStarts(daoShip, proposalId, 'voting window P4');
 
       // Vote
-      await withTestRetry(() => provider.getBlockNumber(Shard.Cyprus1), 'getBlockNumber pre-vote P4');
-      await sendTx(() => daoShip.connect(deployer).submitVote(proposalId, true), 'submitVote deployer P4');
-      console.log('   Deployer voted YES');
+      await castVotes(daoShip, proposalId, [
+        { signer: deployer, label: 'submitVote deployer P4' },
+        { signer: alice, label: 'submitVote alice P4' },
+      ]);
+      console.log('   Deployer + Alice voted YES');
 
-      await sendTx(() => daoShip.connect(alice).submitVote(proposalId, true), 'submitVote alice P4');
-      console.log('   Alice voted YES');
-
-      // Wait for voting + grace
-      const totalWait = totalWaitSec; // voting + grace
-      console.log(
-        `   Waiting for voting + grace (${totalWait}s = ${(totalWait / 60).toFixed(1)}min)...`,
-      );
-      await sleep(totalWait * 1000);
-
-      // Process
-      await withTestRetry(() => provider.getBlockNumber(Shard.Cyprus1), 'getBlockNumber post-sleep P4');
+      // Wait for the grace period to complete (Ready state). Same rationale
+      // as pre-vote: contract-state gate is immune to chain-time drift.
+      await waitForProposalState(daoShip, proposalId, [5], 'ready P4', readyWaitMs);
       const processReceipt = await sendProcessProposal(
         daoShip, deployer, proposalId, proposalData, 'processProposal P4',
       );
@@ -1290,11 +2088,10 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
 
       const dbProposalId = `${daoId}-${proposalId}`;
 
-      const { data: proposal } = await supabase
-        .from('ds_proposals')
-        .select('*')
-        .eq('id', dbProposalId)
-        .single();
+      const proposal = await waitForRow<any>(
+        () => supabase.from('ds_proposals').select('*').eq('id', dbProposalId).single(),
+        'proposal P4',
+      );
 
       expect(proposal).toBeTruthy();
       expect(proposal!.dao_id).toBe(daoId);
@@ -1315,11 +2112,10 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
       console.log(`   Votes verified (${votes!.length} YES votes)`);
 
       // Check DAO proposal_count
-      const { data: dao } = await supabase
-        .from('ds_daos')
-        .select('proposal_count')
-        .eq('id', daoId)
-        .single();
+      const dao = await waitForRow<any>(
+        () => supabase.from('ds_daos').select('proposal_count').eq('id', daoId).single(),
+        'dao proposal_count P4',
+      );
 
       expect(dao).toBeTruthy();
       expect(Number(dao!.proposal_count)).toBeGreaterThanOrEqual(1);
@@ -1378,11 +2174,10 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
       await waitForIndexer(supabase, blockNum, 'Phase 5');
 
       const aliceMemberId = `${daoId}-${alice.address.toLowerCase()}`;
-      const { data: aliceMember } = await supabase
-        .from('ds_members')
-        .select('shares, loot')
-        .eq('id', aliceMemberId)
-        .single();
+      const aliceMember = await waitForRow<any>(
+        () => supabase.from('ds_members').select('shares, loot').eq('id', aliceMemberId).single(),
+        'aliceMember P5',
+      );
 
       expect(aliceMember).toBeTruthy();
       expect(BigInt(aliceMember!.shares)).toBe(aliceSharesAfter);
@@ -1392,11 +2187,10 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
 
       // Check DAO totals updated — ConvertSharesToLoot handler owns DAO totals
       // for this operation (Transfer handler only owns member balances)
-      const { data: daoAfter } = await supabase
-        .from('ds_daos')
-        .select('total_shares, total_loot')
-        .eq('id', daoId)
-        .single();
+      const daoAfter = await waitForRow<any>(
+        () => supabase.from('ds_daos').select('total_shares, total_loot').eq('id', daoId).single(),
+        'daoAfter P5',
+      );
 
       expect(daoAfter).toBeTruthy();
       if (daoBefore) {
@@ -1450,11 +2244,10 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
 
       // Check Alice's delegating_to in ds_members
       const aliceMemberId = `${daoId}-${alice.address.toLowerCase()}`;
-      const { data: aliceMember } = await supabase
-        .from('ds_members')
-        .select('delegating_to')
-        .eq('id', aliceMemberId)
-        .single();
+      const aliceMember = await waitForRow<any>(
+        () => supabase.from('ds_members').select('delegating_to').eq('id', aliceMemberId).single(),
+        'aliceMember P5b',
+      );
 
       expect(aliceMember).toBeTruthy();
       expect(aliceMember!.delegating_to).toBe(bob.address.toLowerCase());
@@ -1462,11 +2255,10 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
 
       // Check Bob's voting_power increased in ds_members
       const bobMemberId = `${daoId}-${bob.address.toLowerCase()}`;
-      const { data: bobMember } = await supabase
-        .from('ds_members')
-        .select('voting_power')
-        .eq('id', bobMemberId)
-        .single();
+      const bobMember = await waitForRow<any>(
+        () => supabase.from('ds_members').select('voting_power').eq('id', bobMemberId).single(),
+        'bobMember P5b',
+      );
 
       expect(bobMember).toBeTruthy();
       expect(BigInt(bobMember!.voting_power)).toBeGreaterThan(0n);
@@ -1601,20 +2393,15 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
       const proposalId = daoShip.interface.parseLog(proposalEvent!)?.args[0];
       console.log(`   Proposal ID: ${proposalId}`);
 
-      console.log('   Waiting for checkpoints (20s)...');
-      await sleep(20_000);
-
-      await withTestRetry(() => provider.getBlockNumber(Shard.Cyprus1), 'getBlockNumber pre-vote P6');
-      await sendTx(() => daoShip.connect(deployer).submitVote(proposalId, true), 'submitVote deployer P6');
-      // Alice delegated her voting power to Bob in Phase 5b, so Bob votes instead
-      await sendTx(() => daoShip.connect(bob).submitVote(proposalId, true), 'submitVote bob P6');
+      await waitPastVotingStarts(daoShip, proposalId, 'voting window P6');
+      // Alice delegated her voting power to Bob in Phase 5b, so Bob votes instead.
+      await castVotes(daoShip, proposalId, [
+        { signer: deployer, label: 'submitVote deployer P6' },
+        { signer: bob, label: 'submitVote bob P6' },
+      ]);
       console.log('   Votes cast');
 
-      const totalWait = totalWaitSec; // voting + grace
-      console.log(`   Waiting ${totalWait}s...`);
-      await sleep(totalWait * 1000);
-
-      await withTestRetry(() => provider.getBlockNumber(Shard.Cyprus1), 'getBlockNumber post-sleep P6');
+      await waitForProposalState(daoShip, proposalId, [5], 'ready P6', readyWaitMs);
       const processReceipt = await sendProcessProposal(
         daoShip, deployer, proposalId, proposalData, 'processProposal P6',
       );
@@ -1640,9 +2427,350 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
       expect(navigatorRecord).toBeTruthy();
       expect(navigatorRecord!.permission).toBe(1);
       expect(navigatorRecord!.permission_label).toBe('admin');
-      console.log('   Bob navigator record verified (ADMIN)');
+      // Trust model: a NavigatorSet grant from a known DAO flips permission_ever_granted
+      // (monotonic) and stamps trust_status='sanctioned' (permissioned navs are vouched
+      // by the grant itself). is_active = (permission > 0) under the redefined semantics.
+      expect(navigatorRecord!.permission_ever_granted).toBe(true);
+      expect(navigatorRecord!.trust_status).toBe('sanctioned');
+      expect(navigatorRecord!.is_active).toBe(true);
+      console.log('   Bob navigator record verified (ADMIN, ever_granted, sanctioned)');
 
       console.log('  Phase 6 PASSED\n');
+    },
+    perProposalMs + proposalPhaseOverhead,
+  );
+
+  // ════════════════════════════════════════════════════════════════════
+  // PHASE 6b: Deploy SignalNavigator (read-only) — self_asserted binding
+  // ════════════════════════════════════════════════════════════════════
+  // A SignalNavigator holds NO permission and NEVER fires NavigatorSet. It is
+  // deployed AFTER the DAO is live so the indexer's resolution gate (which drops
+  // read-only deploys aimed at unknown DAOs) recognizes daoShip. On NavigatorDeployed
+  // the indexer binds dao_id from the event and records the row as self_asserted +
+  // is_active=true (functional at permission 0), permission_ever_granted=false.
+
+  it(
+    'Phase 6b: Deploy SignalNavigator → self_asserted, active, dao-bound',
+    async () => {
+      console.log('\n== PHASE 6b: Deploy SignalNavigator (read-only) ==\n');
+
+      const SignalNavigatorJson = JSON.parse(
+        fs.readFileSync(
+          path.join(ARTIFACTS_DIR, 'navigators/SignalNavigator.sol/SignalNavigator.json'),
+          'utf-8',
+        ),
+      );
+      const signalIpfsHash = extractIPFSHash(SignalNavigatorJson.bytecode);
+      console.log(`   SignalNavigator IPFS: ${signalIpfsHash}`);
+
+      await withTestRetry(() => provider.getBlockNumber(Shard.Cyprus1), 'getBlockNumber P6b');
+
+      const SignalFactory = new quais.ContractFactory(
+        SignalNavigatorABI,
+        SignalNavigatorJson.bytecode,
+        deployer,
+        signalIpfsHash,
+      );
+      // SignalNavigator(daoShip, minSharesToCreatePoll, minDuration, maxDuration,
+      //   maxStartDelay, name, description)
+      const signalInstance = await SignalFactory.deploy(
+        daoShipAddress,
+        0,        // minSharesToCreatePoll (0 = anyone with power)
+        60,       // minDuration (contract requires > 0)
+        86_400,   // maxDuration (1 day)
+        86_400,   // maxStartDelay
+        'Test Signal',
+        'SignalNavigator for E2E tests',
+      );
+      await signalInstance.waitForDeployment();
+      signalNavigator = signalInstance;
+      signalNavAddr = (await signalInstance.getAddress()).toLowerCase();
+
+      // The NavigatorDeployed log is in the deployment block — backfill's lower bound.
+      const deployReceipt = await signalInstance.deploymentTransaction()!.wait();
+      signalNavDeployBlock = deployReceipt!.blockNumber;
+      console.log(`   SignalNavigator: ${signalNavAddr} (deploy block ${signalNavDeployBlock})`);
+
+      // ── INDEXER VERIFICATION ────────────────────────────────
+
+      console.log('\n  Verifying indexer...');
+      await waitForIndexer(supabase, signalNavDeployBlock, 'Phase 6b');
+
+      const { data: navRow } = await supabase
+        .from('ds_navigators')
+        .select('*')
+        .eq('id', `${daoId}-${signalNavAddr}`)
+        .single();
+
+      expect(navRow, 'SignalNavigator row should be bound on NavigatorDeployed').toBeTruthy();
+      expect(navRow!.navigator_type).toBe('SignalNavigator');
+      expect(navRow!.dao_id).toBe(daoId);              // bound from the event, not NavigatorSet
+      expect(navRow!.permission).toBe(0);              // read-only — no permission, ever
+      expect(navRow!.permission_ever_granted).toBe(false);
+      expect(navRow!.trust_status).toBe('self_asserted'); // not yet sanctioned by the DAO
+      expect(navRow!.is_active).toBe(true);            // functional at permission 0 (NOT revoked)
+      expect(Number(navRow!.deploy_block)).toBe(signalNavDeployBlock);
+      console.log('   SignalNavigator row verified (self_asserted, active, dao-bound)');
+
+      console.log('  Phase 6b PASSED\n');
+    },
+    simplePhaseTimeout,
+  );
+
+  // ════════════════════════════════════════════════════════════════════
+  // PHASE 6c: Create a poll + vote BEFORE sanction → deferred (not materialized)
+  // ════════════════════════════════════════════════════════════════════
+  // The materialization gate: PollCreated/Voted are SEEN (logs marked processed)
+  // but NOT written while the navigator is only self_asserted. This proves a flood
+  // of unsanctioned read-only navigators cannot bloat the signal tables.
+
+  it(
+    'Phase 6c: Poll + votes on a self_asserted navigator are deferred (no rows)',
+    async () => {
+      console.log('\n== PHASE 6c: Poll + votes deferred (pre-sanction) ==\n');
+
+      await withTestRetry(() => provider.getBlockNumber(Shard.Cyprus1), 'getBlockNumber P6c');
+
+      // duration generous enough to cast both votes inside the half-open window.
+      const createReceipt = await sendTx(
+        () => signalNavigator.connect(deployer).createPoll('Ship v2?', 3, 0, 300),
+        'createPoll P6c',
+      );
+      const pollEvent = createReceipt.logs.find((log: any) => {
+        try { return signalNavigator.interface.parseLog(log)?.name === 'PollCreated'; }
+        catch { return false; }
+      });
+      expect(pollEvent, 'PollCreated should be emitted').toBeTruthy();
+      signalPollId = signalNavigator.interface.parseLog(pollEvent!)?.args[0];
+      console.log(`   Poll created: id=${signalPollId}`);
+
+      // Two voters with voting power: deployer (init shares) and bob (onboarded +
+      // Alice's delegation from Phase 5b). Half-open [start, end) window is open now.
+      await sendTx(() => signalNavigator.connect(deployer).vote(signalPollId, 0), 'vote deployer P6c');
+      const voteReceipt = await sendTx(() => signalNavigator.connect(bob).vote(signalPollId, 1), 'vote bob P6c');
+      const voteBlock = voteReceipt.blockNumber;
+      console.log(`   Votes cast (deployer→0, bob→1), block ${voteBlock}`);
+
+      // ── INDEXER VERIFICATION ────────────────────────────────
+
+      console.log('\n  Verifying indexer...');
+      await waitForIndexer(supabase, voteBlock, 'Phase 6c');
+
+      const pollPk = `${signalNavAddr}-${signalPollId}`;
+      const { data: polls } = await supabase
+        .from('ds_signal_polls')
+        .select('*')
+        .eq('id', pollPk);
+      expect(polls ?? [], 'poll must NOT be materialized while self_asserted').toHaveLength(0);
+
+      const { data: votes } = await supabase
+        .from('ds_signal_votes')
+        .select('*')
+        .eq('navigator_address', signalNavAddr);
+      expect(votes ?? [], 'votes must NOT be materialized while self_asserted').toHaveLength(0);
+      console.log('   Deferred correctly: no poll/vote rows pre-sanction');
+
+      console.log('  Phase 6c PASSED\n');
+    },
+    simplePhaseTimeout,
+  );
+
+  // ════════════════════════════════════════════════════════════════════
+  // PHASE 6d: Vault sanctions the navigator → backfill materializes history
+  // ════════════════════════════════════════════════════════════════════
+  // The DAO's vault (avatar) posts daoships.dao.navigators — the authoritative
+  // "DAO authorized it" signal (VERIFIED = msg.sender == avatar). The indexer flips
+  // trust_status self_asserted→sanctioned and BACKFILLS the navigator's poll history
+  // (getLogs by address from deploy_block), so the Phase 6c poll/votes now appear.
+
+  it(
+    'Phase 6d: Vault sanction flips trust + backfills the deferred poll/votes',
+    async () => {
+      console.log('\n== PHASE 6d: Vault sanction + backfill ==\n');
+
+      const posterAddress = deploymentAddresses.contracts.Poster;
+      const poster = new quais.Contract(posterAddress, PosterABI, provider);
+
+      // Full-set sanction list (canonical; not a delta). The vault must be msg.sender,
+      // so route the Poster.post through the vault's propose→approve→execute flow.
+      const sanctionContent = JSON.stringify({
+        schemaVersion: '1.0',
+        daoAddress: daoId,
+        navigators: [{ address: signalNavAddr, type: 'SignalNavigator' }],
+      });
+      const postData = poster.interface.encodeFunctionData('post(string,string)', [
+        sanctionContent,
+        'daoships.dao.navigators',
+      ]);
+
+      const vaultContract = new quais.Contract(vault, QuaiVaultJson.abi, deployer);
+
+      await withTestRetry(() => provider.getBlockNumber(Shard.Cyprus1), 'getBlockNumber P6d');
+
+      const proposeReceipt = await sendTx(
+        () => vaultContract.proposeTransaction(posterAddress, 0, postData),
+        'vault proposeTransaction P6d',
+      );
+      const proposeLog = proposeReceipt.logs.find((log: any) => {
+        try { return vaultContract.interface.parseLog(log)?.name === 'TransactionProposed'; }
+        catch { return false; }
+      });
+      const vaultTxHash = vaultContract.interface.parseLog(proposeLog!)?.args.txHash;
+      await sendTx(() => vaultContract.approveTransaction(vaultTxHash), 'vault approveTransaction P6d');
+      const execReceipt = await sendTx(
+        () => vaultContract.executeTransaction(vaultTxHash),
+        'vault executeTransaction P6d',
+      );
+      const sanctionBlock = execReceipt.blockNumber;
+      console.log(`   Vault posted daoships.dao.navigators in block ${sanctionBlock}`);
+
+      // ── INDEXER VERIFICATION ────────────────────────────────
+
+      console.log('\n  Verifying indexer...');
+      await waitForIndexer(supabase, sanctionBlock, 'Phase 6d');
+
+      // 1. Trust flipped to sanctioned (still permission 0, still active, never granted).
+      const { data: navRow } = await supabase
+        .from('ds_navigators')
+        .select('*')
+        .eq('id', `${daoId}-${signalNavAddr}`)
+        .single();
+      expect(navRow!.trust_status).toBe('sanctioned');
+      expect(navRow!.permission_ever_granted).toBe(false); // sanctioning grants no permission
+      expect(navRow!.is_active).toBe(true);
+      console.log('   trust_status flipped to sanctioned');
+
+      // 2. Backfill materialized the deferred poll (created while self_asserted).
+      const pollPk = `${signalNavAddr}-${signalPollId}`;
+      const { data: poll } = await supabase
+        .from('ds_signal_polls')
+        .select('*')
+        .eq('id', pollPk)
+        .single();
+      expect(poll, 'poll should be backfilled on sanction').toBeTruthy();
+      expect(poll!.dao_id).toBe(daoId);
+      expect(poll!.navigator_address).toBe(signalNavAddr);
+      expect(poll!.creator).toBe(deployer.address.toLowerCase());
+      expect(poll!.option_count).toBe(3);
+      expect(poll!.cancelled).toBe(false);
+      console.log('   Poll backfilled and verified');
+
+      // 3. Both votes materialized, keyed (navigator, poll, voter).
+      const { data: votes } = await supabase
+        .from('ds_signal_votes')
+        .select('*')
+        .eq('poll_pk', pollPk);
+      expect(votes, 'votes should be backfilled on sanction').toBeTruthy();
+      expect(votes!.length).toBe(2);
+      const byVoter = Object.fromEntries(votes!.map((v: any) => [v.voter, v]));
+      expect(byVoter[deployer.address.toLowerCase()].option).toBe(0);
+      expect(byVoter[bob.address.toLowerCase()].option).toBe(1);
+      expect(votes!.every((v: any) => BigInt(v.weight) > 0n)).toBe(true);
+      console.log('   Both votes backfilled (deployer→0, bob→1)');
+
+      // 4. Tally is derived-from-truth (ds_recompute_poll_tally), not incremented.
+      if (poll!.tally != null) {
+        const tally = poll!.tally as any[];
+        expect(tally.length).toBe(3);
+        expect(BigInt(tally[0])).toBe(BigInt(byVoter[deployer.address.toLowerCase()].weight));
+        expect(BigInt(tally[1])).toBe(BigInt(byVoter[bob.address.toLowerCase()].weight));
+        expect(BigInt(tally[2])).toBe(0n);
+        console.log(`   Tally derived from votes: [${tally.join(', ')}]`);
+      }
+
+      console.log('  Phase 6d PASSED\n');
+    },
+    perProposalMs + proposalPhaseOverhead,
+  );
+
+  // ════════════════════════════════════════════════════════════════════
+  // PHASE 6e: Poll option labels via Poster (daoships.signal.poll)
+  // ════════════════════════════════════════════════════════════════════
+  // The SignalNavigator stores only optionCount — option LABELS live off-chain in a
+  // daoships.signal.poll Poster post by the poll CREATOR (msg.sender == PollCreated.creator).
+  // The navigator is sanctioned (Phase 6d), so a freshly created poll materializes live; the
+  // labels post then decorates ds_signal_polls.options. A non-creator post is ignored.
+  // See docs/SIGNAL_POLL_LABELS_SUPPORT.md.
+
+  it(
+    'Phase 6e: Poll creator labels options via daoships.signal.poll; non-creator post ignored',
+    async () => {
+      console.log('\n== PHASE 6e: Signal poll option labels ==\n');
+
+      const posterAddress = deploymentAddresses.contracts.Poster;
+      const poster = new quais.Contract(posterAddress, PosterABI, provider);
+
+      await withTestRetry(() => provider.getBlockNumber(Shard.Cyprus1), 'getBlockNumber P6e');
+
+      // 1. New poll on the now-sanctioned navigator — long window so labels land while Active.
+      const createReceipt = await sendTx(
+        () => signalNavigator.connect(deployer).createPoll('Which v2 brand color?', 3, 0, 3600),
+        'createPoll P6e',
+      );
+      const pollEvent = createReceipt.logs.find((log: any) => {
+        try { return signalNavigator.interface.parseLog(log)?.name === 'PollCreated'; }
+        catch { return false; }
+      });
+      expect(pollEvent, 'PollCreated should be emitted').toBeTruthy();
+      const labelPollId: bigint = signalNavigator.interface.parseLog(pollEvent!)?.args[0];
+      const labelPollPk = `${signalNavAddr}-${labelPollId}`;
+      console.log(`   Poll created: id=${labelPollId}`);
+
+      await waitForIndexer(supabase, createReceipt.blockNumber, 'Phase 6e (poll)');
+
+      // Sanctioned navigator → poll materializes live; labels not set yet.
+      const { data: prePoll } = await supabase
+        .from('ds_signal_polls').select('*').eq('id', labelPollPk).single();
+      expect(prePoll, 'poll should materialize live on a sanctioned navigator').toBeTruthy();
+      expect(prePoll!.options ?? null, 'options NULL until labels post seen').toBeNull();
+      console.log('   Poll materialized live; options NULL (render Option 1..n)');
+
+      // 2. Creator posts option labels DIRECTLY (msg.sender == creator == deployer).
+      const labelContent = JSON.stringify({
+        schemaVersion: '1.0',
+        daoAddress: daoId,
+        navigatorAddress: signalNavAddr,
+        pollId: Number(labelPollId),
+        options: ['Teal', 'Magenta', 'Slate'],
+        description: 'Pick the v2 brand color.',
+        discussionUrl: 'https://forum.example.xyz/t/brand-color/789',
+      });
+      const labelReceipt = await sendTx(
+        () => poster.connect(deployer)['post(string,string)'](labelContent, 'daoships.signal.poll'),
+        'creator signal.poll post P6e',
+      );
+      console.log(`   Creator posted labels in block ${labelReceipt.blockNumber}`);
+
+      await waitForIndexer(supabase, labelReceipt.blockNumber, 'Phase 6e (labels)');
+
+      const { data: labeled } = await supabase
+        .from('ds_signal_polls').select('*').eq('id', labelPollPk).single();
+      expect(labeled!.options, 'options applied from creator post').toEqual(['Teal', 'Magenta', 'Slate']);
+      expect(labeled!.description).toBe('Pick the v2 brand color.');
+      expect(labeled!.discussion_url).toBe('https://forum.example.xyz/t/brand-color/789');
+      expect(Number(labeled!.labels_block_number)).toBe(labelReceipt.blockNumber);
+      console.log('   Option labels applied: [Teal, Magenta, Slate]');
+
+      // 3. Non-creator (bob) posts different labels → discarded (trust gate). Options unchanged.
+      const spoofContent = JSON.stringify({
+        schemaVersion: '1.0',
+        daoAddress: daoId,
+        navigatorAddress: signalNavAddr,
+        pollId: Number(labelPollId),
+        options: ['Hacked', 'Spoofed', 'Fake'],
+      });
+      const spoofReceipt = await sendTx(
+        () => poster.connect(bob)['post(string,string)'](spoofContent, 'daoships.signal.poll'),
+        'non-creator signal.poll post P6e',
+      );
+      await waitForIndexer(supabase, spoofReceipt.blockNumber, 'Phase 6e (spoof)');
+
+      const { data: afterSpoof } = await supabase
+        .from('ds_signal_polls').select('options').eq('id', labelPollPk).single();
+      expect(afterSpoof!.options, 'non-creator labels must be ignored').toEqual(['Teal', 'Magenta', 'Slate']);
+      console.log('   Non-creator labels correctly ignored');
+
+      console.log('  Phase 6e PASSED\n');
     },
     perProposalMs + proposalPhaseOverhead,
   );
@@ -1746,22 +2874,20 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
       await waitForIndexer(supabase, lastBlock, 'Phase 8');
 
       const bobMemberId = `${daoId}-${bob.address.toLowerCase()}`;
-      const { data: bobMember } = await supabase
-        .from('ds_members')
-        .select('shares')
-        .eq('id', bobMemberId)
-        .single();
+      const bobMember = await waitForRow<any>(
+        () => supabase.from('ds_members').select('shares').eq('id', bobMemberId).single(),
+        'bobMember P8',
+      );
 
       expect(bobMember).toBeTruthy();
       expect(BigInt(bobMember!.shares)).toBe(bobSharesAfter);
       console.log(`   Bob shares in DB: ${bobMember!.shares} (matches on-chain)`);
 
       const carolMemberId = `${daoId}-${carol.address.toLowerCase()}`;
-      const { data: carolMember } = await supabase
-        .from('ds_members')
-        .select('loot')
-        .eq('id', carolMemberId)
-        .single();
+      const carolMember = await waitForRow<any>(
+        () => supabase.from('ds_members').select('loot').eq('id', carolMemberId).single(),
+        'carolMember P8',
+      );
 
       expect(carolMember).toBeTruthy();
       expect(BigInt(carolMember!.loot)).toBe(carolLootAfter);
@@ -1888,19 +3014,14 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
       const proposalId = daoShip.interface.parseLog(proposalEvent!)?.args[0];
       console.log(`   Proposal ID: ${proposalId}`);
 
-      console.log('   Waiting for checkpoints (20s)...');
-      await sleep(20_000);
+      await waitPastVotingStarts(daoShip, proposalId, 'voting window P10');
+      // Alice delegated her voting power to Bob in Phase 5b, so Bob votes instead.
+      await castVotes(daoShip, proposalId, [
+        { signer: deployer, label: 'submitVote deployer P10' },
+        { signer: bob, label: 'submitVote bob P10' },
+      ]);
 
-      await withTestRetry(() => provider.getBlockNumber(Shard.Cyprus1), 'getBlockNumber pre-vote P10');
-      await sendTx(() => daoShip.connect(deployer).submitVote(proposalId, true), 'submitVote deployer P10');
-      // Alice delegated her voting power to Bob in Phase 5b, so Bob votes instead
-      await sendTx(() => daoShip.connect(bob).submitVote(proposalId, true), 'submitVote bob P10');
-
-      const totalWait = totalWaitSec; // voting + grace
-      console.log(`   Waiting ${totalWait}s...`);
-      await sleep(totalWait * 1000);
-
-      await withTestRetry(() => provider.getBlockNumber(Shard.Cyprus1), 'getBlockNumber post-sleep P10');
+      await waitForProposalState(daoShip, proposalId, [5], 'ready P10', readyWaitMs);
       const processReceipt = await sendProcessProposal(
         daoShip, deployer, proposalId, proposalData, 'processProposal P10',
       );
@@ -1916,11 +3037,10 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
       await waitForIndexer(supabase, processBlock, 'Phase 10');
 
       const navigatorId = `${daoId}-${onboarderAddr.toLowerCase()}`;
-      const { data: navigatorRecord } = await supabase
-        .from('ds_navigators')
-        .select('*')
-        .eq('id', navigatorId)
-        .single();
+      const navigatorRecord = await waitForRow<any>(
+        () => supabase.from('ds_navigators').select('*').eq('id', navigatorId).single(),
+        'navigatorRecord P10',
+      );
 
       expect(navigatorRecord).toBeTruthy();
       expect(navigatorRecord!.permission).toBe(0);
@@ -2005,6 +3125,820 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
       console.log('  Phase 11 PASSED\n');
     },
     simplePhaseTimeout,
+  );
+
+  // ════════════════════════════════════════════════════════════════════
+  // PHASE 11b: Deploy + register TimelockNavigator (GOVERNOR) & VestingNavigator (MANAGER)
+  // ════════════════════════════════════════════════════════════════════
+  // Both are PERMISSIONED — registered via setNavigators → NavigatorSet fires and the
+  // indexer marks them sanctioned. MUST run before Phase 12 (which locks manager/governor,
+  // after which setNavigators/setGovernanceConfig revert).
+
+  it(
+    'Phase 11b: Deploy + register Timelock (GOVERNOR) & Vesting (MANAGER)',
+    async () => {
+      console.log('\n== PHASE 11b: Deploy + register Timelock & Vesting ==\n');
+
+      // ── Deploy TimelockNavigator ──
+      const TimelockJson = JSON.parse(
+        fs.readFileSync(path.join(ARTIFACTS_DIR, 'navigators/TimelockNavigator.sol/TimelockNavigator.json'), 'utf-8'),
+      );
+      const timelockIpfs = extractIPFSHash(TimelockJson.bytecode);
+      await withTestRetry(() => provider.getBlockNumber(Shard.Cyprus1), 'getBlockNumber P11b tl');
+      const TimelockFactory = new quais.ContractFactory(TimelockJson.abi, TimelockJson.bytecode, deployer, timelockIpfs);
+      // TimelockNavigator(daoShip, delay, expiryWindow, name, description)
+      const timelockInstance = await TimelockFactory.deploy(
+        daoShipAddress, TIMELOCK_DELAY_SEC, TIMELOCK_EXPIRY_SEC, 'Test Timelock', 'Timelock for E2E tests',
+      );
+      await timelockInstance.waitForDeployment();
+      timelockNavigator = timelockInstance;
+      timelockAddr = (await timelockInstance.getAddress()).toLowerCase();
+      console.log(`   TimelockNavigator: ${timelockAddr}`);
+
+      // ── Deploy VestingNavigator ──
+      const VestingJson = JSON.parse(
+        fs.readFileSync(path.join(ARTIFACTS_DIR, 'navigators/VestingNavigator.sol/VestingNavigator.json'), 'utf-8'),
+      );
+      const vestingIpfs = extractIPFSHash(VestingJson.bytecode);
+      const VestingFactory = new quais.ContractFactory(VestingJson.abi, VestingJson.bytecode, deployer, vestingIpfs);
+      // VestingNavigator(daoShip, name, description)
+      const vestingInstance = await VestingFactory.deploy(daoShipAddress, 'Test Vesting', 'Vesting for E2E tests');
+      await vestingInstance.waitForDeployment();
+      vestingNavigator = vestingInstance;
+      vestingAddr = (await vestingInstance.getAddress()).toLowerCase();
+      const vestingDeployBlock = (await vestingInstance.deploymentTransaction()!.wait())!.blockNumber;
+      console.log(`   VestingNavigator: ${vestingAddr} (deploy block ${vestingDeployBlock})`);
+
+      // ── Register both in one governance proposal: setNavigators([tl,vesting],[4,2]) ──
+      const timelockCs = await timelockInstance.getAddress();
+      const vestingCs = await vestingInstance.getAddress();
+      const setNavData = daoShip.interface.encodeFunctionData('setNavigators', [
+        [timelockCs, vestingCs],
+        [4, 2], // GOVERNOR, MANAGER
+      ]);
+      const execData = daoShip.interface.encodeFunctionData('executeAsGovernance', [daoShipAddress, 0, setNavData]);
+      const proposalData = encodeMultiSend([{ operation: 0, to: daoShipAddress, value: 0n, data: execData }]);
+
+      const processReceipt = await runProposal(
+        daoShip, deployer, [deployer, bob], proposalData,
+        JSON.stringify({ title: 'Register Timelock + Vesting navigators' }), 'P11b register',
+      );
+      const processBlock = processReceipt.blockNumber;
+
+      expect(await daoShip.navigators(timelockCs)).toBe(4n);
+      expect(await daoShip.navigators(vestingCs)).toBe(2n);
+      console.log('   On-chain permissions: timelock=4 (GOVERNOR), vesting=2 (MANAGER)');
+
+      // ── INDEXER VERIFICATION ────────────────────────────────
+      console.log('\n  Verifying indexer...');
+      await waitForIndexer(supabase, processBlock, 'Phase 11b');
+
+      const tlRow = await waitForRow<any>(
+        () => supabase.from('ds_navigators').select('*').eq('id', `${daoId}-${timelockAddr}`).single(),
+        'timelock navigator P11b',
+      );
+      expect(tlRow, 'TimelockNavigator row').toBeTruthy();
+      expect(tlRow!.navigator_type).toBe('TimelockNavigator');
+      expect(tlRow!.permission).toBe(4);
+      expect(tlRow!.permission_label).toBe('governor');
+      expect(tlRow!.trust_status).toBe('sanctioned');
+      expect(tlRow!.is_active).toBe(true);
+
+      const vRow = await waitForRow<any>(
+        () => supabase.from('ds_navigators').select('*').eq('id', `${daoId}-${vestingAddr}`).single(),
+        'vesting navigator P11b',
+      );
+      expect(vRow, 'VestingNavigator row').toBeTruthy();
+      expect(vRow!.navigator_type).toBe('VestingNavigator');
+      expect(vRow!.permission).toBe(2);
+      expect(vRow!.permission_label).toBe('manager');
+      expect(vRow!.trust_status).toBe('sanctioned');
+      console.log('   Both navigator records verified (GOVERNOR/MANAGER, sanctioned)');
+
+      console.log('  Phase 11b PASSED\n');
+    },
+    perProposalMs + proposalPhaseOverhead,
+  );
+
+  // ════════════════════════════════════════════════════════════════════
+  // PHASE 11c: Timelock — queue a config change, then cancel it
+  // ════════════════════════════════════════════════════════════════════
+  // queueChange / cancelChange are avatar-only → driven via governance proposals.
+  // Neither applies the config (only executeChange does), so this leaves DAO config untouched.
+
+  it(
+    'Phase 11c: Timelock queue + cancel a governance-config change',
+    async () => {
+      console.log('\n== PHASE 11c: Timelock queue + cancel ==\n');
+
+      // Encode a governanceConfig (the 7 fields, in DAOShip.setGovernanceConfig order)
+      const coder = quais.AbiCoder.defaultAbiCoder();
+      const newCfg = coder.encode(
+        ['uint32', 'uint32', 'uint256', 'uint256', 'uint256', 'uint256', 'uint32'],
+        [180, 60, quais.parseQuai('0.001'), 1000, quais.parseQuai('1'), 6600, 0],
+      );
+      const configHash = quais.keccak256(newCfg);
+      const timelockCs = await timelockNavigator.getAddress();
+
+      // ── Queue (changeId 0) ──
+      const queueData = timelockNavigator.interface.encodeFunctionData('queueChange', [newCfg]);
+      const queueProposal = encodeMultiSend([{ operation: 0, to: timelockCs, value: 0n, data: queueData }]);
+      const queueReceipt = await runProposal(
+        daoShip, deployer, [deployer, bob], queueProposal,
+        JSON.stringify({ title: 'Queue timelock config change' }), 'P11c queue',
+      );
+      console.log(`   Queued in block ${queueReceipt.blockNumber}`);
+
+      await waitForIndexer(supabase, queueReceipt.blockNumber, 'Phase 11c queue');
+      const change = await waitForRow<any>(
+        () => supabase.from('ds_timelock_changes').select('*').eq('id', `${timelockAddr}-0`).single(),
+        'timelock change 0 P11c',
+      );
+      expect(change, 'ds_timelock_changes row for change 0').toBeTruthy();
+      expect(change!.dao_id).toBe(daoId);
+      expect(change!.navigator_address).toBe(timelockAddr);
+      // NUMERIC(78,0): PostgREST deserializes small values as JS numbers (0), large ones as
+      // strings — compare numerically, matching the token_id BigInt pattern above.
+      expect(BigInt(change!.change_id)).toBe(0n);
+      expect(change!.queued_by).toBe(vault.toLowerCase()); // avatar queues via the proposal
+      expect(change!.config_hash).toBe(configHash);
+      expect(change!.governance_config).toBe(newCfg); // full bytes stored for executeChange recovery
+      expect(change!.status).toBe('queued');
+      expect(Number(change!.executable_after)).toBeGreaterThan(0);
+      expect(Number(change!.expires_at)).toBeGreaterThan(Number(change!.executable_after));
+      console.log('   Queued change row verified (status=queued, full config bytes stored)');
+
+      // ── Cancel (changeId 0) ──
+      const cancelData = timelockNavigator.interface.encodeFunctionData('cancelChange', [0]);
+      const cancelProposal = encodeMultiSend([{ operation: 0, to: timelockCs, value: 0n, data: cancelData }]);
+      const cancelReceipt = await runProposal(
+        daoShip, deployer, [deployer, bob], cancelProposal,
+        JSON.stringify({ title: 'Cancel timelock config change' }), 'P11c cancel',
+      );
+      console.log(`   Cancelled in block ${cancelReceipt.blockNumber}`);
+
+      await waitForIndexer(supabase, cancelReceipt.blockNumber, 'Phase 11c cancel');
+      const cancelled = await waitForRow<any>(
+        () => supabase.from('ds_timelock_changes').select('*').eq('id', `${timelockAddr}-0`)
+          .eq('status', 'cancelled').single(),
+        'timelock change 0 cancelled P11c',
+      );
+      expect(cancelled, 'change 0 should be cancelled').toBeTruthy();
+      expect(cancelled!.status).toBe('cancelled');
+      expect(cancelled!.cancelled_tx).toBeTruthy();
+      console.log('   Cancelled change row verified (status=cancelled)');
+
+      console.log('  Phase 11c PASSED\n');
+    },
+    2 * (perProposalMs + proposalPhaseOverhead),
+  );
+
+  // ════════════════════════════════════════════════════════════════════
+  // PHASE 11d: Timelock BYPASS detection — direct setGovernanceConfig is flagged
+  // ════════════════════════════════════════════════════════════════════
+  // With an ACTIVE TimelockNavigator, a proposal that changes governance config DIRECTLY
+  // (executeAsGovernance → setGovernanceConfig, no paired ChangeExecuted) is a timelock
+  // bypass. The indexer flags ds_governance_config_history.bypassed_timelock = TRUE.
+
+  it(
+    'Phase 11d: Direct setGovernanceConfig on a timelock-enabled DAO is flagged as bypass',
+    async () => {
+      console.log('\n== PHASE 11d: Timelock bypass detection ==\n');
+
+      const coder = quais.AbiCoder.defaultAbiCoder();
+      const directCfg = coder.encode(
+        ['uint32', 'uint32', 'uint256', 'uint256', 'uint256', 'uint256', 'uint32'],
+        [180, 60, quais.parseQuai('0.001'), 1000, quais.parseQuai('1'), 6600, 0],
+      );
+      const setGovData = daoShip.interface.encodeFunctionData('setGovernanceConfig', [directCfg]);
+      const execData = daoShip.interface.encodeFunctionData('executeAsGovernance', [daoShipAddress, 0, setGovData]);
+      const proposalData = encodeMultiSend([{ operation: 0, to: daoShipAddress, value: 0n, data: execData }]);
+
+      const processReceipt = await runProposal(
+        daoShip, deployer, [deployer, bob], proposalData,
+        JSON.stringify({ title: 'Direct config change (bypasses timelock)' }), 'P11d bypass',
+      );
+      const processBlock = processReceipt.blockNumber;
+      const processTx = String(processReceipt.hash).toLowerCase();
+      console.log(`   Direct GovernanceConfigSet in tx ${processTx} (block ${processBlock})`);
+
+      await waitForIndexer(supabase, processBlock, 'Phase 11d');
+      // The bypass flag is resolved at END of the range — give it a moment beyond catch-up.
+      const row = await waitForRow<any>(
+        () => supabase.from('ds_governance_config_history').select('*')
+          .eq('dao_id', daoId).eq('tx_hash', processTx).single(),
+        'governance_config_history P11d',
+      );
+      expect(row, 'governance config history row for the direct change').toBeTruthy();
+      expect(row!.bypassed_timelock).toBe(true);
+      console.log('   Bypass correctly flagged: bypassed_timelock = true');
+
+      console.log('  Phase 11d PASSED\n');
+    },
+    perProposalMs + proposalPhaseOverhead,
+  );
+
+  // ════════════════════════════════════════════════════════════════════
+  // PHASE 11e: Timelock EXECUTE path (opt-in) — routed change is NOT flagged
+  // ════════════════════════════════════════════════════════════════════
+  // Proves the bypass resolver's negative case: a change pushed through executeChange emits
+  // ChangeExecuted in the SAME tx as GovernanceConfigSet → bypassed_timelock = FALSE.
+  // Gated behind E2E_TIMELOCK_EXECUTE because executeChange must wait out MIN_DELAY (10 min)
+  // of real wall-clock — there is no time-travel on a live testnet.
+
+  (process.env.E2E_TIMELOCK_EXECUTE ? it : it.skip)(
+    'Phase 11e: executeChange after delay applies config WITHOUT a bypass flag',
+    async () => {
+      console.log('\n== PHASE 11e: Timelock execute path (opt-in) ==\n');
+
+      const coder = quais.AbiCoder.defaultAbiCoder();
+      const cfg = coder.encode(
+        ['uint32', 'uint32', 'uint256', 'uint256', 'uint256', 'uint256', 'uint32'],
+        [180, 60, quais.parseQuai('0.001'), 1000, quais.parseQuai('1'), 6600, 0],
+      );
+      const timelockCs = await timelockNavigator.getAddress();
+
+      // Queue change 1 via proposal
+      const queueData = timelockNavigator.interface.encodeFunctionData('queueChange', [cfg]);
+      const queueProposal = encodeMultiSend([{ operation: 0, to: timelockCs, value: 0n, data: queueData }]);
+      await runProposal(daoShip, deployer, [deployer, bob], queueProposal,
+        JSON.stringify({ title: 'Queue change for execute path' }), 'P11e queue');
+
+      // changeCount is now 2 (0 from P11c, 1 here) → our change is id 1
+      const changeId = 1;
+      const onchain = await timelockNavigator.queuedChanges(changeId);
+      const executableAfter = Number(onchain.executableAfter);
+      console.log(`   Waiting for delay (executableAfter=${executableAfter}); polling chain time...`);
+
+      // Gate on the CONTRACT's own clock via the isExecutable() view, NOT woHeader.timestamp:
+      // on Quai the work-object header time runs AHEAD of the EVM block.timestamp that
+      // executeChange actually enforces, so a woHeader gate returns while the change is still
+      // ChangeNotReady. Polling the view sees the same block.timestamp the state-changing call
+      // will (mirrors daoships-contracts `waitForContractClock`). Real ~10 min wait.
+      const execDeadline = Date.now() + (TIMELOCK_DELAY_SEC + 300) * 1000;
+      for (;;) {
+        let ready = false;
+        try { ready = await timelockNavigator.isExecutable(changeId); } catch { /* transient RPC blip */ }
+        if (ready) break;
+        if (Date.now() > execDeadline) throw new Error('P11e: timed out waiting for timelock delay to elapse');
+        await sleep(15_000);
+      }
+
+      const execReceipt = await sendTx(
+        () => timelockNavigator.connect(deployer).executeChange(changeId, cfg),
+        'executeChange P11e',
+      );
+      const execTx = String(execReceipt.hash).toLowerCase();
+      console.log(`   Executed change ${changeId} in tx ${execTx} (block ${execReceipt.blockNumber})`);
+
+      await waitForIndexer(supabase, execReceipt.blockNumber, 'Phase 11e');
+
+      const executed = await waitForRow<any>(
+        () => supabase.from('ds_timelock_changes').select('*').eq('id', `${timelockAddr}-${changeId}`)
+          .eq('status', 'executed').single(),
+        'timelock change executed P11e',
+      );
+      expect(executed!.status).toBe('executed');
+      expect(String(executed!.executed_tx).toLowerCase()).toBe(execTx);
+
+      // The paired GovernanceConfigSet in the same tx → NOT a bypass.
+      const histRow = await waitForRow<any>(
+        () => supabase.from('ds_governance_config_history').select('*')
+          .eq('dao_id', daoId).eq('tx_hash', execTx).single(),
+        'governance_config_history P11e',
+      );
+      expect(histRow, 'config history row for the executed change').toBeTruthy();
+      expect(histRow!.bypassed_timelock).toBe(false);
+      console.log('   Routed change verified: status=executed, bypassed_timelock=false');
+
+      console.log('  Phase 11e PASSED\n');
+    },
+    perProposalMs + proposalPhaseOverhead + (TIMELOCK_DELAY_SEC + 600) * 1000,
+  );
+
+  // ════════════════════════════════════════════════════════════════════
+  // PHASE 11f: Vesting — create schedule, claim, revoke
+  // ════════════════════════════════════════════════════════════════════
+  // createSchedule / revoke are avatar-only (proposals); claim is called by the beneficiary.
+  // A short fully-vesting schedule keeps the claim deterministic on a live testnet.
+
+  it(
+    'Phase 11f: Vesting create + claim + revoke',
+    async () => {
+      console.log('\n== PHASE 11f: Vesting create + claim + revoke ==\n');
+
+      const vestingCs = await vestingNavigator.getAddress();
+      const totalAmount = quais.parseQuai('5');
+
+      // ── Create schedule (changeId 0) for Carol: cliff 0, vesting 1s (fully vests immediately) ──
+      // createSchedule(beneficiary, totalAmount, startTime, cliffDuration, vestingDuration, isLoot)
+      const createData = vestingNavigator.interface.encodeFunctionData('createSchedule', [
+        carol.address, totalAmount, 0, 0, 1, false,
+      ]);
+      const createProposal = encodeMultiSend([{ operation: 0, to: vestingCs, value: 0n, data: createData }]);
+      const createReceipt = await runProposal(
+        daoShip, deployer, [deployer, bob], createProposal,
+        JSON.stringify({ title: 'Create vesting schedule for Carol' }), 'P11f create',
+      );
+      console.log(`   Schedule created in block ${createReceipt.blockNumber}`);
+
+      await waitForIndexer(supabase, createReceipt.blockNumber, 'Phase 11f create');
+      const schedule = await waitForRow<any>(
+        () => supabase.from('ds_vesting_schedules').select('*').eq('id', `${vestingAddr}-0`).single(),
+        'vesting schedule 0 P11f',
+      );
+      expect(schedule, 'ds_vesting_schedules row').toBeTruthy();
+      expect(schedule!.dao_id).toBe(daoId);
+      expect(schedule!.beneficiary).toBe(carol.address.toLowerCase());
+      expect(BigInt(schedule!.total_amount)).toBe(totalAmount);
+      expect(schedule!.is_loot).toBe(false);
+      expect(schedule!.revoked).toBe(false);
+      console.log('   Schedule row verified (beneficiary=Carol, 5 shares, not revoked)');
+
+      // ── Claim (by Carol) — schedule is fully vested (vesting=1s elapsed) ──
+      const carolSharesBefore = await shares.balanceOf(carol.address);
+      const claimReceipt = await sendTx(
+        () => vestingNavigator.connect(carol).claim(0),
+        'vesting claim P11f',
+      );
+      const carolSharesAfter = await shares.balanceOf(carol.address);
+      const claimedDelta = carolSharesAfter - carolSharesBefore;
+      expect(claimedDelta).toBeGreaterThan(0n);
+      console.log(`   Carol claimed ${quais.formatQuai(claimedDelta)} shares in block ${claimReceipt.blockNumber}`);
+
+      await waitForIndexer(supabase, claimReceipt.blockNumber, 'Phase 11f claim');
+      // claimed is recomputed from the SUM of ds_vesting_claims at end-of-range.
+      const claimedSchedule = await waitForRow<any>(
+        () => supabase.from('ds_vesting_schedules').select('*').eq('id', `${vestingAddr}-0`).single(),
+        'vesting schedule claimed P11f',
+      );
+      expect(BigInt(claimedSchedule!.claimed)).toBe(claimedDelta);
+
+      const { data: claims } = await supabase
+        .from('ds_vesting_claims')
+        .select('*')
+        .eq('schedule_pk', `${vestingAddr}-0`);
+      expect(claims).toBeTruthy();
+      expect(claims!.length).toBeGreaterThanOrEqual(1);
+      const claimSum = claims!.reduce((acc: bigint, c: any) => acc + BigInt(c.amount), 0n);
+      expect(claimSum).toBe(claimedDelta);
+      expect(claims!.every((c: any) => c.is_loot === false)).toBe(true);
+      console.log(`   Claim feed verified (${claims!.length} row(s), Σamount matches on-chain mint)`);
+
+      // ── Revoke (avatar via proposal) ──
+      const revokeData = vestingNavigator.interface.encodeFunctionData('revoke', [0]);
+      const revokeProposal = encodeMultiSend([{ operation: 0, to: vestingCs, value: 0n, data: revokeData }]);
+      const revokeReceipt = await runProposal(
+        daoShip, deployer, [deployer, bob], revokeProposal,
+        JSON.stringify({ title: 'Revoke Carol vesting schedule' }), 'P11f revoke',
+      );
+      console.log(`   Revoked in block ${revokeReceipt.blockNumber}`);
+
+      await waitForIndexer(supabase, revokeReceipt.blockNumber, 'Phase 11f revoke');
+      const revoked = await waitForRow<any>(
+        () => supabase.from('ds_vesting_schedules').select('*').eq('id', `${vestingAddr}-0`)
+          .eq('revoked', true).single(),
+        'vesting schedule revoked P11f',
+      );
+      expect(revoked, 'schedule should be revoked').toBeTruthy();
+      expect(revoked!.revoked).toBe(true);
+      expect(Number(revoked!.revoked_at)).toBeGreaterThan(0);
+      expect(revoked!.vested_at_revoke).toBeTruthy();
+      console.log('   Revoked schedule row verified (revoked=true, revoked_at + vested_at_revoke set)');
+
+      console.log('  Phase 11f PASSED\n');
+    },
+    2 * (perProposalMs + proposalPhaseOverhead),
+  );
+
+  // ════════════════════════════════════════════════════════════════════
+  // PHASE 11g: Deploy BudgetNavigator → self_asserted, INACTIVE, dao-bound
+  // ════════════════════════════════════════════════════════════════════
+  // BudgetNavigator is the THIRD trust class: it holds NO DAOShip permission (no
+  // NavigatorSet, like Signal) but is NOT read-only — its authority is being an enabled
+  // module on the DAO's vault. So at NavigatorDeployed it is born self_asserted AND
+  // is_active=false (powerless until the vault enables it), unlike a read-only nav which is
+  // active at permission 0. Native zero address = QUAI; SENTINEL = Safe module linked-list head.
+  const NATIVE_TOKEN = '0x0000000000000000000000000000000000000000';
+  const SENTINEL_MODULES = '0x0000000000000000000000000000000000000001';
+
+  it(
+    'Phase 11g: Deploy BudgetNavigator → self_asserted, inactive, dao-bound',
+    async () => {
+      console.log('\n== PHASE 11g: Deploy BudgetNavigator (vault-module authority) ==\n');
+
+      const BudgetJson = JSON.parse(
+        fs.readFileSync(path.join(ARTIFACTS_DIR, 'navigators/BudgetNavigator.sol/BudgetNavigator.json'), 'utf-8'),
+      );
+      const budgetIpfs = extractIPFSHash(BudgetJson.bytecode);
+      await withTestRetry(() => provider.getBlockNumber(Shard.Cyprus1), 'getBlockNumber P11g');
+
+      const BudgetFactory = new quais.ContractFactory(BudgetJson.abi, BudgetJson.bytecode, deployer, budgetIpfs);
+      // BudgetNavigator(daoShip, name, description) — constructor makes NO call to the DAO,
+      // so it is safe against the (already-launched) DAO address.
+      const budgetInstance = await BudgetFactory.deploy(daoShipAddress, 'Test Budget', 'BudgetNavigator for E2E tests');
+      await budgetInstance.waitForDeployment();
+      budgetNavigator = budgetInstance;
+      budgetAddr = (await budgetInstance.getAddress()).toLowerCase();
+      const deployReceipt = await budgetInstance.deploymentTransaction()!.wait();
+      budgetNavDeployBlock = deployReceipt!.blockNumber;
+      console.log(`   BudgetNavigator: ${budgetAddr} (deploy block ${budgetNavDeployBlock})`);
+
+      // ── INDEXER VERIFICATION ────────────────────────────────
+      console.log('\n  Verifying indexer...');
+      await waitForIndexer(supabase, budgetNavDeployBlock, 'Phase 11g');
+
+      const navRow = await waitForRow<any>(
+        () => supabase.from('ds_navigators').select('*').eq('id', `${daoId}-${budgetAddr}`).single(),
+        'budget navigator P11g',
+      );
+      expect(navRow, 'BudgetNavigator row should be bound on NavigatorDeployed').toBeTruthy();
+      expect(navRow!.navigator_type).toBe('BudgetNavigator');
+      expect(navRow!.dao_id).toBe(daoId);                 // bound from the event
+      expect(navRow!.permission).toBe(0);                 // module nav — no permission, ever
+      expect(navRow!.permission_ever_granted).toBe(false);
+      expect(navRow!.trust_status).toBe('self_asserted'); // not yet enabled on the vault
+      expect(navRow!.is_active).toBe(false);              // powerless until EnabledModule (≠ read-only)
+      expect(Number(navRow!.deploy_block)).toBe(budgetNavDeployBlock);
+      console.log('   BudgetNavigator row verified (self_asserted, INACTIVE, dao-bound)');
+
+      console.log('  Phase 11g PASSED\n');
+    },
+    simplePhaseTimeout,
+  );
+
+  // ════════════════════════════════════════════════════════════════════
+  // PHASE 11h: createBudget BEFORE enable → deferred (no ds_budgets row)
+  // ════════════════════════════════════════════════════════════════════
+  // The materialization gate: BudgetCreated is SEEN (log marked processed) but NOT written
+  // while the navigator is only self_asserted — exactly like Signal polls pre-sanction. This
+  // proves a never-enabled budget navigator cannot inject treasury activity into a DAO's feed.
+  // createBudget is avatar-only → routed through the vault's propose→approve→execute flow
+  // (msg.sender == vault == avatar). The budget's manager is the deployer (disburses in 11i).
+
+  it(
+    'Phase 11h: createBudget on a self_asserted navigator is deferred (no row)',
+    async () => {
+      console.log('\n== PHASE 11h: createBudget deferred (pre-enable) ==\n');
+
+      const vaultContract = new quais.Contract(vault, QuaiVaultJson.abi, deployer);
+      // createBudget(manager, token, allowancePerPeriod, totalCeiling, periodLength, startTime, endTime)
+      const createData = budgetNavigator.interface.encodeFunctionData('createBudget', [
+        deployer.address,            // manager (will disburse)
+        NATIVE_TOKEN,                // native QUAI
+        quais.parseQuai('0.05'),     // allowancePerPeriod
+        quais.parseQuai('0.05'),     // totalCeiling
+        3600,                        // periodLength (MIN_PERIOD = 1 hour)
+        0,                           // startTime (0 = now)
+        0,                           // endTime (0 = perpetual)
+      ]);
+
+      await withTestRetry(() => provider.getBlockNumber(Shard.Cyprus1), 'getBlockNumber P11h');
+      const proposeReceipt = await sendTx(
+        () => vaultContract.proposeTransaction(budgetAddr, 0, createData),
+        'vault proposeTransaction createBudget P11h',
+      );
+      const proposeLog = proposeReceipt.logs.find((log: any) => {
+        try { return vaultContract.interface.parseLog(log)?.name === 'TransactionProposed'; }
+        catch { return false; }
+      });
+      const vaultTxHash = vaultContract.interface.parseLog(proposeLog!)?.args.txHash;
+      await sendTx(() => vaultContract.approveTransaction(vaultTxHash), 'vault approve createBudget P11h');
+      const execReceipt = await sendTx(
+        () => vaultContract.executeTransaction(vaultTxHash),
+        'vault execute createBudget P11h',
+      );
+      const createBlock = execReceipt.blockNumber;
+      console.log(`   createBudget executed (budgetId 0) in block ${createBlock}`);
+
+      // ── INDEXER VERIFICATION ────────────────────────────────
+      console.log('\n  Verifying indexer...');
+      await waitForIndexer(supabase, createBlock, 'Phase 11h');
+
+      const { data: budgets } = await supabase
+        .from('ds_budgets')
+        .select('*')
+        .eq('id', `${budgetAddr}-0`);
+      expect(budgets ?? [], 'budget must NOT be materialized while self_asserted').toHaveLength(0);
+      console.log('   Deferred correctly: no ds_budgets row pre-enable');
+
+      console.log('  Phase 11h PASSED\n');
+    },
+    simplePhaseTimeout,
+  );
+
+  // ════════════════════════════════════════════════════════════════════
+  // PHASE 11i: Enable module → sanctioned + active + feed + backfill; then disburse
+  // ════════════════════════════════════════════════════════════════════
+  // The vault enables the BudgetNavigator as a Zodiac module (msg.sender == vault). The indexer
+  // records the authenticated event in ds_vault_module_events, DERIVES trust_status→sanctioned /
+  // is_active→true from the feed, and BACKFILLS the deferred budget (created in 11h). The manager
+  // then disburses; total_spent is derive-from-truth (SUM of ds_budget_disbursements).
+
+  it(
+    'Phase 11i: EnabledModule flips trust, backfills the budget, and a disburse is recorded',
+    async () => {
+      console.log('\n== PHASE 11i: Enable module + backfill + disburse ==\n');
+
+      const vaultContract = new quais.Contract(vault, QuaiVaultJson.abi, deployer);
+
+      // ── Enable the BudgetNavigator as a vault module ──
+      let enableBlock: number;
+      if (!(await vaultContract.isModuleEnabled(budgetAddr))) {
+        const enableData = vaultContract.interface.encodeFunctionData('enableModule', [budgetAddr]);
+        await withTestRetry(() => provider.getBlockNumber(Shard.Cyprus1), 'getBlockNumber P11i enable');
+        const proposeReceipt = await sendTx(
+          () => vaultContract.proposeTransaction(vault, 0, enableData),
+          'vault proposeTransaction enableModule P11i',
+        );
+        const proposeLog = proposeReceipt.logs.find((log: any) => {
+          try { return vaultContract.interface.parseLog(log)?.name === 'TransactionProposed'; }
+          catch { return false; }
+        });
+        const vaultTxHash = vaultContract.interface.parseLog(proposeLog!)?.args.txHash;
+        await sendTx(() => vaultContract.approveTransaction(vaultTxHash), 'vault approve enableModule P11i');
+        const execReceipt = await sendTx(
+          () => vaultContract.executeTransaction(vaultTxHash),
+          'vault execute enableModule P11i',
+        );
+        expect(await vaultContract.isModuleEnabled(budgetAddr)).toBe(true);
+        enableBlock = execReceipt.blockNumber;
+      } else {
+        enableBlock = await provider.getBlockNumber(Shard.Cyprus1);
+      }
+      console.log(`   BudgetNavigator enabled as vault module (block ${enableBlock})`);
+
+      // ── INDEXER VERIFICATION: trust flip + feed + backfill ──
+      console.log('\n  Verifying indexer (trust + feed + backfill)...');
+      await waitForIndexer(supabase, enableBlock, 'Phase 11i enable');
+
+      // 1. Trust derived from the feed → sanctioned + active.
+      const navRow = await waitForRow<any>(
+        () => supabase.from('ds_navigators').select('*').eq('id', `${daoId}-${budgetAddr}`)
+          .eq('trust_status', 'sanctioned').single(),
+        'budget nav sanctioned P11i',
+      );
+      expect(navRow!.trust_status).toBe('sanctioned');
+      expect(navRow!.is_active).toBe(true);
+      expect(navRow!.permission_ever_granted).toBe(false); // enabling grants no DAOShip permission
+      console.log('   trust_status derived → sanctioned, is_active → true');
+
+      // 2. Authenticated enable event recorded in the trust feed.
+      const { data: feed } = await supabase
+        .from('ds_vault_module_events')
+        .select('*')
+        .eq('navigator_address', budgetAddr)
+        .eq('enabled', true);
+      expect(feed, 'enable feed row').toBeTruthy();
+      expect(feed!.length).toBeGreaterThanOrEqual(1);
+      expect(feed![0].dao_id).toBe(daoId);
+      expect(feed![0].vault.toLowerCase()).toBe(vault.toLowerCase());
+      console.log('   ds_vault_module_events enable row verified');
+
+      // 3. Budget deferred in 11h is now backfilled.
+      const budget = await waitForRow<any>(
+        () => supabase.from('ds_budgets').select('*').eq('id', `${budgetAddr}-0`).single(),
+        'budget backfilled P11i',
+      );
+      expect(budget, 'budget should be backfilled on enable').toBeTruthy();
+      expect(budget!.dao_id).toBe(daoId);
+      expect(budget!.manager).toBe(deployer.address.toLowerCase());
+      expect(budget!.token).toBe(NATIVE_TOKEN);
+      expect(BigInt(budget!.allowance_per_period)).toBe(quais.parseQuai('0.05'));
+      expect(BigInt(budget!.total_ceiling)).toBe(quais.parseQuai('0.05'));
+      expect(BigInt(budget!.total_spent)).toBe(0n);
+      expect(budget!.cancelled).toBe(false);
+      console.log('   Budget backfilled and verified (manager, native token, caps)');
+
+      // ── Disburse (manager = deployer) → feed row + derived total_spent ──
+      const disburseAmount = quais.parseQuai('0.01');
+      const disburseReceipt = await sendTx(
+        () => budgetNavigator.connect(deployer).disburse(0, carol.address, disburseAmount),
+        'budget disburse P11i',
+      );
+      const disburseBlock = disburseReceipt.blockNumber;
+      console.log(`   Disbursed ${quais.formatQuai(disburseAmount)} QUAI to Carol in block ${disburseBlock}`);
+
+      await waitForIndexer(supabase, disburseBlock, 'Phase 11i disburse');
+
+      const { data: disb } = await supabase
+        .from('ds_budget_disbursements')
+        .select('*')
+        .eq('navigator_address', budgetAddr);
+      expect(disb, 'disbursement feed row').toBeTruthy();
+      expect(disb!.length).toBeGreaterThanOrEqual(1);
+      const row = disb!.find((d: any) => d.recipient === carol.address.toLowerCase());
+      expect(row, 'disbursement to Carol').toBeTruthy();
+      expect(BigInt(row!.amount)).toBe(disburseAmount);
+      expect(row!.budget_pk).toBe(`${budgetAddr}-0`);
+
+      // total_spent is recomputed (SUM of disbursements), never incremented inline.
+      const spentBudget = await waitForRow<any>(
+        () => supabase.from('ds_budgets').select('*').eq('id', `${budgetAddr}-0`)
+          .gt('total_spent', '0').single(),
+        'budget total_spent P11i',
+      );
+      expect(BigInt(spentBudget!.total_spent)).toBe(disburseAmount);
+      console.log('   Disbursement feed + derived total_spent verified');
+
+      console.log('  Phase 11i PASSED\n');
+    },
+    perProposalMs + proposalPhaseOverhead,
+  );
+
+  // ════════════════════════════════════════════════════════════════════
+  // PHASE 11j: DisableModule → unsanctioned (derived from the feed)
+  // ════════════════════════════════════════════════════════════════════
+  // Removing the module is the capability revocation. The indexer appends a disable row to
+  // ds_vault_module_events and RE-DERIVES trust from the latest event → unsanctioned + inactive,
+  // so the app drops the navigator's budgets from default (trust-gated) views. Gnosis disableModule
+  // needs the linked-list predecessor, resolved via getModulesPaginated.
+
+  it(
+    'Phase 11j: DisabledModule re-derives trust → unsanctioned',
+    async () => {
+      console.log('\n== PHASE 11j: Disable module → unsanctioned ==\n');
+
+      const vaultContract = new quais.Contract(vault, QuaiVaultJson.abi, deployer);
+
+      // Resolve prevModule for budgetAddr in the module linked list (most-recent-first).
+      const [modules] = await vaultContract.getModulesPaginated(SENTINEL_MODULES, 50);
+      const lowered = (modules as string[]).map((m) => m.toLowerCase());
+      const idx = lowered.indexOf(budgetAddr);
+      expect(idx, 'budget module present in vault module list').toBeGreaterThanOrEqual(0);
+      const prevModule = idx === 0 ? SENTINEL_MODULES : (modules as string[])[idx - 1];
+
+      const disableData = vaultContract.interface.encodeFunctionData('disableModule', [prevModule, budgetAddr]);
+      await withTestRetry(() => provider.getBlockNumber(Shard.Cyprus1), 'getBlockNumber P11j');
+      const proposeReceipt = await sendTx(
+        () => vaultContract.proposeTransaction(vault, 0, disableData),
+        'vault proposeTransaction disableModule P11j',
+      );
+      const proposeLog = proposeReceipt.logs.find((log: any) => {
+        try { return vaultContract.interface.parseLog(log)?.name === 'TransactionProposed'; }
+        catch { return false; }
+      });
+      const vaultTxHash = vaultContract.interface.parseLog(proposeLog!)?.args.txHash;
+      await sendTx(() => vaultContract.approveTransaction(vaultTxHash), 'vault approve disableModule P11j');
+      const execReceipt = await sendTx(
+        () => vaultContract.executeTransaction(vaultTxHash),
+        'vault execute disableModule P11j',
+      );
+      const disableBlock = execReceipt.blockNumber;
+      expect(await vaultContract.isModuleEnabled(budgetAddr)).toBe(false);
+      console.log(`   BudgetNavigator disabled as vault module (block ${disableBlock})`);
+
+      // ── INDEXER VERIFICATION ────────────────────────────────
+      console.log('\n  Verifying indexer...');
+      await waitForIndexer(supabase, disableBlock, 'Phase 11j');
+
+      // Trust re-derived from the latest feed event → unsanctioned + inactive.
+      const navRow = await waitForRow<any>(
+        () => supabase.from('ds_navigators').select('*').eq('id', `${daoId}-${budgetAddr}`)
+          .eq('trust_status', 'unsanctioned').single(),
+        'budget nav unsanctioned P11j',
+      );
+      expect(navRow!.trust_status).toBe('unsanctioned');
+      expect(navRow!.is_active).toBe(false);
+      console.log('   trust_status re-derived → unsanctioned, is_active → false');
+
+      // The disable event is recorded in the feed (alongside the prior enable row).
+      const { data: feed } = await supabase
+        .from('ds_vault_module_events')
+        .select('*')
+        .eq('navigator_address', budgetAddr)
+        .eq('enabled', false);
+      expect(feed, 'disable feed row').toBeTruthy();
+      expect(feed!.length).toBeGreaterThanOrEqual(1);
+      console.log('   ds_vault_module_events disable row verified');
+
+      console.log('  Phase 11j PASSED\n');
+    },
+    simplePhaseTimeout,
+  );
+
+  // ════════════════════════════════════════════════════════════════════
+  // PHASE 11k: Subscription — deploy + register (MANAGER), enroll, pay fee
+  // ════════════════════════════════════════════════════════════════════
+  // SubscriptionNavigator is PERMISSIONED (MANAGER, like Vesting): registered via
+  // setNavigators([sub],[2]) → NavigatorSet fires → indexer marks it sanctioned. Mirrors the
+  // contracts on-chain Phase 2i (register → payFee → enroll). MUST run before Phase 12 (which
+  // locks manager/governor, after which setNavigators reverts).
+  //
+  // Covered: MemberEnrolled (governance enroll → complimentary period) and FeePaid (a member's
+  // own payFee → self-enroll, payment feed, derive-from-truth total_paid). FeeCollected is NOT
+  // exercised — collection requires a member past grace, and MIN_PERIOD is 1h on-chain (the same
+  // wall-clock constraint that kept Phase 11f's vesting schedule to a 1s vest); the collect path
+  // is covered by the contracts suite + the handler unit tests.
+
+  it(
+    'Phase 11k: Subscription deploy + register (MANAGER) + enroll + payFee',
+    async () => {
+      console.log('\n== PHASE 11k: Subscription register + enroll + payFee ==\n');
+
+      // ── Deploy SubscriptionNavigator (native-QUAI menu) ──
+      const SubscriptionJson = JSON.parse(
+        fs.readFileSync(path.join(ARTIFACTS_DIR, 'navigators/SubscriptionNavigator.sol/SubscriptionNavigator.json'), 'utf-8'),
+      );
+      const subIpfs = extractIPFSHash(SubscriptionJson.bytecode);
+      await withTestRetry(() => provider.getBlockNumber(Shard.Cyprus1), 'getBlockNumber P11k');
+      const SubFactory = new quais.ContractFactory(SubscriptionJson.abi, SubscriptionJson.bytecode, deployer, subIpfs);
+      const feePerPeriod = quais.parseQuai('0.001');
+      const PERIOD_DURATION = 3600; // MIN_PERIOD (1h) — smallest the contract allows
+      // constructor(daoShip, tokens[], feesPerPeriod[], periodDuration, graceDuration, startTime,
+      //             collectorRewardBps, burnOnCollect, initialMembers[], name, description)
+      const subInstance = await SubFactory.deploy(
+        daoShipAddress, [NATIVE_TOKEN], [feePerPeriod], PERIOD_DURATION, 0, 0, 500, false, [],
+        'Test Subscription', 'Subscription for E2E tests',
+      );
+      await subInstance.waitForDeployment();
+      const subscriptionNavigator: any = subInstance;
+      const subAddr = (await subInstance.getAddress()).toLowerCase();
+      console.log(`   SubscriptionNavigator: ${subAddr}`);
+
+      // ── Register via governance: setNavigators([sub],[2]) ──
+      const subCs = await subInstance.getAddress();
+      const setNavData = daoShip.interface.encodeFunctionData('setNavigators', [[subCs], [2]]);
+      const execData = daoShip.interface.encodeFunctionData('executeAsGovernance', [daoShipAddress, 0, setNavData]);
+      const registerProposal = encodeMultiSend([{ operation: 0, to: daoShipAddress, value: 0n, data: execData }]);
+      const registerReceipt = await runProposal(
+        daoShip, deployer, [deployer, bob], registerProposal,
+        JSON.stringify({ title: 'Register Subscription navigator' }), 'P11k register',
+      );
+      expect(await daoShip.navigators(subCs)).toBe(2n);
+      console.log(`   On-chain permission: subscription=2 (MANAGER), registered in block ${registerReceipt.blockNumber}`);
+
+      await waitForIndexer(supabase, registerReceipt.blockNumber, 'Phase 11k register');
+      const subRow = await waitForRow<any>(
+        () => supabase.from('ds_navigators').select('*').eq('id', `${daoId}-${subAddr}`).single(),
+        'subscription navigator P11k',
+      );
+      expect(subRow, 'SubscriptionNavigator row').toBeTruthy();
+      expect(subRow!.navigator_type).toBe('SubscriptionNavigator');
+      expect(subRow!.permission).toBe(2);
+      expect(subRow!.permission_label).toBe('manager');
+      expect(subRow!.trust_status).toBe('sanctioned');
+      expect(subRow!.is_active).toBe(true);
+      console.log('   Navigator row verified (MANAGER, sanctioned, active)');
+
+      // ── MemberEnrolled: governance enroll(carol) grants one complimentary period ──
+      const enrollData = subscriptionNavigator.interface.encodeFunctionData('enroll', [carol.address]);
+      const enrollProposal = encodeMultiSend([{ operation: 0, to: subCs, value: 0n, data: enrollData }]);
+      const enrollReceipt = await runProposal(
+        daoShip, deployer, [deployer, bob], enrollProposal,
+        JSON.stringify({ title: 'Enroll Carol in subscription' }), 'P11k enroll',
+      );
+      console.log(`   Carol enrolled (governance) in block ${enrollReceipt.blockNumber}`);
+
+      await waitForIndexer(supabase, enrollReceipt.blockNumber, 'Phase 11k enroll');
+      const carolPk = `${subAddr}-${carol.address.toLowerCase()}`;
+      const carolMember = await waitForRow<any>(
+        () => supabase.from('ds_subscription_members').select('*').eq('id', carolPk).single(),
+        'subscription member carol P11k',
+      );
+      expect(carolMember, 'ds_subscription_members row for Carol').toBeTruthy();
+      expect(carolMember!.dao_id).toBe(daoId);
+      expect(carolMember!.member).toBe(carol.address.toLowerCase());
+      // Complimentary period → paid_through is in the future and matches the contract clock.
+      expect(Number(carolMember!.paid_through)).toBeGreaterThan(0);
+      expect(BigInt(carolMember!.paid_through)).toBe(await subscriptionNavigator.paidThrough(carol.address));
+      console.log('   MemberEnrolled row verified (complimentary period set)');
+
+      // ── FeePaid: Bob's own payFee self-enrolls him (no MemberEnrolled) ──
+      const payReceipt = await sendTx(
+        () => subscriptionNavigator.connect(bob).payFee(1, NATIVE_TOKEN, { value: feePerPeriod }),
+        'subscription payFee P11k',
+      );
+      console.log(`   Bob paid 1 period (${quais.formatQuai(feePerPeriod)} QUAI) in block ${payReceipt.blockNumber}`);
+
+      await waitForIndexer(supabase, payReceipt.blockNumber, 'Phase 11k payFee');
+      const bobPk = `${subAddr}-${bob.address.toLowerCase()}`;
+      // total_paid is recomputed (SUM of ds_subscription_payments) at end-of-range, never inline.
+      const bobMember = await waitForRow<any>(
+        () => supabase.from('ds_subscription_members').select('*').eq('id', bobPk).gt('total_paid', '0').single(),
+        'subscription member bob P11k',
+      );
+      expect(bobMember, 'ds_subscription_members row for Bob (self-enrolled)').toBeTruthy();
+      expect(Number(bobMember!.paid_through)).toBeGreaterThan(0);
+      expect(BigInt(bobMember!.total_paid)).toBe(feePerPeriod);
+
+      const { data: payments } = await supabase
+        .from('ds_subscription_payments')
+        .select('*')
+        .eq('member_pk', bobPk);
+      expect(payments, 'payment feed rows for Bob').toBeTruthy();
+      expect(payments!.length).toBeGreaterThanOrEqual(1);
+      const payRow = payments![0];
+      expect(payRow.payer).toBe(bob.address.toLowerCase());
+      expect(payRow.token).toBe(NATIVE_TOKEN);
+      expect(BigInt(payRow.amount)).toBe(feePerPeriod);
+      const paySum = payments!.reduce((acc: bigint, p: any) => acc + BigInt(p.amount), 0n);
+      expect(paySum).toBe(BigInt(bobMember!.total_paid));
+      console.log('   FeePaid row + derived total_paid verified (self-enroll, payment feed)');
+
+      console.log('  Phase 11k PASSED\n');
+    },
+    2 * (perProposalMs + proposalPhaseOverhead),
   );
 
   // ════════════════════════════════════════════════════════════════════
@@ -2103,19 +4037,53 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
       const proposalId = daoShip.interface.parseLog(proposalEvent!)?.args[0];
       console.log(`\n   Proposal ID: ${proposalId}`);
 
-      console.log('   Waiting for checkpoints (20s)...');
-      await sleep(20_000);
+      await waitPastVotingStarts(daoShip, proposalId, 'voting window P12');
 
-      await withTestRetry(() => provider.getBlockNumber(Shard.Cyprus1), 'getBlockNumber pre-vote P12');
-      await sendTx(() => daoShip.connect(deployer).submitVote(proposalId, true), 'submitVote deployer P12');
-      // Alice delegated her voting power to Bob in Phase 5b, so Bob votes instead
-      await sendTx(() => daoShip.connect(bob).submitVote(proposalId, true), 'submitVote bob P12');
+      // ── DIAGNOSTIC PROBE ────────────────────────────────────
+      // Phase 12 has been observed reverting on `submitVote` with custom
+      // error 0x44e7e7a8 while sibling phases (P10/P11/P13) pass the same
+      // flow. Capture pre-vote state so the next failure surfaces a
+      // concrete root cause (not-sponsored / voting-not-started / voting-
+      // ended / insufficient shares) instead of a bare selector.
+      try {
+        const prop = await daoShip.proposals(proposalId);
+        const tipBlock = await provider.getBlock(Shard.Cyprus1, 'latest', false);
+        const chainNow = Number((tipBlock as any)?.woHeader?.timestamp ?? 0);
+        const deployerShares = await shares.balanceOf(deployer.address);
+        const bobShares = await shares.balanceOf(bob.address);
+        const sponsorThreshold = await daoShip.sponsorThreshold();
+        console.log('   P12 pre-vote diagnostics:');
+        console.log(`     proposal.sponsor:       ${prop.sponsor}`);
+        console.log(`     proposal.submitter:     ${prop.submitter}`);
+        console.log(`     proposal.votingStarts:  ${prop.votingStarts} (${prop.votingStarts > 0n ? new Date(Number(prop.votingStarts) * 1000).toISOString() : 'unset'})`);
+        console.log(`     proposal.votingEnds:    ${prop.votingEnds} (${prop.votingEnds > 0n ? new Date(Number(prop.votingEnds) * 1000).toISOString() : 'unset'})`);
+        console.log(`     chain now:              ${chainNow} (${chainNow > 0 ? new Date(chainNow * 1000).toISOString() : 'unset'})`);
+        console.log(`     deployer shares:        ${deployerShares}`);
+        console.log(`     bob shares:             ${bobShares}`);
+        console.log(`     sponsorThreshold:       ${sponsorThreshold}`);
+        const sponsored = prop.sponsor !== quais.ZeroAddress;
+        const inVotingWindow = chainNow >= Number(prop.votingStarts) && chainNow < Number(prop.votingEnds);
+        console.log(`     derived: sponsored=${sponsored}, inVotingWindow=${inVotingWindow}`);
+        if (!sponsored) {
+          console.log('     ⚠  Proposal NOT sponsored — submitVote will revert.');
+          console.log('        Likely cause: auto-sponsor requires deployer shares ≥ sponsorThreshold at submit time,');
+          console.log('        OR the proposal needs an explicit sponsorProposal() call before voting.');
+        } else if (!inVotingWindow) {
+          console.log('     ⚠  Not in voting window — submitVote will revert.');
+          console.log(`        Fix: increase pre-vote sleep (currently 20s) if votingStarts > chainNow,`);
+          console.log(`        or reduce it if chainNow >= votingEnds.`);
+        }
+      } catch (diagErr) {
+        console.log(`   P12 diagnostic probe failed: ${(diagErr as Error).message}`);
+      }
 
-      const totalWait = totalWaitSec; // voting + grace
-      console.log(`   Waiting ${totalWait}s...`);
-      await sleep(totalWait * 1000);
+      // Alice delegated her voting power to Bob in Phase 5b, so Bob votes instead.
+      await castVotes(daoShip, proposalId, [
+        { signer: deployer, label: 'submitVote deployer P12' },
+        { signer: bob, label: 'submitVote bob P12' },
+      ]);
 
-      await withTestRetry(() => provider.getBlockNumber(Shard.Cyprus1), 'getBlockNumber post-sleep P12');
+      await waitForProposalState(daoShip, proposalId, [5], 'ready P12', readyWaitMs);
       const processReceipt = await sendProcessProposal(
         daoShip, deployer, proposalId, proposalData, 'processProposal P12',
       );
@@ -2134,13 +4102,14 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
       console.log('\n  Verifying indexer...');
       await waitForIndexer(supabase, processBlock, 'Phase 12');
 
-      const { data: dao } = await supabase
-        .from('ds_daos')
-        .select(
-          'admin_locked, manager_locked, governor_locked, quorum_percent',
-        )
-        .eq('id', daoId)
-        .single();
+      const dao = await waitForRow<any>(
+        () => supabase
+          .from('ds_daos')
+          .select('admin_locked, manager_locked, governor_locked, quorum_percent')
+          .eq('id', daoId)
+          .single(),
+        'dao P12',
+      );
 
       expect(dao).toBeTruthy();
       expect(dao!.admin_locked).toBe(true);
@@ -2151,11 +4120,10 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
 
       // Check guild token
       const guildTokenId = `${daoId}-${quais.ZeroAddress.toLowerCase()}`;
-      const { data: guildToken } = await supabase
-        .from('ds_guild_tokens')
-        .select('*')
-        .eq('id', guildTokenId)
-        .single();
+      const guildToken = await waitForRow<any>(
+        () => supabase.from('ds_guild_tokens').select('*').eq('id', guildTokenId).single(),
+        'guildToken P12',
+      );
 
       expect(guildToken).toBeTruthy();
       expect(guildToken!.enabled).toBe(true);
@@ -2220,11 +4188,10 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
 
       // Check Alice shares in members table
       const aliceMemberId = `${daoId}-${alice.address.toLowerCase()}`;
-      const { data: aliceMember } = await supabase
-        .from('ds_members')
-        .select('shares')
-        .eq('id', aliceMemberId)
-        .single();
+      const aliceMember = await waitForRow<any>(
+        () => supabase.from('ds_members').select('shares').eq('id', aliceMemberId).single(),
+        'aliceMember P13',
+      );
 
       expect(aliceMember).toBeTruthy();
       expect(BigInt(aliceMember!.shares)).toBe(aliceSharesAfter);
@@ -2271,8 +4238,11 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
     console.log('    DelegateVotesChanged (Phase 5b)');
     console.log('\n  Exit Mechanism (1/1):');
     console.log('    Ragequit (Phase 13)');
-    console.log('\n  Navigator Events (2/2):');
+    console.log('\n  Navigator Events:');
     console.log('    Onboard (Phases 2, 3)');
+    console.log('    Timelock ChangeQueued/ChangeCancelled (Phase 11c), ChangeExecuted (Phase 11e, opt-in)');
+    console.log('    Vesting ScheduleCreated/TokensClaimed/ScheduleRevoked (Phase 11f)');
+    console.log('    GovernanceConfigSet timelock-bypass flag (Phase 11d)');
     console.log('\n  Setup (1/1):');
     console.log('    SetupComplete (Phase 1)');
     console.log('\n  Admin Operations (1/1):');
@@ -2281,17 +4251,38 @@ describe('E2E: Indexer Lifecycle Verification (Cyprus1)', () => {
     console.log('    NewPost (Phase 5c)');
 
     console.log('\n  Supabase Tables Verified:');
-    console.log('    ds_daos             - DAO records + governance params + locks');
-    console.log('    ds_members          - Member balances + shares/loot + delegation');
-    console.log('    ds_proposals        - Proposal lifecycle + votes');
-    console.log('    ds_votes            - Individual vote records');
-    console.log('    ds_navigators       - Navigator permission changes');
-    console.log('    ds_ragequits        - Ragequit records');
-    console.log('    ds_guild_tokens     - Guild token registration');
-    console.log('    ds_navigator_events - Onboard events');
-    console.log('    ds_delegations      - Delegation records');
-    console.log('    ds_records          - Poster records');
+    console.log('    ds_daos                    - DAO records + governance params + locks');
+    console.log('    ds_members                 - Member balances + shares/loot + delegation');
+    console.log('    ds_proposals               - Proposal lifecycle + votes');
+    console.log('    ds_votes                   - Individual vote records');
+    console.log('    ds_navigators              - Navigator permission changes (incl. Timelock/Vesting)');
+    console.log('    ds_ragequits               - Ragequit records');
+    console.log('    ds_guild_tokens            - Guild token registration');
+    console.log('    ds_navigator_events        - Onboard events');
+    console.log('    ds_delegations             - Delegation records');
+    console.log('    ds_records                 - Poster records');
+    console.log('    ds_timelock_changes        - Timelock queue/execute/cancel lifecycle (Phase 11c/e)');
+    console.log('    ds_vesting_schedules       - Vesting schedules + claimed (Phase 11f)');
+    console.log('    ds_vesting_claims          - Vesting claim feed (Phase 11f)');
+    console.log('    ds_governance_config_history - Config-change audit + timelock-bypass flag (Phase 11d)');
 
-    console.log('\n  All 24 events triggered, indexed, and verified.\n');
+    // ── Real outcome (no more unconditional "all verified") ──────────────
+    // failedPhases/passedPhases are populated by the onTestFinished hook in
+    // beforeEach. This Summary asserts the suite actually succeeded instead of
+    // printing a success banner regardless of what happened.
+    const total = passedPhases.length + failedPhases.length;
+    console.log(`\n  Phase results: ${passedPhases.length}/${total} passed`);
+    if (failedPhases.length > 0) {
+      console.log(`\n  ❌ ${failedPhases.length} phase(s) FAILED:`);
+      for (const name of failedPhases) console.log(`     - ${name}`);
+      console.log('\n  Not all events were verified — see failures above.\n');
+    } else {
+      console.log('\n  ✅ All triggered events were indexed and verified.\n');
+    }
+
+    expect(
+      failedPhases,
+      `Indexer E2E had ${failedPhases.length} failing phase(s): ${failedPhases.join(', ')}`,
+    ).toEqual([]);
   });
 });

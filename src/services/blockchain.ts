@@ -132,10 +132,38 @@ export class BlockchainService {
       nodeLocation: [0, 0],
     };
     if (address !== null) filter.address = address;
-    return this.withTrackedRetry(
+    const logs = await this.withTrackedRetry(
       () => this.provider.getLogs(filter as any),
       `getLogs(${fromBlock}-${toBlock})`,
     );
+
+    // U1/U6 — client-side oversize guard. Chain-wide unfiltered fetches can
+    // return huge payloads that OOM the process before handlers run. On
+    // breach throw a transient-classified error so processBlockRange can
+    // bisect the range and retry the halves. The thrown message contains
+    // "oversize response" which the processor pattern-matches on.
+    const maxLogs = config.fetch.maxLogsPerCall;
+    if (logs.length > maxLogs) {
+      throw new Error(
+        `getLogs oversize response: ${logs.length} logs exceeds FETCH_MAX_LOGS_PER_CALL=${maxLogs} ` +
+        `for range ${fromBlock}-${toBlock} — bisect required`,
+      );
+    }
+    const maxBytes = config.fetch.maxBytesPerCall;
+    let approxBytes = 0;
+    for (const log of logs) {
+      approxBytes += log.topics.length * 32;
+      const dataHex = log.data ?? '0x';
+      approxBytes += Math.max(0, (dataHex.length - 2) / 2);
+      // Short-circuit once we've exceeded the cap — no need to sum the tail.
+      if (approxBytes > maxBytes) {
+        throw new Error(
+          `getLogs oversize response: approx ${approxBytes} bytes exceeds FETCH_MAX_BYTES_PER_CALL=${maxBytes} ` +
+          `for range ${fromBlock}-${toBlock} — bisect required`,
+        );
+      }
+    }
+    return logs;
   }
 
   async getTransaction(hash: string): Promise<TransactionResponse | null> {

@@ -17,6 +17,11 @@ export class ContractRegistry {
   /** Token address → DaoShip address */
   private tokenToDaoMap: Map<string, string> = new Map();
 
+  /** Vault/avatar address → DaoShip address. Powers the BudgetNavigator vault-module
+   *  watch: EnabledModule/DisabledModule are emitted by the vault (avatar), and the
+   *  only authenticated way to tie that grant to a DAO is emitter == that DAO's avatar. */
+  private avatarToDaoMap: Map<string, string> = new Map();
+
   /** Navigator addresses to fetch logs from */
   private navigators: Set<string> = new Set();
 
@@ -46,9 +51,10 @@ export class ContractRegistry {
         { daoShip, oldShares: existing.sharesAddress, newShares, oldLoot: existing.lootAddress, newLoot },
         'DAO re-registered with different addresses',
       );
-      // Remove stale token mappings before adding updated ones
+      // Remove stale token + avatar mappings before adding updated ones
       this.tokenToDaoMap.delete(existing.sharesAddress);
       this.tokenToDaoMap.delete(existing.lootAddress);
+      this.avatarToDaoMap.delete(existing.avatar);
     }
 
     this.daos.set(daoShip, {
@@ -59,6 +65,7 @@ export class ContractRegistry {
     });
     this.tokenToDaoMap.set(newShares, daoShip);
     this.tokenToDaoMap.set(newLoot, daoShip);
+    this.avatarToDaoMap.set(newAvatar, daoShip);
   }
 
   getDaoByDaoShipAddress(address: string): DaoRegistryEntry | undefined {
@@ -67,6 +74,12 @@ export class ContractRegistry {
 
   getDaoByTokenAddress(tokenAddress: string): string | undefined {
     return this.tokenToDaoMap.get(tokenAddress.toLowerCase());
+  }
+
+  /** Vault/avatar address → DaoShip address. Used to authenticate vault-emitted
+   *  EnabledModule/DisabledModule events (emitter must be a known DAO's avatar). */
+  getDaoByAvatarAddress(avatarAddress: string): string | undefined {
+    return this.avatarToDaoMap.get(avatarAddress.toLowerCase());
   }
 
   isSharesToken(tokenAddress: string): boolean {
@@ -108,6 +121,7 @@ export class ContractRegistry {
   clear(): void {
     this.daos.clear();
     this.tokenToDaoMap.clear();
+    this.avatarToDaoMap.clear();
     this.navigators.clear();
     this.navigatorToDaoMap.clear();
   }

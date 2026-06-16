@@ -5,6 +5,7 @@ import {
 } from '../../../src/handlers/launcher.js';
 import {
   DAOSHIP, SHARES, LOOT, AVATAR, LAUNCHER, TX_HASH,
+  VAULT_LAUNCHER_ADDR, DAOSHIP_LAUNCHER_ADDR,
   makeCtx, makeMockDb, makeMockRegistry,
 } from './helpers.js';
 
@@ -16,7 +17,7 @@ describe('handleLaunchDAOShipAndVault', () => {
   it('registers the DAO in registry and upserts to DB', async () => {
     const db = makeMockDb();
     const registry = makeMockRegistry();
-    const ctx = makeCtx({ db, registry });
+    const ctx = makeCtx({ db, registry, log: { address: VAULT_LAUNCHER_ADDR } });
 
     await handleLaunchDAOShipAndVault(ctx, {
       daoShip: DAOSHIP,
@@ -47,7 +48,7 @@ describe('handleLaunchDAOShipAndVault', () => {
 
   it('sets new_vault=false when newVault=false', async () => {
     const db = makeMockDb();
-    const ctx = makeCtx({ db });
+    const ctx = makeCtx({ db, log: { address: VAULT_LAUNCHER_ADDR } });
 
     await handleLaunchDAOShipAndVault(ctx, {
       daoShip: DAOSHIP, vault: AVATAR, shares: SHARES, loot: LOOT,
@@ -59,7 +60,7 @@ describe('handleLaunchDAOShipAndVault', () => {
 
   it('zeros out governance params in initial upsert', async () => {
     const db = makeMockDb();
-    const ctx = makeCtx({ db });
+    const ctx = makeCtx({ db, log: { address: VAULT_LAUNCHER_ADDR } });
 
     await handleLaunchDAOShipAndVault(ctx, {
       daoShip: DAOSHIP, vault: AVATAR, shares: SHARES, loot: LOOT,
@@ -78,9 +79,25 @@ describe('handleLaunchDAOShipAndVault', () => {
   });
 
   it('throws on missing required arg', async () => {
-    const ctx = makeCtx({});
+    const ctx = makeCtx({ log: { address: VAULT_LAUNCHER_ADDR } });
     await expect(handleLaunchDAOShipAndVault(ctx, { daoShip: DAOSHIP, vault: AVATAR, shares: SHARES, loot: LOOT }))
       .rejects.toThrow('Missing required field "launcher"');
+  });
+
+  it('drops events from unauthorized emitters (U2)', async () => {
+    const db = makeMockDb();
+    const registry = makeMockRegistry();
+    // Some arbitrary non-launcher contract
+    const ctx = makeCtx({ db, registry, log: { address: '0x000000000000000000000000000000000000bEEF' } });
+
+    await handleLaunchDAOShipAndVault(ctx, {
+      daoShip: DAOSHIP, vault: AVATAR, shares: SHARES, loot: LOOT,
+      newVault: true, launcher: LAUNCHER,
+    });
+
+    // Nothing was registered or written.
+    expect(registry.registerDao).not.toHaveBeenCalled();
+    expect(db.upsertDao).not.toHaveBeenCalled();
   });
 });
 
@@ -93,7 +110,7 @@ describe('handleLaunchDAOShip', () => {
     const db = makeMockDb();
     const registry = makeMockRegistry();
     registry.getDaoByDaoShipAddress.mockReturnValue(undefined); // not already registered
-    const ctx = makeCtx({ db, registry });
+    const ctx = makeCtx({ db, registry, log: { address: DAOSHIP_LAUNCHER_ADDR } });
 
     await handleLaunchDAOShip(ctx, {
       daoShip: DAOSHIP, shares: SHARES, loot: LOOT,
@@ -116,7 +133,7 @@ describe('handleLaunchDAOShip', () => {
     const registry = makeMockRegistry();
     // Already registered — simulate pre-existing entry
     registry.getDaoByDaoShipAddress.mockReturnValue({ daoShipAddress: DAOSHIP });
-    const ctx = makeCtx({ db, registry });
+    const ctx = makeCtx({ db, registry, log: { address: DAOSHIP_LAUNCHER_ADDR } });
 
     await handleLaunchDAOShip(ctx, {
       daoShip: DAOSHIP, shares: SHARES, loot: LOOT,
@@ -128,8 +145,37 @@ describe('handleLaunchDAOShip', () => {
   });
 
   it('throws on missing required arg', async () => {
-    const ctx = makeCtx({});
+    const ctx = makeCtx({ log: { address: DAOSHIP_LAUNCHER_ADDR } });
     await expect(handleLaunchDAOShip(ctx, { daoShip: DAOSHIP, shares: SHARES, loot: LOOT, avatar: AVATAR }))
       .rejects.toThrow('Missing required field "launcher"');
+  });
+
+  it('accepts events from DAOShipAndVaultLauncher (internal call-through)', async () => {
+    const db = makeMockDb();
+    const registry = makeMockRegistry();
+    registry.getDaoByDaoShipAddress.mockReturnValue(undefined);
+    const ctx = makeCtx({ db, registry, log: { address: VAULT_LAUNCHER_ADDR } });
+
+    await handleLaunchDAOShip(ctx, {
+      daoShip: DAOSHIP, shares: SHARES, loot: LOOT,
+      avatar: AVATAR, launcher: LAUNCHER,
+    });
+
+    expect(db.upsertDao).toHaveBeenCalled();
+  });
+
+  it('drops events from unauthorized emitters (U2)', async () => {
+    const db = makeMockDb();
+    const registry = makeMockRegistry();
+    registry.getDaoByDaoShipAddress.mockReturnValue(undefined);
+    const ctx = makeCtx({ db, registry, log: { address: '0x000000000000000000000000000000000000bEEF' } });
+
+    await handleLaunchDAOShip(ctx, {
+      daoShip: DAOSHIP, shares: SHARES, loot: LOOT,
+      avatar: AVATAR, launcher: LAUNCHER,
+    });
+
+    expect(registry.registerDao).not.toHaveBeenCalled();
+    expect(db.upsertDao).not.toHaveBeenCalled();
   });
 });

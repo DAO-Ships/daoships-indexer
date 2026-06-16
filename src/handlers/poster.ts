@@ -1,8 +1,11 @@
 import { Interface, Indexed, id as keccak256 } from 'quais';
 import type { EventContext } from './index.js';
+import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { makeMemberId } from '../utils/addresses.js';
 import { validateEventArgs, validateAndNormalizeAddress } from '../utils/validation.js';
+
+import { reconcileSanctionedNavigators, makePollPk } from './signal.js';
 
 import PosterAbi from '../abis/Poster.json' with { type: 'json' };
 
@@ -31,17 +34,19 @@ async function determineTrustLevel(
   user: string,
   daoId: string,
   tag: string,
-  // M7: Accept pre-fetched DAO to avoid redundant DB call when caller already has it
-  prefetchedDao?: Awaited<ReturnType<typeof ctx.db.getDao>>,
 ): Promise<{ trust: TrustLevel; dao: Awaited<ReturnType<typeof ctx.db.getDao>> }> {
-  const dao = prefetchedDao ?? await ctx.db.getDao(daoId);
+  // RangeCache deduplicates the getDao read across the handler's own
+  // earlier `fetchDao(candidate)` and this call (M7's `prefetchedDao`
+  // param is no longer needed).
+  const dao = await ctx.cache.fetchDao(daoId, () => ctx.db.getDao(daoId));
   if (!dao) return { trust: 'UNTRUSTED', dao: null };
   if (user === dao.avatar) return { trust: 'VERIFIED', dao };
   if (user === dao.deployer && tag === 'daoships.dao.profile.initial') return { trust: 'VERIFIED_INITIAL', dao };
   if (user === dao.id) return { trust: 'VERIFIED', dao };
   const navigatorDaoId = ctx.registry.getDaoByNavigatorAddress(user);
   if (navigatorDaoId === daoId) return { trust: 'SEMI_TRUSTED', dao };
-  const member = await ctx.db.getMember(makeMemberId(daoId, user));
+  const memberId = makeMemberId(daoId, user);
+  const member = await ctx.cache.fetchMember(memberId, () => ctx.db.getMember(memberId));
   if (member && BigInt(member.shares || '0') > 0n) return { trust: 'MEMBER', dao };
   return { trust: 'UNTRUSTED', dao };
 }
@@ -66,6 +71,13 @@ const TAG_DEFINITIONS: TagDefinition[] = [
   { tag: 'daoships.member.profile', minTrust: 'MEMBER', updatesDao: false },
   { tag: 'daoships.proposal.vote.reason', minTrust: 'MEMBER', updatesDao: false },
   { tag: 'daoships.navigator.allowlist', minTrust: 'MEMBER', updatesDao: false },
+  // Vault-authenticated allowlist of sanctioned read-only navigators. VERIFIED =
+  // msg.sender == dao.avatar. Grants no permission — purely a trust/display signal.
+  { tag: 'daoships.dao.navigators', minTrust: 'VERIFIED', updatesDao: false },
+  // SignalNavigator poll option labels. minTrust here is a placeholder — this tag is fully
+  // special-cased (like navigator.allowlist) and BYPASSES the meetsMinTrust DAO-rank gate; the
+  // real gate is msg.sender == PollCreated.creator, enforced in applySignalPollLabels.
+  { tag: 'daoships.signal.poll', minTrust: 'UNTRUSTED', updatesDao: false },
 ];
 
 for (const def of TAG_DEFINITIONS) {
@@ -79,6 +91,8 @@ const TAG_VALIDATORS: Record<string, ContentValidator> = {
   'daoships.member.profile': validateMemberProfile,
   'daoships.proposal.vote.reason': validateVoteReason,
   'daoships.navigator.allowlist': validateNavigatorAllowlist,
+  'daoships.dao.navigators': validateDaoNavigators,
+  'daoships.signal.poll': validateSignalPoll,
 };
 
 // ── Helpers ─────────────────────────────────────────────────────
@@ -151,6 +165,32 @@ function linksObj(v: unknown, maxUrlLen: number): Record<string, string> | undef
       result[key] = url;
       count++;
     }
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+// daoships.dao.profile `theme` palette (schema 1.1+). Strict 3- or 6-digit hex only.
+const HEX_COLOR_RE = /^#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})$/;
+const THEME_COLOR_KEYS = ['primary', 'secondary', 'accent', 'background', 'surface', 'text'] as const;
+
+/**
+ * Validate the DAO-profile `theme` color palette. **Security boundary** (POSTER.md → Security:
+ * Content Rendering, rule 7): every theme color is a CSS-injection vector — a frontend that
+ * interpolates a posted color into a `style` attribute / stylesheet / CSS variable could be fed
+ * `#fff; } body { background: url(...)` to inject arbitrary rules. We therefore accept ONLY values
+ * matching the strict hex regex per color and constrain `mode` to the literals 'light'/'dark';
+ * every non-conforming token is DROPPED (the frontend falls back to its default). We read from a
+ * FIXED key allowlist, so unknown/attacker-supplied keys never reach content_json. Replaced as a
+ * whole, like `links` — no per-token deep merge.
+ */
+function themeObj(v: unknown): Record<string, string> | undefined {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
+  const obj = v as Record<string, unknown>;
+  const result: Record<string, string> = {};
+  if (obj.mode === 'light' || obj.mode === 'dark') result.mode = obj.mode;
+  for (const key of THEME_COLOR_KEYS) {
+    const raw = obj[key];
+    if (typeof raw === 'string' && HEX_COLOR_RE.test(raw)) result[key] = raw;
   }
   return Object.keys(result).length > 0 ? result : undefined;
 }
@@ -245,14 +285,14 @@ function validateDaoProfileInitial(p: Record<string, unknown>): Record<string, u
   const description = str(p.description, 1000);
   if (!daoAddress || !name || !description) return null; // all required for initial
   if (!ETH_ADDRESS_RE.test(daoAddress)) return null;
-  return clean({ daoAddress, name, description, avatar: urlStr(p.avatar, 2048), banner: urlStr(p.banner, 2048), links: linksObj(p.links, 2048), tags: strArray(p.tags, 20, 50), chainId: num(p.chainId), schemaVersion: str(p.schemaVersion, 10) });
+  return clean({ daoAddress, name, description, avatar: urlStr(p.avatar, 2048), banner: urlStr(p.banner, 2048), links: linksObj(p.links, 2048), theme: themeObj(p.theme), tags: strArray(p.tags, 20, 50), chainId: num(p.chainId), schemaVersion: str(p.schemaVersion, 10) });
 }
 
 function validateDaoProfile(p: Record<string, unknown>): Record<string, unknown> | null {
   const daoAddress = str(p.daoAddress, 42);
   if (!daoAddress) return null; // only daoAddress required — supports partial updates
   if (!ETH_ADDRESS_RE.test(daoAddress)) return null;
-  return clean({ daoAddress, name: str(p.name, 100), description: str(p.description, 1000), avatar: urlStr(p.avatar, 2048), banner: urlStr(p.banner, 2048), links: linksObj(p.links, 2048), tags: strArray(p.tags, 20, 50), chainId: num(p.chainId), schemaVersion: str(p.schemaVersion, 10) });
+  return clean({ daoAddress, name: str(p.name, 100), description: str(p.description, 1000), avatar: urlStr(p.avatar, 2048), banner: urlStr(p.banner, 2048), links: linksObj(p.links, 2048), theme: themeObj(p.theme), tags: strArray(p.tags, 20, 50), chainId: num(p.chainId), schemaVersion: str(p.schemaVersion, 10) });
 }
 
 function validateDaoAnnouncement(p: Record<string, unknown>): Record<string, unknown> | null {
@@ -337,6 +377,140 @@ function validateNavigatorAllowlist(p: Record<string, unknown>): Record<string, 
 }
 
 /**
+ * daoships.dao.navigators — the DAO's COMPLETE sanctioned read-only-navigator set.
+ * The `navigators` array is canonical (full set, not a delta); an empty array clears
+ * all sanctions. Each entry needs a valid hex address; `type` is an optional hint
+ * sanity-checked downstream against the on-chain navigator_type. Trust (msg.sender ==
+ * vault) is enforced by the VERIFIED tag gate in handleNewPost, not here.
+ */
+function validateDaoNavigators(p: Record<string, unknown>): Record<string, unknown> | null {
+  const daoAddress = str(p.daoAddress, 42);
+  if (!daoAddress || !ETH_ADDRESS_RE.test(daoAddress)) return null;
+  if (!Array.isArray(p.navigators)) return null; // required; [] is valid (clears all)
+
+  const navigators = (p.navigators as unknown[]).slice(0, 200)
+    .map((n): Record<string, unknown> | null => {
+      if (!n || typeof n !== 'object' || Array.isArray(n)) return null;
+      const rec = n as Record<string, unknown>;
+      const address = str(rec.address, 42);
+      if (!address || !ETH_ADDRESS_RE.test(address)) return null;
+      const type = str(rec.type, 50);
+      return clean({ address: address.toLowerCase(), type });
+    })
+    .filter((n): n is Record<string, unknown> => n !== null);
+
+  return clean({
+    daoAddress: daoAddress.toLowerCase(),
+    navigators,
+    schemaVersion: str(p.schemaVersion, 10),
+  });
+}
+
+/** Parse a per-navigator pollId into a canonical decimal string (matches signal.ts bigintToString). */
+function pollIdStr(v: unknown): string | undefined {
+  try {
+    let b: bigint;
+    if (typeof v === 'bigint') b = v;
+    else if (typeof v === 'number' && Number.isInteger(v)) b = BigInt(v);
+    else if (typeof v === 'string' && /^[0-9]+$/.test(v)) b = BigInt(v);
+    else return undefined;
+    return b >= 0n ? b.toString() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// SignalNavigator option-count bounds (contract MIN_OPTIONS..MAX_OPTIONS).
+const SIGNAL_MIN_OPTIONS = 2;
+const SIGNAL_MAX_OPTIONS = 10;
+
+/**
+ * daoships.signal.poll — off-chain option labels for a SignalNavigator poll. The contract stores
+ * only optionCount; this post carries the index→label map (+ optional description / discussionUrl).
+ * `options` is an ordered map, so a single empty/invalid label invalidates the whole post (dropping
+ * one entry would shift every later index). The on-chain optionCount match and the creator-identity
+ * trust gate are enforced at apply time (applySignalPollLabels), not here.
+ */
+function validateSignalPoll(p: Record<string, unknown>): Record<string, unknown> | null {
+  const daoAddress = str(p.daoAddress, 42);
+  const navigatorAddress = str(p.navigatorAddress, 42);
+  if (!daoAddress || !ETH_ADDRESS_RE.test(daoAddress)) return null;
+  if (!navigatorAddress || !ETH_ADDRESS_RE.test(navigatorAddress)) return null;
+
+  const pollId = pollIdStr(p.pollId);
+  if (pollId === undefined) return null;
+
+  if (!Array.isArray(p.options)) return null;
+  if (p.options.length < SIGNAL_MIN_OPTIONS || p.options.length > SIGNAL_MAX_OPTIONS) return null;
+  const options: string[] = [];
+  for (const item of p.options) {
+    const label = str(item, 200);
+    if (label === undefined) return null; // empty/invalid label would shift indices — reject post
+    options.push(label);
+  }
+
+  return clean({
+    daoAddress: daoAddress.toLowerCase(),
+    navigatorAddress: navigatorAddress.toLowerCase(),
+    pollId,
+    options,
+    description: str(p.description, 1000),
+    discussionUrl: urlStr(p.discussionUrl, 2048),
+    schemaVersion: str(p.schemaVersion, 10),
+  });
+}
+
+/**
+ * Apply daoships.signal.poll labels to a materialized poll row. Gates (all → discard on fail):
+ *   1. poll row exists (else out-of-flow unsanctioned poll — discard, do not hold; §3 of plan)
+ *   2. msg.sender == PollCreated.creator (the trust gate — wrong wallet is spam)
+ *   3. poll not cancelled and not ended at the post's block timestamp (ignore late edits)
+ *   4. options.length == on-chain option_count (else frontend renders numeric Option 1..n)
+ * applyPollLabels itself adds the last-write-wins-by-block guard.
+ */
+async function applySignalPollLabels(
+  ctx: EventContext,
+  user: string,
+  validated: Record<string, unknown>,
+): Promise<void> {
+  const navigatorAddress = String(validated.navigatorAddress).toLowerCase();
+  const pollId = String(validated.pollId);
+  const pollPk = makePollPk(navigatorAddress, pollId);
+
+  const poll = await ctx.db.getSignalPoll(pollPk);
+  if (!poll) {
+    logger.debug({ navigatorAddress, pollId }, 'signal.poll: poll not materialized — discarding labels (not held)');
+    return;
+  }
+  if (user.toLowerCase() !== poll.creator.toLowerCase()) {
+    logger.warn({ navigatorAddress, pollId, user, creator: poll.creator }, 'signal.poll: sender is not poll creator — discarding');
+    return;
+  }
+  if (poll.cancelled || ctx.blockTimestamp >= poll.voting_ends) {
+    logger.debug({ navigatorAddress, pollId }, 'signal.poll: poll cancelled/ended — ignoring late labels');
+    return;
+  }
+  const options = validated.options as string[];
+  if (options.length !== poll.option_count) {
+    logger.warn(
+      { navigatorAddress, pollId, got: options.length, want: poll.option_count },
+      'signal.poll: options length != option_count — discarding (frontend renders numeric)',
+    );
+    return;
+  }
+
+  const now = new Date(ctx.blockTimestamp * 1000).toISOString();
+  await ctx.db.applyPollLabels(pollPk, {
+    options,
+    description: (validated.description as string | undefined) ?? null,
+    discussionUrl: (validated.discussionUrl as string | undefined) ?? null,
+    labelsUpdatedAt: now,
+    labelsBlockNumber: ctx.log.blockNumber,
+  });
+  logger.info({ navigatorAddress, pollId, optionCount: options.length }, 'signal.poll: option labels applied');
+}
+
+/**
  * Extract DAO metadata updates from validated poster content.
  * Supports merge semantics per POSTER.md:
  * - Field present with value → set field
@@ -380,6 +554,16 @@ export async function handleNewPost(
   ctx: EventContext,
   args: Record<string, unknown>,
 ): Promise<void> {
+  // U2: Under unfiltered topic0 mode any contract can emit NewPost. Our
+  // Poster is a single global contract (config.contracts.poster) — drop
+  // events from any other emitter. This closes the orphan-spam vector
+  // that would otherwise exist alongside the H1 allowlist trust chain.
+  const emitter = ctx.log.address.toLowerCase();
+  if (emitter !== config.contracts.poster) {
+    logger.warn({ emitter }, 'NewPost from unauthorized address — dropping');
+    return;
+  }
+
   validateEventArgs(args, ['user', 'content', 'tag'], 'NewPost');
   const user = validateAndNormalizeAddress(args.user, 'user');
   const content: string = String(args.content);
@@ -429,6 +613,7 @@ export async function handleNewPost(
   // ── Determine DAO + Trust ──────────────────────────────────────
 
   const isNavigatorAllowlist = tagName === 'daoships.navigator.allowlist';
+  const isSignalPoll = tagName === 'daoships.signal.poll';
   let daoId: string | null = null;
   let trustLevel: TrustLevel = 'UNTRUSTED';
   let trustDao: Awaited<ReturnType<typeof ctx.db.getDao>> = null;
@@ -465,13 +650,32 @@ export async function handleNewPost(
       { user, daoAddress: claimedDao, navigatorAddress: navAddr, trustLevel },
       'navigator.allowlist: verified against indexed navigator metadata',
     );
+  } else if (isSignalPoll) {
+    // ── Signal poll labels: creator-identity trust, NOT DAO rank ──
+    // Validate, resolve the claimed DAO (must be one we index), and record at MEMBER trust
+    // (the creator provably held shares at createPoll — SignalNavigator gates on voting power).
+    // The real creator-match gate runs later in applySignalPollLabels.
+    const validator = TAG_VALIDATORS[tagName];
+    preValidated = validator ? validator(parsed) : null;
+    if (!preValidated) {
+      logger.warn({ user, tagHash, tagName }, 'signal.poll: schema validation failed, skipping');
+      return;
+    }
+    const candidate = String(preValidated.daoAddress).toLowerCase();
+    const dao = await ctx.cache.fetchDao(candidate, () => ctx.db.getDao(candidate));
+    if (!dao) {
+      logger.warn({ user, tagName, daoAddress: candidate }, 'signal.poll: unknown DAO, skipping');
+      return;
+    }
+    daoId = candidate;
+    trustLevel = 'MEMBER';
   } else {
     // ── Normal path for all other tags ─────────────────────────
 
     if (parsed?.daoAddress) {
       const candidate = String(parsed.daoAddress).toLowerCase();
       // DB errors propagate — processor retries the block range
-      const dao = await ctx.db.getDao(candidate);
+      const dao = await ctx.cache.fetchDao(candidate, () => ctx.db.getDao(candidate));
       if (dao) {
         daoId = candidate;
       }
@@ -497,7 +701,7 @@ export async function handleNewPost(
   // For navigator.allowlist, preValidated was already computed above — reuse it.
 
   let validatedJson: Record<string, unknown> | null = parsed;
-  if (isNavigatorAllowlist && preValidated) {
+  if ((isNavigatorAllowlist || isSignalPoll) && preValidated) {
     validatedJson = preValidated;
   } else {
     try {
@@ -548,6 +752,7 @@ export async function handleNewPost(
         if (Object.keys(updates).length > 0) {
           updates.profile_source = 'launcher';
           await ctx.db.updateDao(daoId, updates);
+          ctx.cache.invalidateDao(daoId);
           logger.info({ daoId, updates }, 'DAO initial profile set from launcher');
         }
         break;
@@ -560,6 +765,7 @@ export async function handleNewPost(
         if (Object.keys(updates).length > 0) {
           updates.profile_source = 'vault';
           await ctx.db.updateDao(daoId, updates);
+          ctx.cache.invalidateDao(daoId);
           logger.info({ daoId, updates }, 'DAO profile updated from vault');
         }
         break;
@@ -569,6 +775,28 @@ export async function handleNewPost(
         const navAddr = (validatedJson.navigatorAddress as string)?.toLowerCase();
         const addrCount = Array.isArray(validatedJson.addresses) ? validatedJson.addresses.length : 0;
         logger.info({ daoId, navigatorAddress: navAddr, addressCount: addrCount }, 'Navigator allowlist indexed');
+        break;
+      }
+
+      case 'daoships.dao.navigators': {
+        if (!daoId) break; // VERIFIED path always sets daoId, but guard for the type-narrowing
+        // VERIFIED gate above already proved msg.sender == vault. Reconcile the DAO's
+        // full sanctioned read-only set: sanction listed (+ backfill), de-sanction omitted,
+        // hold intents for not-yet-seen addresses. Empty/absent array clears all sanctions.
+        const listed = Array.isArray(validatedJson.navigators)
+          ? (validatedJson.navigators as Array<{ address: string; type?: string }>)
+          : [];
+        await reconcileSanctionedNavigators(ctx, daoId, user, listed);
+        logger.info({ daoId, sanctionedCount: listed.length }, 'DAO sanctioned-navigator list reconciled');
+        break;
+      }
+
+      case 'daoships.signal.poll': {
+        if (!daoId) break; // signal.poll path always sets daoId, but guard for type-narrowing
+        // Creator-match + length + not-expired gates live in the helper; the ds_records audit
+        // row above is already written (so the post is always traceable) even if labels are
+        // discarded here.
+        await applySignalPollLabels(ctx, user, validatedJson);
         break;
       }
 

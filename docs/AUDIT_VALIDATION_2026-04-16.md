@@ -22,13 +22,17 @@ at the bottom.
 
 Verification:
 - `npm run typecheck` — clean.
-- `npm run test:run` — 266 unit tests pass (added 34 net new across the
+- `npm run test:run` — 306 unit tests pass (added 74 net new across the
   cycle: schema whitelist, `requires_full_reindex` wiring,
   `BlockProcessor.clearCaches`, allowlist root caching at
   `NavigatorDeployed`, DB-indexed allowlist verification,
   discovery-pass overflow throw, `pruneProcessedLogs` guard,
-  insert-if-absent stubs for vote/ragequit, and a new
-  `processor.test.ts` covering `BlockProcessor` end-to-end).
+  insert-if-absent stubs for vote/ragequit,
+  `processor.test.ts` covering `BlockProcessor` end-to-end,
+  `contract-registry.test.ts` covering the registry module, and
+  `database-methods.test.ts` covering VALID_TABLES allowlist, H1
+  `getNavigatorByAddress`, E1 insert-if-absent wiring, and address
+  validation).
 - E2E tests deliberately skipped per scope.
 
 ---
@@ -1117,10 +1121,9 @@ Recommended remediation: defer pending measurement.
 
 ---
 
-### A4 — Test coverage gaps (processor.test.ts)
+### A4 — Test coverage gaps
 
-**Status: FIXED (2026-04-16) for processor.ts; database.ts and
-contract-registry.ts gaps remain.**
+**Status: FIXED (2026-04-16).**
 
 Confirmed missing unit tests for `processor.ts`, `database.ts`,
 `contract-registry.ts`. All three are testable with mocks. Architect's
@@ -1138,10 +1141,36 @@ Remediation: `test/unit/processor.test.ts` added — 15 tests covering:
   deterministic errors logged and skipped without aborting the range
 - block-hash return: cached, fallback-fetch, and fallback-failure paths
 
-Still-missing coverage (outside this cycle's scope): `database.ts`
-(partially covered by `database-reindex-flag.test.ts` and
-`database-prune-guard.test.ts`) and `contract-registry.ts` (zero unit
-coverage).
+Remaining files added in this cycle:
+
+- `test/unit/contract-registry.test.ts` — 20 tests covering
+  `registerDao` (fresh, idempotent, token-re-map), `getDaoByTokenAddress`,
+  `isSharesToken`, navigator register/unregister/re-register,
+  `clear()` idempotency + post-clear re-registration, address case
+  normalization, counters.
+- `test/unit/database-methods.test.ts` — 20 tests covering:
+  - `VALID_TABLES` allowlist enforcement on generic `upsert()` /
+    `insert()` (SQL-injection defense): rejects unknown tables,
+    typed-table names, and pg_catalog/DROP-TABLE injection attempts.
+    Accepts each whitelisted table.
+  - `insert()` ignoring `23505` duplicate-key errors (retry
+    idempotency contract).
+  - H1 `getNavigatorByAddress` return shape, null-on-miss,
+    invalid-address pre-check, DB-error propagation.
+  - E1 `insertProposalIfAbsent` / `insertMemberIfAbsent` boolean
+    wiring (true on insert, false on conflict), `ignoreDuplicates`
+    option passed through, error propagation.
+  - Address + bytes32 validation on `upsertDao`, `getDao`,
+    `updateDao`, `recordEventTransaction` inputs.
+
+Residual coverage gaps:
+
+- `blockchain.ts` — thin wrapper around `quais.JsonRpcProvider`; unit
+  testing mostly validates the mock layer. Lower ROI.
+- `health.ts` — HTTP server + rate limiting; integration testing
+  (via a dev server) would be more valuable than unit tests.
+- Iterator methods (`getAllDaosIterator`, `getActiveNavigatorsIterator`)
+  — exercised via e2e and existing handler tests indirectly.
 
 ---
 
@@ -1176,18 +1205,31 @@ the improvement. A9 (graceful shutdown) is well-designed.
 - **SU2** — Lock handler family collapsed via `makeLockHandler`.
 - **E1** — `handleSubmitVote` and `handleRagequit` use parallel
   `insertProposalIfAbsent` / `insertMemberIfAbsent` (no pre-reads).
-- **A4 (partial)** — `processor.test.ts` added with 15 tests covering
-  `BlockProcessor.processBlockRange` end-to-end.
+- **A4** — `processor.test.ts` (15 tests) +
+  `contract-registry.test.ts` (20 tests) +
+  `database-methods.test.ts` (20 tests) — covers all three files that
+  were untested pre-cycle.
 
 ### Tier 1 — Do next (high value, low risk)
 1. Document `CONFIRMATION_BLOCKS ≥ 5` as mainnet minimum (already the
    value in `.env.mainnet.example`; just needs a README note).
 
 ### Tier 2 — Do this quarter
-6. **Top-5 #1** — batch `markLogProcessed` to end-of-range; pre-fetch
-   members referenced in batch.
-7. **A4 remainder** — add unit tests for `contract-registry.ts` and
-   round out `database.ts` coverage beyond the M2/SC7 spot tests.
+6. **Top-5 #1 — Options A AND B SHIPPED (2026-04-18).**
+   - Option A: lazy per-range `RangeCache` for members + DAOs, scoped
+     to `processBlockRange`, with `fetchMember`/`fetchDao` read-through
+     helpers and invalidate-on-write. Pre-existing self-transfer
+     balance bug found and fixed in the same cycle.
+   - Option B: handler idempotency refactor (`ds_apply_transfer` RPC
+     replaces client-side balance math) + end-of-range batched writes
+     (dirty-DAO recompute, batched `markLogProcessed`). Delta-based
+     `adjustDaoTotals` removed from the Option B handler path; kept
+     for reorg recovery only.
+   - Combined with unfiltered topic0 fetching (A3 / SC1), the
+     realistic DAO ceiling moves from ~1,000 to ~15,000–20,000.
+   - See `docs/PERF_BATCH_DB_ROUNDTRIPS.md` §0.4 (unfiltered) and
+     §0.5 (Option B) for full changelogs, schema migrations, and
+     security mitigations (Security Engineer B1–B7 all addressed).
 
 ### Tier 3 — Measure before committing
 10. **Top-5 #2** — revisit only after a proposal exceeds ~1k votes.
@@ -1220,7 +1262,7 @@ the improvement. A9 (graceful shutdown) is well-designed.
 | SU1 (mint/burn duplication) | **FIXED 2026-04-16** | `makeMintBurnHandler` factory |
 | SU2 (lock duplication) | **FIXED 2026-04-16** | `makeLockHandler` factory |
 | E1 (SubmitVote pre-reads) | **FIXED 2026-04-16** | Parallel insert-if-absent; ~1 RTT saved per vote |
-| A4 (processor.test.ts) | **FIXED 2026-04-16** | 15 tests covering processBlockRange end-to-end |
+| A4 (processor / registry / database tests) | **FIXED 2026-04-16** | 55 tests covering BlockProcessor, ContractRegistry, and DB security/H1/E1 paths |
 | Top-5 #2 (delta rewrite) | Wrong fix | Delta model fails under partial handler failure |
 | Top-5 #3 (scan) | Overstated | First page is small; still worth lazy-fetch |
 | Top-5 #4 (reorg fn) | Overstated | Current reorg scope is ≤1 DAO; latent only |
@@ -1281,8 +1323,13 @@ Files touched:
 - `test/unit/handlers/helpers.ts` — added `insertProposalIfAbsent` /
   `insertMemberIfAbsent` mocks.
 - `test/unit/processor.test.ts` — new file, 15 tests for A4.
+- `test/unit/contract-registry.test.ts` — new file, 20 tests for A4
+  (register, unregister, token/navigator lookup, counters, clear).
+- `test/unit/database-methods.test.ts` — new file, 20 tests for A4
+  (VALID_TABLES allowlist, H1 `getNavigatorByAddress`, E1
+  insert-if-absent wiring, duplicate-key ignoring, input validation).
 
-Test summary: 266 unit tests pass (was 232 pre-remediation; +34 net new).
+Test summary: 306 unit tests pass (was 232 pre-remediation; +74 net new).
 No e2e run in this cycle.
 
 ### Schema migration required

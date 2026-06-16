@@ -1,0 +1,357 @@
+{
+  "rpcUrl": "https://rpc.quai.network",
+  "fromBlock": 7531240,
+  "toBlock": 7531740,
+  "shard": "0x00",
+  "measuredAt": "2026-04-19T01:58:28.060Z",
+  "results": [
+    {
+      "topic0": "0x5cf1117b4be37c1a522244bc5a86df3b5dad887e6e80f5fdf90c95f9e3b644ab",
+      "eventNames": [
+        "LaunchDAOShipAndVault"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0x8c84e99a067c9c9e2396366294b9c392ee1a1e87178f63facacecb7546293125",
+      "eventNames": [
+        "LaunchDAOShip"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0xe5ec0cd0edd4c0386ae827ce2a09a194dfb494e2747d9f7337dc3297a3b9c3e1",
+      "eventNames": [
+        "SetupComplete"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0x961e075e213f92c9eb301ddcf7137208ffd220f0ef6b19f44c4cc96055b7682c",
+      "eventNames": [
+        "SubmitProposal"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0xa712e6c3feb763b9dbc8f2ac800e087f7e9eee02518eafbf6fb8f83095989ab0",
+      "eventNames": [
+        "SponsorProposal"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0x786755545a7e27c12c90cc7f0934514d03fdacfe3684a340b8c4100531e7ecd5",
+      "eventNames": [
+        "SubmitVote"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0x34eb4233b3f96cc2a4bc5a6026a0f4e2eccfc6254b2fbdc26e118fdb078f4cf6",
+      "eventNames": [
+        "ProcessProposal"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0xc215fed6680bb02d323dc3f8b8f85241572607538426059c9232601bd293c3be",
+      "eventNames": [
+        "CancelProposal"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0xc1cca88bd6e0e30a227efc5c385310969110f38b5747bbdfacd4464e8b192406",
+      "eventNames": [
+        "Ragequit"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0x01f2a472a2f42d2297f8f40fe7d199ae37136ed434e85021d3a47ab579c326ef",
+      "eventNames": [
+        "NavigatorSet"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0x41d0389fb39b1ad307d59d49d882982fba8a556e09e2110f6e4899a5f13adc9a",
+      "eventNames": [
+        "GovernanceConfigSet"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0xb28cf4d7cc6d09ecad9d2425fcad2c8bb5086adc544814ade61353318c0f03dd",
+      "eventNames": [
+        "SetGuildTokens"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0xa23e5f4df744c09f380eb3d60c9bbd6e06b6ff549b91699756f19d750583a740",
+      "eventNames": [
+        "MintShares"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0xee471b7a886e1fd4de84cd78b3b714a0bf2db157195728a8745ce5cb0a385500",
+      "eventNames": [
+        "MintLoot"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0x8fc00e66e1a93059d4618692a4bde8fbeeae59bab747c13df1fd132dbd6e3daa",
+      "eventNames": [
+        "BurnShares"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0xa29b455265f5029ca842063ee28fe4567cdbace8fa093a1b906084cd28f0eb2e",
+      "eventNames": [
+        "BurnLoot"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0x5e1c9f68365556a24387c25fd0922af31039bcfc65d36caac57401d310948e59",
+      "eventNames": [
+        "LockAdmin"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0xb496b9628e839102454d8b483ba451c4be96675009b637273a00e4ab6a59db72",
+      "eventNames": [
+        "LockManager"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0xd9574ee4ccdf21db87aa2c1d1fee3248522d79c07c54bde4a9edeb0620bef71f",
+      "eventNames": [
+        "LockGovernor"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0x919a31da3abe80797e98aa9c2c7f702e81362432ae3e701295d162ceee68101b",
+      "eventNames": [
+        "ConvertSharesToLoot"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0xf34accb7f7f5add8a3a2e54128bad2b67cd14b58555eb8bbea122058e9d794ae",
+      "eventNames": [
+        "AdminConfigSet"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+      "eventNames": [
+        "Transfer"
+      ],
+      "collisionProne": true,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0x3134e8a2e6d97e929a7e54011ea5485d7d196dd5f0ba4d4ef95803e8e3fc257f",
+      "eventNames": [
+        "DelegateChanged"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0xdec2bacdd2f05b59de34da9b523dff8be42e5e38e818c82fdb0bae774387a724",
+      "eventNames": [
+        "DelegateVotesChanged"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0x62e78cea01bee320cd4e420270b5ea74000d11b0c9f74754ebdbfc544b05a258",
+      "eventNames": [
+        "Paused"
+      ],
+      "collisionProne": true,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0x5db9ee0a495bf2e6ff9c91a7834c1ba4fdd244a5e8aa4e537bd38aeae4b073aa",
+      "eventNames": [
+        "Unpaused"
+      ],
+      "collisionProne": true,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0x6c7f3182d7e4cb876251f9ae1489975fdbbf15d9f35d393f2ac9b1ff57cec69f",
+      "eventNames": [
+        "NewPost"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0x610bfbd87701bb75bd018645eebcf805329465f8c2746c0768a3ab60bb853a58",
+      "eventNames": [
+        "NavigatorDeployed"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    },
+    {
+      "topic0": "0x5f60888034cbbb9154011e35d21f3fb4b0e7a1602b146fc67b823d8f465c2227",
+      "eventNames": [
+        "Onboard"
+      ],
+      "collisionProne": false,
+      "logCount": 0,
+      "approxBytes": 0,
+      "distinctAddresses": 0,
+      "sampleAddresses": [],
+      "errors": []
+    }
+  ]
+}

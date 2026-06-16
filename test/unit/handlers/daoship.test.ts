@@ -22,7 +22,7 @@ import {
   handleAdminConfigSet,
 } from '../../../src/handlers/daoship.js';
 import {
-  DAOSHIP, SHARES, LOOT, MEMBER1, MEMBER2, NAVIGATOR, LAUNCHER, TOKEN_A, TX_HASH,
+  DAOSHIP, SHARES, LOOT, AVATAR, MEMBER1, MEMBER2, NAVIGATOR, LAUNCHER, TOKEN_A, TX_HASH,
   makeCtx, makeMockDb, makeMockBlockchain, makeMockRegistry,
 } from './helpers.js';
 
@@ -373,7 +373,7 @@ describe('handleRagequit', () => {
     }));
   });
 
-  it('atomically decrements DAO totals via adjustDaoTotals on ragequit', async () => {
+  it('queues DAO for end-of-range recompute (Option B — no per-log adjustDaoTotals)', async () => {
     const db = makeMockDb();
     db.getMember.mockResolvedValue({ id: `${DAOSHIP}-${MEMBER1}` });
     const ctx = makeCtx({ db, log: { address: DAOSHIP } });
@@ -382,19 +382,22 @@ describe('handleRagequit', () => {
       member: MEMBER1, to: MEMBER2, lootToBurn: 50n, sharesToBurn: 100n, tokens: [], amounts: [],
     });
 
-    expect(db.adjustDaoTotals).toHaveBeenCalledWith(DAOSHIP, '-100', '-50');
+    // No per-log total adjustment; member balances come through Transfer
+    // events and DAO totals get recomputed once at end-of-range.
+    expect(db.adjustDaoTotals).not.toHaveBeenCalled();
+    expect(ctx.dirtyDaoIds.has(DAOSHIP)).toBe(true);
   });
 
-  it('only sends shares delta when lootToBurn is zero', async () => {
+  it('does NOT queue dirty DAO when both burn amounts are zero', async () => {
     const db = makeMockDb();
     db.getMember.mockResolvedValue({ id: `${DAOSHIP}-${MEMBER1}` });
     const ctx = makeCtx({ db, log: { address: DAOSHIP } });
 
     await handleRagequit(ctx, {
-      member: MEMBER1, to: MEMBER2, lootToBurn: 0n, sharesToBurn: 100n, tokens: [], amounts: [],
+      member: MEMBER1, to: MEMBER2, lootToBurn: 0n, sharesToBurn: 0n, tokens: [], amounts: [],
     });
 
-    expect(db.adjustDaoTotals).toHaveBeenCalledWith(DAOSHIP, '-100', '0');
+    expect(ctx.dirtyDaoIds.has(DAOSHIP)).toBe(false);
   });
 
   it('skips when tokens/amounts array lengths mismatch', async () => {
@@ -465,72 +468,28 @@ describe('handleNavigatorSet', () => {
     expect(db.upsert).not.toHaveBeenCalled();
   });
 
-  it('promotes orphan navigator when IDs match', async () => {
+  it('flips permission_ever_granted + trust_status=sanctioned on a grant from a known DAO', async () => {
     const db = makeMockDb();
-    const expectedId = `${DAOSHIP}-${NAVIGATOR}`;
-    db.findOrphanNavigator.mockResolvedValue({
-      id: expectedId,
-      deployer: MEMBER1,
-      navigator_type: 'OnboarderNavigator',
-      name: 'My Nav',
-      description: 'Does things',
-    });
     const registry = makeMockRegistry();
     registry.getDaoByDaoShipAddress.mockReturnValue({ daoShipAddress: DAOSHIP });
     const ctx = makeCtx({ db, registry, log: { address: DAOSHIP } });
 
     await handleNavigatorSet(ctx, { navigator: NAVIGATOR, permission: 4n });
 
-    expect(db.findOrphanNavigator).toHaveBeenCalledWith(NAVIGATOR);
-    expect(db.upsert).toHaveBeenCalledWith('ds_navigators', expect.objectContaining({
-      deployer: MEMBER1,
-      navigator_type: 'OnboarderNavigator',
-      name: 'My Nav',
-      description: 'Does things',
-    }));
-  });
-
-  it('discards orphan metadata when IDs mismatch (spoofed daoShip)', async () => {
-    const db = makeMockDb();
-    const wrongDaoShip = '0x0000000000000000000000000000000000000099';
-    db.findOrphanNavigator.mockResolvedValue({
-      id: `${wrongDaoShip}-${NAVIGATOR}`,
-      deployer: MEMBER1,
-      navigator_type: 'OnboarderNavigator',
-      name: 'Fake',
-      description: 'Bad',
-    });
-    const registry = makeMockRegistry();
-    registry.getDaoByDaoShipAddress.mockReturnValue({ daoShipAddress: DAOSHIP });
-    const ctx = makeCtx({ db, registry, log: { address: DAOSHIP } });
-
-    await handleNavigatorSet(ctx, { navigator: NAVIGATOR, permission: 4n });
-
-    // Metadata fields omitted when orphan ID mismatches
+    // Metadata (deployer/type/name) is NOT re-written here — it was bound by
+    // NavigatorDeployed and is preserved by the partial upsert. The grant only moves
+    // permission + the monotonic discriminator + trust.
     const upsertData = db.upsert.mock.calls[0][1];
+    expect(upsertData).toMatchObject({
+      permission: 4,
+      is_active: true,
+      permission_ever_granted: true,
+      trust_status: 'sanctioned',
+    });
     expect(upsertData).not.toHaveProperty('deployer');
-    expect(upsertData).not.toHaveProperty('name');
-    expect(upsertData).not.toHaveProperty('description');
   });
 
-  it('works when no orphan exists (findOrphanNavigator returns null)', async () => {
-    const db = makeMockDb();
-    db.findOrphanNavigator.mockResolvedValue(null);
-    const registry = makeMockRegistry();
-    registry.getDaoByDaoShipAddress.mockReturnValue({ daoShipAddress: DAOSHIP });
-    const ctx = makeCtx({ db, registry, log: { address: DAOSHIP } });
-
-    await handleNavigatorSet(ctx, { navigator: NAVIGATOR, permission: 4n });
-
-    // Metadata fields omitted when no orphan found
-    const upsertData = db.upsert.mock.calls[0][1];
-    expect(upsertData).not.toHaveProperty('deployer');
-    expect(upsertData).not.toHaveProperty('navigator_type');
-    expect(upsertData).not.toHaveProperty('name');
-    expect(upsertData).not.toHaveProperty('description');
-  });
-
-  it('skips orphan lookup when permission=0', async () => {
+  it('preserves permission_ever_granted/trust_status on revoke (keeps revoked history)', async () => {
     const db = makeMockDb();
     const registry = makeMockRegistry();
     registry.getDaoByDaoShipAddress.mockReturnValue({ daoShipAddress: DAOSHIP });
@@ -538,7 +497,26 @@ describe('handleNavigatorSet', () => {
 
     await handleNavigatorSet(ctx, { navigator: NAVIGATOR, permission: 0n });
 
-    expect(db.findOrphanNavigator).not.toHaveBeenCalled();
+    const upsertData = db.upsert.mock.calls[0][1];
+    expect(upsertData).toMatchObject({ permission: 0, is_active: false });
+    // Omitted on revoke so the existing values survive (revoked => ever_granted stays true).
+    expect(upsertData).not.toHaveProperty('permission_ever_granted');
+    expect(upsertData).not.toHaveProperty('trust_status');
+  });
+
+  it('does not flip permission_ever_granted when the grant is from an UNKNOWN DAOShip', async () => {
+    const db = makeMockDb();
+    const registry = makeMockRegistry();
+    registry.getDaoByDaoShipAddress.mockReturnValue(undefined); // emitter not a known DAOShip
+    const ctx = makeCtx({ db, registry, log: { address: DAOSHIP } });
+
+    await handleNavigatorSet(ctx, { navigator: NAVIGATOR, permission: 4n });
+
+    // trust_status is still set (permission > 0), but the monotonic discriminator only
+    // flips for a KNOWN DAOShip (per the doc), and the navigator isn't registered.
+    const upsertData = db.upsert.mock.calls[0][1];
+    expect(upsertData).not.toHaveProperty('permission_ever_granted');
+    expect(registry.registerNavigator).not.toHaveBeenCalled();
   });
 
   it('upserts to DB but skips registry when daoship not in registry', async () => {
@@ -619,46 +597,53 @@ describe('handleSetGuildTokens', () => {
 
 // ── handleMintShares / handleBurnShares / handleMintLoot / handleBurnLoot ──
 
+// Option B: Mint/Burn handlers no longer call adjustDaoTotals. They only
+// flag the DAO dirty for end-of-range `ds_recompute_dao_totals`. Member
+// balances are authoritative via the Transfer event handler.
+
 describe('handleMintShares', () => {
-  it('atomically adjusts total_shares via adjustDaoTotals', async () => {
+  it('queues dirty DAO for end-of-range recompute', async () => {
     const db = makeMockDb();
     const ctx = makeCtx({ db, log: { address: DAOSHIP } });
 
     await handleMintShares(ctx, { to: [MEMBER1, MEMBER2], amount: [100n, 200n] });
 
-    // Total delta = +300 shares, 0 loot
-    expect(db.adjustDaoTotals).toHaveBeenCalledWith(DAOSHIP, '300', '0');
+    expect(db.adjustDaoTotals).not.toHaveBeenCalled();
+    expect(ctx.dirtyDaoIds.has(DAOSHIP)).toBe(true);
   });
 
-  it('sends negative delta for burns via adjustDaoTotals', async () => {
+  it('handleBurnShares also queues the DAO dirty', async () => {
     const db = makeMockDb();
     const ctx = makeCtx({ db, log: { address: DAOSHIP } });
 
     await handleBurnShares(ctx, { from: [MEMBER1], amount: [100n] });
 
-    expect(db.adjustDaoTotals).toHaveBeenCalledWith(DAOSHIP, '-100', '0');
+    expect(db.adjustDaoTotals).not.toHaveBeenCalled();
+    expect(ctx.dirtyDaoIds.has(DAOSHIP)).toBe(true);
   });
 });
 
 describe('handleMintLoot', () => {
-  it('atomically adjusts total_loot via adjustDaoTotals', async () => {
+  it('queues dirty DAO', async () => {
     const db = makeMockDb();
     const ctx = makeCtx({ db, log: { address: DAOSHIP } });
 
     await handleMintLoot(ctx, { to: [MEMBER1], amount: [250n] });
 
-    expect(db.adjustDaoTotals).toHaveBeenCalledWith(DAOSHIP, '0', '250');
+    expect(db.adjustDaoTotals).not.toHaveBeenCalled();
+    expect(ctx.dirtyDaoIds.has(DAOSHIP)).toBe(true);
   });
 });
 
 describe('handleBurnLoot', () => {
-  it('sends negative loot delta via adjustDaoTotals', async () => {
+  it('queues dirty DAO', async () => {
     const db = makeMockDb();
     const ctx = makeCtx({ db, log: { address: DAOSHIP } });
 
     await handleBurnLoot(ctx, { from: [MEMBER1], amount: [100n] });
 
-    expect(db.adjustDaoTotals).toHaveBeenCalledWith(DAOSHIP, '0', '-100');
+    expect(db.adjustDaoTotals).not.toHaveBeenCalled();
+    expect(ctx.dirtyDaoIds.has(DAOSHIP)).toBe(true);
   });
 });
 
@@ -705,15 +690,15 @@ describe('handleConvertSharesToLoot', () => {
   // are updated by the Transfer events (burn shares + mint loot) that fire
   // from the contract's sharesToken.burn() / lootToken.mint() calls.
 
-  it('atomically adjusts DAO totals (member balances owned by Transfer handler)', async () => {
+  it('queues DAO dirty for end-of-range recompute (member balances owned by Transfer handler)', async () => {
     const db = makeMockDb();
     const ctx = makeCtx({ db, log: { address: DAOSHIP } });
 
     await handleConvertSharesToLoot(ctx, { from: MEMBER1, amount: 30n });
 
-    // shares -30, loot +30
-    expect(db.adjustDaoTotals).toHaveBeenCalledWith(DAOSHIP, '-30', '30');
-    // Member balance NOT updated — Transfer handler owns that
+    expect(db.adjustDaoTotals).not.toHaveBeenCalled();
+    expect(ctx.dirtyDaoIds.has(DAOSHIP)).toBe(true);
+    // Member balance NOT updated — Transfer handler owns that.
     expect(db.upsertMember).not.toHaveBeenCalled();
   });
 });
@@ -822,7 +807,7 @@ describe('handleNavigatorDeployed', () => {
   const VALID_ROOT = '0x' + 'ab'.repeat(32);
   const BYTES32_ZERO = '0x' + '0'.repeat(64);
 
-  it('writes an orphan row with dao_id: null', async () => {
+  it('binds dao_id for a permissioned navigator and leaves it inert until NavigatorSet', async () => {
     const db = makeMockDb();
     const blockchain = makeMockBlockchain();
     // Default: rawCall rejects — navigator has no allowlistRoot()
@@ -841,16 +826,138 @@ describe('handleNavigatorDeployed', () => {
       description: 'Does things',
     });
 
+    // dao_id is bound from the event for EVERY navigator now (no more dao_id: null orphan).
+    // A permissioned navigator is inert (is_active false) until a NavigatorSet grants permission,
+    // and is implicitly 'sanctioned' (it will be vouched by NavigatorSet).
     expect(db.upsert).toHaveBeenCalledWith('ds_navigators', expect.objectContaining({
       id: `${DAOSHIP}-${NAVIGATOR}`,
-      dao_id: null,
+      dao_id: DAOSHIP,
       navigator_address: NAVIGATOR,
       deployer: MEMBER1,
       navigator_type: 'OnboarderNavigator',
       name: 'My Nav',
       description: 'Does things',
+      permission: 0,
+      permission_ever_granted: false,
+      trust_status: 'sanctioned',
       is_active: false,
+      deploy_block: 100,
       allowlist_root: null, // no allowlist — rawCall reverted
+    }));
+  });
+
+  it('binds a read-only (SignalNavigator) row as self_asserted + active when the DAO is known', async () => {
+    const db = makeMockDb();
+    const registry = makeMockRegistry();
+    registry.getDaoByDaoShipAddress.mockReturnValue({ daoShipAddress: DAOSHIP, avatar: AVATAR });
+    const ctx = makeCtx({ db, registry, log: { address: NAVIGATOR } });
+
+    await handleNavigatorDeployed(ctx, {
+      daoShip: DAOSHIP,
+      deployer: MEMBER1,
+      navigatorType: 'SignalNavigator',
+      name: 'Polls',
+      description: 'Temperature checks',
+    });
+
+    expect(db.upsert).toHaveBeenCalledWith('ds_navigators', expect.objectContaining({
+      dao_id: DAOSHIP,
+      navigator_type: 'SignalNavigator',
+      permission: 0,
+      permission_ever_granted: false,
+      trust_status: 'self_asserted',
+      is_active: true, // read-only is functional at permission 0
+    }));
+    // Registered so getDaoFromNavigator resolves without an RPC.
+    expect(registry.registerNavigator).toHaveBeenCalledWith(NAVIGATOR, DAOSHIP);
+  });
+
+  it('IGNORES a read-only navigator whose claimed DAO is unknown (resolution gate)', async () => {
+    const db = makeMockDb();
+    const registry = makeMockRegistry();
+    registry.getDaoByDaoShipAddress.mockReturnValue(undefined); // DAO not indexed
+    const ctx = makeCtx({ db, registry, log: { address: NAVIGATOR } });
+
+    await handleNavigatorDeployed(ctx, {
+      daoShip: DAOSHIP,
+      deployer: MEMBER1,
+      navigatorType: 'SignalNavigator',
+      name: 'Spam',
+      description: 'x',
+    });
+
+    expect(db.upsert).not.toHaveBeenCalled();
+    expect(registry.registerNavigator).not.toHaveBeenCalled();
+  });
+
+  it('applies a held vault sanction intent on a read-only deploy (ordering)', async () => {
+    const db = makeMockDb();
+    db.consumeSanctionIntent.mockResolvedValue(AVATAR); // vault had pre-sanctioned this address
+    const registry = makeMockRegistry();
+    registry.getDaoByDaoShipAddress.mockReturnValue({ daoShipAddress: DAOSHIP, avatar: AVATAR });
+    const ctx = makeCtx({ db, registry, log: { address: NAVIGATOR } });
+
+    await handleNavigatorDeployed(ctx, {
+      daoShip: DAOSHIP,
+      deployer: MEMBER1,
+      navigatorType: 'SignalNavigator',
+      name: 'Polls',
+      description: 'x',
+    });
+
+    expect(db.consumeSanctionIntent).toHaveBeenCalledWith(DAOSHIP, NAVIGATOR);
+    expect(db.upsert).toHaveBeenCalledWith('ds_navigators', expect.objectContaining({
+      trust_status: 'sanctioned',
+    }));
+  });
+
+  it('binds a module (BudgetNavigator) row as self_asserted + INACTIVE, registered, even vs an unknown DAO', async () => {
+    const db = makeMockDb();
+    const registry = makeMockRegistry();
+    registry.getDaoByDaoShipAddress.mockReturnValue(undefined); // predicted/unknown DAO at deploy time
+    const ctx = makeCtx({ db, registry, log: { address: NAVIGATOR } });
+
+    await handleNavigatorDeployed(ctx, {
+      daoShip: DAOSHIP,
+      deployer: MEMBER1,
+      navigatorType: 'BudgetNavigator',
+      name: 'Treasury',
+      description: 'Payroll',
+    });
+
+    // NOT dropped by the resolution gate (that gate is read-only only): a budget nav can be
+    // deployed against a predicted DAO. Born powerless (is_active false) until the vault enables it.
+    expect(db.upsert).toHaveBeenCalledWith('ds_navigators', expect.objectContaining({
+      dao_id: DAOSHIP,
+      navigator_type: 'BudgetNavigator',
+      permission: 0,
+      permission_ever_granted: false,
+      trust_status: 'self_asserted',
+      is_active: false,
+    }));
+    // Registered so the vault-module watch can resolve module → DAO without an RPC.
+    expect(registry.registerNavigator).toHaveBeenCalledWith(NAVIGATOR, DAOSHIP);
+  });
+
+  it('applies a held vault EnabledModule intent on a budget deploy → sanctioned + active (ordering)', async () => {
+    const db = makeMockDb();
+    db.consumeSanctionIntent.mockResolvedValue(AVATAR); // vault enabled it before we saw the deploy
+    const registry = makeMockRegistry();
+    registry.getDaoByDaoShipAddress.mockReturnValue({ daoShipAddress: DAOSHIP, avatar: AVATAR });
+    const ctx = makeCtx({ db, registry, log: { address: NAVIGATOR } });
+
+    await handleNavigatorDeployed(ctx, {
+      daoShip: DAOSHIP,
+      deployer: MEMBER1,
+      navigatorType: 'BudgetNavigator',
+      name: 'Treasury',
+      description: 'x',
+    });
+
+    expect(db.consumeSanctionIntent).toHaveBeenCalledWith(DAOSHIP, NAVIGATOR);
+    expect(db.upsert).toHaveBeenCalledWith('ds_navigators', expect.objectContaining({
+      trust_status: 'sanctioned',
+      is_active: true, // vault already enabled the module
     }));
   });
 

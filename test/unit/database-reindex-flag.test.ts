@@ -103,3 +103,43 @@ describe('DatabaseService.clearRequiresFullReindex (M2)', () => {
     expect(eqMock).toHaveBeenCalledWith('id', 1);
   });
 });
+
+describe('DatabaseService.countProcessedLogsAfterBlock', () => {
+  // Local chain: from('ds_processed_logs').select('*', {count, head}).gt(...).abortSignal(...)
+  // We rebuild the chain per test since the shared harness doesn't include .gt.
+  function rewireForCount(result: { count: number | null; error: any }) {
+    const gtMock = vi.fn();
+    const localSelectMock = vi.fn();
+    const thenable = {
+      abortSignal: () => Promise.resolve(result),
+      then: (onF: any, onR: any) => Promise.resolve(result).then(onF, onR),
+    };
+    gtMock.mockReturnValue(thenable);
+    localSelectMock.mockReturnValue({ gt: gtMock });
+    fromMock.mockReturnValue({ select: localSelectMock, update: updateMock });
+    return { gtMock, localSelectMock };
+  }
+
+  it('returns the count of processed_logs with block_number > cutoff', async () => {
+    const { gtMock, localSelectMock } = rewireForCount({ count: 7, error: null });
+    const db = new DatabaseService();
+    const n = await db.countProcessedLogsAfterBlock(100);
+
+    expect(fromMock).toHaveBeenCalledWith('ds_processed_logs');
+    expect(localSelectMock).toHaveBeenCalledWith('*', { count: 'exact', head: true });
+    expect(gtMock).toHaveBeenCalledWith('block_number', 100);
+    expect(n).toBe(7);
+  });
+
+  it('returns 0 when Supabase returns null count', async () => {
+    rewireForCount({ count: null, error: null });
+    const db = new DatabaseService();
+    expect(await db.countProcessedLogsAfterBlock(0)).toBe(0);
+  });
+
+  it('throws when the query errors', async () => {
+    rewireForCount({ count: null, error: { message: 'boom' } });
+    const db = new DatabaseService();
+    await expect(db.countProcessedLogsAfterBlock(0)).rejects.toThrow(/boom/);
+  });
+});

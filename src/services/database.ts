@@ -23,8 +23,22 @@ const VALID_TABLES = new Set([
   'ds_ragequits',
   'ds_navigators',
   'ds_navigator_events',
+  'ds_nft_claims',
+  'ds_signal_polls',
+  'ds_signal_votes',
+  'ds_navigator_sanction_intents',
   'ds_records',
   'ds_delegations',
+  'ds_timelock_changes',
+  'ds_vesting_schedules',
+  'ds_vesting_claims',
+  'ds_budgets',
+  'ds_budget_disbursements',
+  'ds_vault_module_events',
+  'ds_governance_config_history',
+  'ds_subscription_members',
+  'ds_subscription_payments',
+  'ds_subscription_collections',
 ]);
 
 export class DatabaseService {
@@ -188,6 +202,44 @@ export class DatabaseService {
       'updateNavigator',
     );
     if (error) throw new Error(`Failed to update navigator ${navigatorId}: ${error.message}`);
+  }
+
+  /** Targeted UPDATE of a timelock change by id ({navigator}-{changeId}). No-op if absent. */
+  async updateTimelockChange(id: string, updates: Record<string, unknown>): Promise<void> {
+    const { error } = await this.withDbTimeout(
+      this.client.from('ds_timelock_changes').update(updates).eq('id', id),
+      'updateTimelockChange',
+    );
+    if (error) throw new Error(`Failed to update timelock change ${id}: ${error.message}`);
+  }
+
+  /** Targeted UPDATE of a vesting schedule by id ({navigator}-{scheduleId}). No-op if absent. */
+  async updateVestingSchedule(id: string, updates: Record<string, unknown>): Promise<void> {
+    const { error } = await this.withDbTimeout(
+      this.client.from('ds_vesting_schedules').update(updates).eq('id', id),
+      'updateVestingSchedule',
+    );
+    if (error) throw new Error(`Failed to update vesting schedule ${id}: ${error.message}`);
+  }
+
+  /** Targeted UPDATE of a budget by id ({navigator}-{budgetId}). No-op if absent — used by
+   *  ManagerUpdated (manager swap) and BudgetCancelled (irreversible halt). */
+  async updateBudget(id: string, updates: Record<string, unknown>): Promise<void> {
+    const { error } = await this.withDbTimeout(
+      this.client.from('ds_budgets').update(updates).eq('id', id),
+      'updateBudget',
+    );
+    if (error) throw new Error(`Failed to update budget ${id}: ${error.message}`);
+  }
+
+  /** Targeted UPDATE of a subscription member by id ({navigator}-{member}). No-op if absent —
+   *  used by FeeCollected (un-enroll: paid_through → 0, stamp last_collected_at). */
+  async updateSubscriptionMember(id: string, updates: Record<string, unknown>): Promise<void> {
+    const { error } = await this.withDbTimeout(
+      this.client.from('ds_subscription_members').update(updates).eq('id', id),
+      'updateSubscriptionMember',
+    );
+    if (error) throw new Error(`Failed to update subscription member ${id}: ${error.message}`);
   }
 
   // ── Member Operations ──────────────────────────────────────────
@@ -355,6 +407,228 @@ export class DatabaseService {
     if (error) throw new Error(`Failed to adjust DAO totals for ${normalized}: ${error.message}`);
   }
 
+  /**
+   * Option B — idempotent Transfer handler RPC. Atomically dedups on
+   * `(tx_hash, log_index)` and applies balance math + active-member
+   * delta in a single transaction. If the log was already processed,
+   * returns `already_processed: true` and the caller short-circuits.
+   *
+   * See `supabase/migrations/schema.sql:ds_apply_transfer` for the full
+   * invariant.
+   */
+  async applyTransfer(args: {
+    txHash: string;
+    logIndex: number;
+    blockNumber: number;
+    daoId: string;
+    fromAddress: string;
+    toAddress: string;
+    value: string; // NUMERIC(78,0) as string
+    isShares: boolean;
+    timestamp: Date;
+  }): Promise<{ alreadyProcessed: boolean; activeMemberDelta: number }> {
+    const { data, error } = await this.withDbTimeout(
+      this.client.rpc('ds_apply_transfer', {
+        p_tx_hash: args.txHash,
+        p_log_index: args.logIndex,
+        p_block_number: args.blockNumber,
+        p_dao_id: validateAndNormalizeAddress(args.daoId, 'daoId'),
+        p_from_address: validateAndNormalizeAddress(args.fromAddress, 'fromAddress'),
+        p_to_address: validateAndNormalizeAddress(args.toAddress, 'toAddress'),
+        p_value: args.value,
+        p_is_shares: args.isShares,
+        p_timestamp: args.timestamp.toISOString(),
+      }),
+      'applyTransfer',
+    );
+    if (error) throw new Error(`Failed ds_apply_transfer: ${error.message}`);
+    // RPC returns a table — Supabase wraps it as an array of rows.
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row) throw new Error('ds_apply_transfer returned no row');
+    return {
+      alreadyProcessed: Boolean(row.already_processed),
+      activeMemberDelta: Number(row.active_member_delta ?? 0),
+    };
+  }
+
+  /**
+   * Option B — derive-from-truth DAO totals recompute. Called ONCE per
+   * dirty DAO at end-of-range by the processor, never per-log. Replaces
+   * the non-idempotent `adjustDaoTotals` delta path for Mint, Burn,
+   * Ragequit, and ConvertSharesToLoot flows.
+   */
+  async recomputeDaoTotals(daoId: string): Promise<void> {
+    const normalized = validateAndNormalizeAddress(daoId, 'daoId');
+    const { error } = await this.withDbTimeout(
+      this.client.rpc('ds_recompute_dao_totals', { p_dao_id: normalized }),
+      'recomputeDaoTotals',
+    );
+    if (error) throw new Error(`Failed to recompute DAO totals for ${normalized}: ${error.message}`);
+  }
+
+  /**
+   * Mark a signal poll cancelled (terminal). Targeted UPDATE — never inserts — so a
+   * PollCancelled for a poll that was not materialized (unsanctioned navigator) is a
+   * harmless no-op rather than resurrecting a stub row.
+   */
+  async markPollCancelled(pollPk: string, updatedAt: string): Promise<void> {
+    const { error } = await this.withDbTimeout(
+      this.client.from('ds_signal_polls')
+        .update({ cancelled: true, updated_at: updatedAt })
+        .eq('id', pollPk),
+      'markPollCancelled',
+    );
+    if (error) throw new Error(`Failed to mark poll cancelled for ${pollPk}: ${error.message}`);
+  }
+
+  /**
+   * Read the fields a daoships.signal.poll labels post needs to gate against: the on-chain
+   * `creator` (trust: msg.sender must match), `option_count` (options.length must equal it),
+   * and the time-derived status inputs (`voting_ends`, `cancelled`) so an expired/cancelled poll
+   * rejects late label edits. Returns null if the poll isn't materialized (unsanctioned navigator
+   * → labels post is discarded, not held — see SIGNAL_POLL_LABELS_SUPPORT.md §3).
+   */
+  async getSignalPoll(pollPk: string): Promise<{
+    creator: string;
+    option_count: number;
+    voting_ends: number;
+    cancelled: boolean;
+    labels_block_number: number | null;
+  } | null> {
+    const { data, error } = await this.withDbTimeout(
+      this.client.from('ds_signal_polls')
+        .select('creator, option_count, voting_ends, cancelled, labels_block_number')
+        .eq('id', pollPk)
+        .limit(1),
+      'getSignalPoll',
+    );
+    if (error) throw new Error(`Failed to read signal poll ${pollPk}: ${error.message}`);
+    const row = Array.isArray(data) && data.length > 0 ? data[0] as Record<string, unknown> : null;
+    if (!row) return null;
+    return {
+      creator: String(row.creator),
+      option_count: Number(row.option_count),
+      voting_ends: Number(row.voting_ends),
+      cancelled: row.cancelled === true,
+      labels_block_number: row.labels_block_number == null ? null : Number(row.labels_block_number),
+    };
+  }
+
+  /**
+   * Apply off-chain option labels (daoships.signal.poll) to a materialized poll row. Targeted
+   * UPDATE — never inserts. Last-write-wins guarded by block: only overwrites when the existing
+   * labels post is older (or absent), so a replayed/out-of-order older post can't clobber a newer
+   * edit. The caller has already verified creator-match, length-match, and not-expired.
+   */
+  async applyPollLabels(
+    pollPk: string,
+    labels: {
+      options: string[];
+      description: string | null;
+      discussionUrl: string | null;
+      labelsUpdatedAt: string;
+      labelsBlockNumber: number;
+    },
+  ): Promise<void> {
+    const { error } = await this.withDbTimeout(
+      this.client.from('ds_signal_polls')
+        .update({
+          options: labels.options,
+          description: labels.description,
+          discussion_url: labels.discussionUrl,
+          labels_updated_at: labels.labelsUpdatedAt,
+          labels_block_number: labels.labelsBlockNumber,
+          updated_at: labels.labelsUpdatedAt,
+        })
+        .eq('id', pollPk)
+        .or(`labels_block_number.is.null,labels_block_number.lte.${labels.labelsBlockNumber}`),
+      'applyPollLabels',
+    );
+    if (error) throw new Error(`Failed to apply poll labels for ${pollPk}: ${error.message}`);
+  }
+
+  /** Derive a signal poll's per-option tally from ds_signal_votes (idempotent). */
+  async recomputePollTally(pollPk: string): Promise<void> {
+    const { error } = await this.withDbTimeout(
+      this.client.rpc('ds_recompute_poll_tally', { p_poll_pk: pollPk }),
+      'recomputePollTally',
+    );
+    if (error) throw new Error(`Failed to recompute poll tally for ${pollPk}: ${error.message}`);
+  }
+
+  /** Derive a vesting schedule's cumulative `claimed` from ds_vesting_claims (idempotent). */
+  async recomputeVestingClaimed(schedulePk: string): Promise<void> {
+    const { error } = await this.withDbTimeout(
+      this.client.rpc('ds_recompute_vesting_claimed', { p_schedule_pk: schedulePk }),
+      'recomputeVestingClaimed',
+    );
+    if (error) throw new Error(`Failed to recompute vesting claimed for ${schedulePk}: ${error.message}`);
+  }
+
+  /** Derive a budget's cumulative `total_spent` from ds_budget_disbursements (idempotent). */
+  async recomputeBudgetSpent(budgetPk: string): Promise<void> {
+    const { error } = await this.withDbTimeout(
+      this.client.rpc('ds_recompute_budget_spent', { p_budget_pk: budgetPk }),
+      'recomputeBudgetSpent',
+    );
+    if (error) throw new Error(`Failed to recompute budget spent for ${budgetPk}: ${error.message}`);
+  }
+
+  /** Derive a subscription member's cumulative `total_paid` from ds_subscription_payments (idempotent). */
+  async recomputeSubscriptionPaid(memberPk: string): Promise<void> {
+    const { error } = await this.withDbTimeout(
+      this.client.rpc('ds_recompute_subscription_paid', { p_member_pk: memberPk }),
+      'recomputeSubscriptionPaid',
+    );
+    if (error) throw new Error(`Failed to recompute subscription paid for ${memberPk}: ${error.message}`);
+  }
+
+  /**
+   * Flag (or clear) timelock bypass on the ds_governance_config_history rows for a (dao, tx).
+   * Idempotent — derives bypassed_timelock from current truth: TRUE iff the DAO has an active
+   * TimelockNavigator and no ChangeExecuted was recorded for it in this tx.
+   */
+  async resolveTimelockBypass(daoId: string, txHash: string): Promise<void> {
+    const { error } = await this.withDbTimeout(
+      this.client.rpc('ds_resolve_timelock_bypass', {
+        p_dao_id: validateAndNormalizeAddress(daoId, 'daoId'),
+        p_tx_hash: txHash,
+      }),
+      'resolveTimelockBypass',
+    );
+    if (error) throw new Error(`Failed to resolve timelock bypass for ${daoId}@${txHash}: ${error.message}`);
+  }
+
+  /**
+   * Trust + identity of a navigator by address (single row — read-only navigators
+   * have exactly one NavigatorDeployed). Used by the signal materialization gate
+   * (only `trust_status === 'sanctioned'` polls/votes are written) and by the
+   * sanction backfill. Returns null if NavigatorDeployed hasn't been indexed yet.
+   */
+  async getNavigatorTrust(navigatorAddress: string): Promise<{
+    id: string;
+    dao_id: string | null;
+    trust_status: string | null;
+    navigator_type: string | null;
+    deploy_block: number | null;
+  } | null> {
+    const normalized = validateAndNormalizeAddress(navigatorAddress, 'navigatorAddress');
+    const { data, error } = await this.withDbTimeout(
+      this.client.from('ds_navigators')
+        .select('id, dao_id, trust_status, navigator_type, deploy_block')
+        .eq('navigator_address', normalized)
+        .limit(1),
+      'getNavigatorTrust',
+    );
+    if (error) {
+      logger.warn({ navigatorAddress: normalized, error: error.message }, 'Failed to read navigator trust (non-fatal)');
+      return null;
+    }
+    return data && data.length > 0 ? (data[0] as {
+      id: string; dao_id: string | null; trust_status: string | null; navigator_type: string | null; deploy_block: number | null;
+    }) : null;
+  }
+
   async updateActiveMemberCount(daoId: string, delta: number): Promise<void> {
     const normalized = validateAndNormalizeAddress(daoId, 'daoId');
     const { error } = await this.withDbTimeout(
@@ -371,6 +645,24 @@ export class DatabaseService {
     );
     if (error) throw new Error(`Failed to delete events after block ${blockNumber}: ${error.message}`);
     logger.info({ blockNumber }, 'Deleted indexed events after block for reorg recovery');
+  }
+
+  // Count dedupe-log rows with block_number > cutoff. Used by the reorg
+  // recovery path to decide whether the rewound window contained any
+  // processed events — if zero, no balance-affecting event was ever
+  // recorded on the abandoned fork and the requires_full_reindex flag
+  // can be skipped. Must be called BEFORE deleteEventsAfterBlock, which
+  // cascades through ds_processed_logs.
+  async countProcessedLogsAfterBlock(blockNumber: number): Promise<number> {
+    const { count, error } = await this.withDbTimeout(
+      this.client
+        .from('ds_processed_logs')
+        .select('*', { count: 'exact', head: true })
+        .gt('block_number', blockNumber),
+      'countProcessedLogsAfterBlock',
+    );
+    if (error) throw new Error(`Failed to count processed_logs after block ${blockNumber}: ${error.message}`);
+    return count ?? 0;
   }
 
   async reparentOrphanedRecords(daoAddress: string, navigatorAddress: string): Promise<void> {
@@ -403,9 +695,15 @@ export class DatabaseService {
     }
   }
 
-  async pruneOrphanedNavigators(retentionDays: number): Promise<void> {
+  /**
+   * Prune genuine orphan navigators. `atChainHead` MUST reflect whether the
+   * indexer has caught up to the chain head — the RPC no-ops when false, since
+   * a navigator whose DAO simply has not been ingested yet is indistinguishable
+   * from an orphan mid-backfill. See ds_prune_orphaned_navigators (schema.sql).
+   */
+  async pruneOrphanedNavigators(retentionDays: number, atChainHead: boolean): Promise<void> {
     const { data, error } = await this.withDbTimeout(
-      this.client.rpc('ds_prune_orphaned_navigators', { p_retention_days: retentionDays }),
+      this.client.rpc('ds_prune_orphaned_navigators', { p_retention_days: retentionDays, p_at_chain_head: atChainHead }),
       'pruneOrphanedNavigators',
     );
     if (error) {
@@ -415,6 +713,103 @@ export class DatabaseService {
     if (data && data > 0) {
       logger.info({ retentionDays, deleted: data }, 'Pruned orphaned navigators');
     }
+  }
+
+  /**
+   * Atomically consume a held sanction intent for (daoAddress, navigatorAddress):
+   * deletes the row and returns true if one existed. Written by the
+   * daoships.dao.navigators handler when it sanctions a navigator we have not yet
+   * seen NavigatorDeployed for; applied by handleNavigatorDeployed when the row
+   * appears. Returns the vault that posted it (for optional re-verification), or null.
+   */
+  /** List a DAO's currently-sanctioned navigators (address + type). The caller
+   *  filters to read-only types — permissioned navigators are 'sanctioned' via
+   *  NavigatorSet and must not be touched by the daoships.dao.navigators path. */
+  async listSanctionedNavigators(daoId: string): Promise<Array<{ navigator_address: string; navigator_type: string | null }>> {
+    const dao = validateAndNormalizeAddress(daoId, 'daoId');
+    const { data, error } = await this.withDbTimeout(
+      this.client.from('ds_navigators')
+        .select('navigator_address, navigator_type')
+        .eq('dao_id', dao)
+        .eq('trust_status', 'sanctioned'),
+      'listSanctionedNavigators',
+    );
+    if (error) {
+      logger.warn({ daoId: dao, error: error.message }, 'Failed to list sanctioned navigators (non-fatal)');
+      return [];
+    }
+    return (data ?? []) as Array<{ navigator_address: string; navigator_type: string | null }>;
+  }
+
+  /**
+   * Derive a BudgetNavigator's trust_status/is_active from the LATEST surviving
+   * ds_vault_module_events row (enabled → sanctioned+active, disabled → unsanctioned+inactive,
+   * none → self_asserted+inactive). Idempotent. Called after writing a vault-module event so the
+   * column is always a pure function of the (reorg-deletable) feed — never a directly-set value
+   * that could go stale when an EnabledModule/DisabledModule is rolled back.
+   */
+  async recomputeModuleTrust(navigatorAddress: string): Promise<void> {
+    const nav = validateAndNormalizeAddress(navigatorAddress, 'navigatorAddress');
+    const { error } = await this.withDbTimeout(
+      this.client.rpc('ds_recompute_module_trust', { p_navigator_address: nav }),
+      'recomputeModuleTrust',
+    );
+    if (error) throw new Error(`Failed to recompute module trust for ${nav}: ${error.message}`);
+  }
+
+  /** Set a navigator's read-only trust_status, scoped to (dao_id, navigator_address). */
+  async setNavigatorTrust(daoId: string, navigatorAddress: string, trustStatus: string, updatedAt: string): Promise<void> {
+    const dao = validateAndNormalizeAddress(daoId, 'daoId');
+    const nav = validateAndNormalizeAddress(navigatorAddress, 'navigatorAddress');
+    const { error } = await this.withDbTimeout(
+      this.client.from('ds_navigators')
+        .update({ trust_status: trustStatus, updated_at: updatedAt })
+        .eq('dao_id', dao)
+        .eq('navigator_address', nav),
+      'setNavigatorTrust',
+    );
+    if (error) throw new Error(`Failed to set navigator trust for ${nav}@${dao}: ${error.message}`);
+  }
+
+  /** Record a sanction intent to apply when the navigator's NavigatorDeployed arrives. */
+  async writeSanctionIntent(daoId: string, navigatorAddress: string, vault: string, createdAt: string): Promise<void> {
+    const dao = validateAndNormalizeAddress(daoId, 'daoId');
+    const nav = validateAndNormalizeAddress(navigatorAddress, 'navigatorAddress');
+    const vlt = validateAndNormalizeAddress(vault, 'vault');
+    const { error } = await this.withDbTimeout(
+      this.client.from('ds_navigator_sanction_intents')
+        .upsert({ dao_id: dao, navigator_address: nav, vault: vlt, created_at: createdAt }, { onConflict: 'dao_id,navigator_address' }),
+      'writeSanctionIntent',
+    );
+    if (error) throw new Error(`Failed to write sanction intent for ${nav}@${dao}: ${error.message}`);
+  }
+
+  /** Clear all held sanction intents for a DAO (full-set, last-write-wins replacement). */
+  async deleteSanctionIntentsForDao(daoId: string): Promise<void> {
+    const dao = validateAndNormalizeAddress(daoId, 'daoId');
+    const { error } = await this.withDbTimeout(
+      this.client.from('ds_navigator_sanction_intents').delete().eq('dao_id', dao),
+      'deleteSanctionIntentsForDao',
+    );
+    if (error) throw new Error(`Failed to delete sanction intents for ${dao}: ${error.message}`);
+  }
+
+  async consumeSanctionIntent(daoAddress: string, navigatorAddress: string): Promise<string | null> {
+    const dao = validateAndNormalizeAddress(daoAddress, 'daoAddress');
+    const nav = validateAndNormalizeAddress(navigatorAddress, 'navigatorAddress');
+    const { data, error } = await this.withDbTimeout(
+      this.client.from('ds_navigator_sanction_intents')
+        .delete()
+        .eq('dao_id', dao)
+        .eq('navigator_address', nav)
+        .select('vault'),
+      'consumeSanctionIntent',
+    );
+    if (error) {
+      logger.warn({ daoAddress: dao, navigatorAddress: nav, error: error.message }, 'Failed to consume sanction intent (non-fatal)');
+      return null;
+    }
+    return Array.isArray(data) && data.length > 0 ? (data[0] as { vault: string }).vault : null;
   }
 
   async findOrphanNavigator(navigatorAddress: string): Promise<Record<string, unknown> | null> {
@@ -579,6 +974,40 @@ export class DatabaseService {
       'markLogProcessed',
     );
     if (error) throw new Error(`Failed to mark log as processed: ${error.message}`);
+  }
+
+  /**
+   * Option B P5.1 — batch end-of-range dedup write. Safe ONLY when every
+   * handler dispatched in the range is idempotent (their own RPCs either
+   * embed a dedup check like `ds_apply_transfer`, or derive-from-truth
+   * so replay is a no-op). The dispatcher's `isHandlerIdempotent` gate
+   * is the enforcement point — `BlockProcessor.processLogs` refuses the
+   * batched path if it sees a non-idempotent handler.
+   *
+   * Chunked at `BATCH_CAP` per call to stay under Supabase's statement
+   * timeout (default ~8s). At 50 ms median upsert-per-row via
+   * single-row API, 1000 rows batched = one ~500 ms RTT instead of
+   * 1000 × 50 ms = 50 s of sequential work (Security B4).
+   */
+  async markLogsProcessedBatch(
+    rows: Array<{ txHash: string; logIndex: number; blockNumber: number }>,
+  ): Promise<void> {
+    if (rows.length === 0) return;
+    const BATCH_CAP = 1000;
+    for (let i = 0; i < rows.length; i += BATCH_CAP) {
+      const chunk = rows.slice(i, i + BATCH_CAP).map((r) => ({
+        tx_hash: r.txHash,
+        log_index: r.logIndex,
+        block_number: r.blockNumber,
+      }));
+      const { error } = await this.withDbTimeout(
+        this.client
+          .from('ds_processed_logs')
+          .upsert(chunk, { onConflict: 'tx_hash,log_index', ignoreDuplicates: true }),
+        `markLogsProcessedBatch:${chunk.length}`,
+      );
+      if (error) throw new Error(`Failed batched markLogProcessed (${chunk.length} rows): ${error.message}`);
+    }
   }
 
   /**

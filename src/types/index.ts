@@ -110,22 +110,87 @@ export interface VoteRow {
   block_number?: number;
 }
 
+/** Read-only DAO-binding trust for a navigator. Permissioned navigators are
+ *  implicitly 'sanctioned' (vouched by NavigatorSet). */
+export type NavigatorTrustStatus = 'self_asserted' | 'sanctioned' | 'unsanctioned' | 'fabricated';
+
 export interface NavigatorRow {
   id: string;
-  dao_id: string;
+  /** Self-asserted daoShip from NavigatorDeployed; bound for every navigator (no FK).
+   *  May reference a DAO not (yet) in ds_daos. NULL only in legacy/edge cases. */
+  dao_id: string | null;
   navigator_address: string;
   deployer?: string | null;
   permission: number;
   permission_label: string;
+  /** TRUE once any NavigatorSet(>0) from a known DAOShip was seen. Separates a
+   *  revoked navigator (true, now permission 0) from a born-read-only one (false). */
+  permission_ever_granted?: boolean;
+  trust_status?: NavigatorTrustStatus;
+  /** "Functional now?" — read-only stays TRUE at permission 0; FALSE on revoke/unregistered. */
   is_active: boolean;
   paused?: boolean;
   navigator_type: string | null;
   name?: string;
   description?: string;
   config?: Record<string, unknown> | null;
+  allowlist_root?: string | null;
+  /** Block of NavigatorDeployed; bounds the sanction backfill range. */
+  deploy_block?: number | null;
   created_at: string;
   tx_hash: string;
   updated_at?: string;
+}
+
+/** SignalNavigator poll (ds_signal_polls). Keyed {navigator_address}-{poll_id}.
+ *  Materialized only for sanctioned navigators (defer + backfill). */
+export interface SignalPollRow {
+  id: string;
+  dao_id: string;
+  navigator_address: string;
+  poll_id: string;            // per-navigator, NUMERIC(78,0) as string
+  creator: string;
+  question: string | null;
+  option_count: number;
+  snapshot_timestamp: number;
+  voting_starts: number;
+  voting_ends: number;
+  cancelled?: boolean;
+  tally?: string[];           // per-option totals (index = option); derived-from-truth
+  // Off-chain option labels (Poster daoships.signal.poll; msg.sender == creator). NULL until
+  // the labels post is seen → frontend renders Option 1..n. See SIGNAL_POLL_LABELS_SUPPORT.md.
+  options?: string[] | null;
+  description?: string | null;
+  discussion_url?: string | null;
+  labels_updated_at?: string | null;
+  labels_block_number?: number | null;  // labels post's block (≠ block_number); reorg-safe clearing
+  tx_hash: string;
+  block_number: number;
+  created_at: string;
+  updated_at?: string;
+}
+
+/** SignalNavigator vote (ds_signal_votes). One row per (navigator, poll, voter). */
+export interface SignalVoteRow {
+  id: string;
+  poll_pk: string;
+  dao_id: string;
+  navigator_address: string;
+  poll_id: string;
+  voter: string;
+  option: number;
+  weight: string;             // snapshot SHARE weight (loot excluded), NUMERIC as string
+  tx_hash: string;
+  block_number: number;
+  created_at: string;
+}
+
+/** Hold-until-discovered sanction intent (ds_navigator_sanction_intents). */
+export interface NavigatorSanctionIntentRow {
+  dao_id: string;
+  navigator_address: string;
+  vault: string;
+  created_at: string;
 }
 
 export interface RagequitRow {
@@ -184,6 +249,19 @@ export interface NavigatorEventRow {
   loot_minted: string;
   amount: string;
   metadata: Record<string, unknown> | null;
+  tx_hash: string;
+  block_number: number;
+  created_at: string;
+}
+
+export interface NftClaimRow {
+  id: string; // {navigator_address}-{token_id}
+  dao_id: string;
+  navigator_address: string;
+  token_id: string;
+  holder: string; // claimer at claim time (the NFT may move later; the claim is permanent)
+  shares: string;
+  loot: string;
   tx_hash: string;
   block_number: number;
   created_at: string;

@@ -1,12 +1,401 @@
-# Deferred: Batch Per-Log DB Round-Trips (Top-5 #1)
+# Batch Per-Log DB Round-Trips (Top-5 #1)
 
-**Status: DEFERRED (2026-04-16).** Scale doesn't warrant the work yet, and the
-architect's original proposal has a correctness trap that requires prerequisite
-handler refactoring. This document captures the analysis and implementation
-plans so the work can be picked up cold when triggered.
+**Status: Option A SHIPPED (2026-04-18). Option B SHIPPED (2026-04-18).**
+
+Together with the unfiltered topic0 flip (docs §0.4), the indexer's
+realistic DAO ceiling moves from ~1,000 (post-Option-A) to ~15,000–20,000
+— well inside the 10k target. See §0.5 below for the full Option B
+changelog.
 
 **Origin:** Backend Architect audit 2026-04-16 — "Top-5 Highest-Impact
 Improvement #1" in `docs/AUDIT_VALIDATION_2026-04-16.md`.
+
+---
+
+## 0. Option A shipped (2026-04-18)
+
+The per-range read cache described in §3 landed in
+`src/services/range-cache.ts` with the following deviations from the
+original proposal (see "Decisions made" at the bottom of this file for
+rationale):
+
+- Scoped to `processBlockRange`, not `processLogs`, so the discovery-pass
+  loop shares the warm cache across all passes for the same range.
+- `MemberRow` + `DaoRow` only. Proposal cache surface was dropped because
+  there are no hot-path `getProposal` consumers today.
+- Invalidate-on-write is the default for mutations that don't produce a
+  full row locally. Handlers that DO compute the full post-write row
+  (the two Transfer debit/credit closures; the launcher skeleton) call
+  `setMember` / `setDao` instead. `upsertMember` was NOT changed to
+  return the row via `.select().single()` — the invalidate path is
+  cheaper on writes and eliminates any partial-shape caching risk.
+- Three-state peek API is wrapped by `fetchMember` / `fetchDao`
+  helpers so handlers don't have to hand-roll the miss/absent/present
+  check.
+- Observability: `RangeCache.stats` counters are summarized at the end of
+  every `processBlockRange` via a single `logger.info` line, and the
+  last 10 summaries are retained in `BlockProcessor.recentRangeStats`
+  for `/health` surfacing.
+- Pre-existing self-transfer bug in `handleTransfer` (`from === to` was
+  reading sender + receiver before either write, then letting credit
+  overwrite debit with value + balance) was uncovered during audit and
+  fixed in the same cycle by short-circuiting self-transfers to a single
+  activity-touch upsert that leaves balance fields untouched.
+
+Invalidation map (by file:line at the time of this writeup):
+
+| Site | Action |
+|---|---|
+| `tokens.ts` sender/receiver debit/credit | `setMember(fullRow)` after `upsertMember` |
+| `tokens.ts` self-transfer touch | `invalidateMember` (timestamps only) |
+| `tokens.ts` DelegateChanged / DelegateVotesChanged | `invalidateMember` |
+| `tokens.ts` updateActiveMemberCount | `invalidateDao` |
+| `tokens.ts` handlePauseState → updateDao | `invalidateDao` |
+| `daoship.ts` handleMintOrBurn → adjustDaoTotals | `invalidateDao` |
+| `daoship.ts` handleSetupComplete → updateDao | `invalidateDao` |
+| `daoship.ts` handleSubmitProposal → incrementProposalCount | `invalidateDao` |
+| `daoship.ts` handleSponsorProposal → updateDao | `invalidateDao` |
+| `daoship.ts` handleSubmitVote member-stub + incrementMemberVotes | `invalidateMember` |
+| `daoship.ts` handleRagequit member-stub + adjustDaoTotals | `invalidateMember` + `invalidateDao` |
+| `daoship.ts` handleGovernanceConfigSet → updateDao | `invalidateDao` |
+| `daoship.ts` Lock factory → updateDao | `invalidateDao` |
+| `daoship.ts` handleConvertSharesToLoot → adjustDaoTotals | `invalidateDao` |
+| `daoship.ts` handleAdminConfigSet → updateDao | `invalidateDao` |
+| `launcher.ts` handleLaunchDAOShipAndVault → upsertDao | `setDao(fullRow)` |
+| `launcher.ts` handleLaunchDAOShip → upsertDao | `setDao(fullRow)` |
+| `poster.ts` dao.profile / dao.profile.initial → updateDao | `invalidateDao` |
+
+---
+
+## 0.1 Scope traps (DO NOT EXPAND HERE)
+
+These items looked tempting during implementation but expand the work
+surface beyond what Option A can safely deliver. Anyone revisiting this
+doc for Option B or follow-up work must keep them separate:
+
+1. **Do NOT batch `markLogProcessed`.** §2 below enumerates 7
+   non-idempotent handlers. Batching the dedup write to end-of-range
+   widens the retry replay window from 1 log to the full range, causing
+   double-counted DAO totals and re-applied Transfer balances. Requires
+   Option B idempotency refactor first.
+2. **Do NOT cache `getNavigatorByAddress`.** An intra-range
+   `NavigatorDeployed → NewPost` sequence would see a stale cache miss
+   and reject a legitimate post, breaking the H1 allowlist-root trust
+   chain. If ever cached, invalidate on every `handleNavigatorDeployed`
+   and never cache negative results.
+3. **Do NOT promote `RangeCache` to a field on `BlockProcessor`.**
+   Cross-range survival re-opens the reorg staleness window that M4
+   closed. The per-`processBlockRange` scope is load-bearing.
+4. **Do NOT bundle Top-5 #3 (lazy `getProcessedLogKeys`) with this
+   work.** Cross-range dedup persistence has a different invalidation
+   contract from the read cache.
+5. **Do NOT cast `MemberUpsert` (partial) as `MemberRow`.** The
+   `setMember` signature enforces this; a cast would defeat the
+   type boundary and return a row with undefined balance fields on
+   the next read.
+6. **Do NOT log cached row contents.** Summaries only (hit/miss
+   counters, size). The `/health` surface uses counters, not payloads.
+
+---
+
+## 0.5 Option B — SHIPPED (2026-04-18)
+
+Handler idempotency refactor + end-of-range batched writes. Lands
+together with unfiltered fetch (§0.4). Backward-compat was explicitly
+NOT preserved — the old delta-based `adjustDaoTotals` path is kept only
+for reorg recovery (`ds_delete_events_after_block`), not for any
+Option B handler.
+
+### SQL surface (schema.sql)
+
+New functions + one unique index:
+
+- **`ds_apply_transfer(tx_hash, log_index, block_number, dao_id, from,
+  to, value, is_shares, timestamp)`** — atomic idempotent Transfer RPC.
+  Dedups on `(tx_hash, log_index)` via `INSERT INTO ds_processed_logs
+  ON CONFLICT DO NOTHING`; on claim, reads sender/receiver, computes
+  new balances with floor-at-zero clamp, upserts both sides, detects
+  zero-crossings for `active_member_delta`. Self-transfer (from == to
+  non-zero) short-circuits to a timestamp-touch upsert. Mint (from ==
+  0) skips the debit path; burn (to == 0) skips the credit path.
+  Returns `(already_processed BOOLEAN, active_member_delta INT)`.
+  Single transaction — replay-safe by construction.
+
+- **`ds_recompute_dao_totals(dao_id)`** — derive-from-truth replacement
+  for `adjustDaoTotals`. Called ONCE per dirty DAO at end-of-range
+  (Security Engineer's B3 mandatory mitigation); `UPDATE ds_daos SET
+  total_shares = SUM(ds_members.shares), total_loot = SUM(ds_members.loot)`.
+  Idempotent by construction.
+
+- **`ux_ds_delegations_dedup` (UNIQUE INDEX on `(tx_hash, delegator)`)** —
+  closes the SERIAL-PK retry hole the Backend Architect identified.
+  `handleDelegateChanged` relies on `DatabaseService.insert`'s existing
+  23505 swallow for idempotency.
+
+### Handler changes
+
+- **`handleTransfer`** — rewritten from ~200 lines of client-side
+  balance math to a ~50-line dispatcher into `ds_apply_transfer`. No
+  more client-side `getMember`, no more partial-failure replay window.
+  Returns early if the RPC reports `already_processed`.
+- **`handleMintShares` / `MintLoot` / `BurnShares` / `BurnLoot` /
+  `handleRagequit` / `handleConvertSharesToLoot`** — no longer call
+  `adjustDaoTotals`. Instead, queue the `daoId` into
+  `ctx.dirtyDaoIds`. The processor flushes one
+  `ds_recompute_dao_totals(daoId)` per entry at end-of-range.
+- **`handleDelegateChanged`** — relies on the unique index for
+  replay-safety; `DatabaseService.insert` already swallows 23505.
+
+### Dispatcher changes
+
+`HandlerDispatcher.registerHandler` gained a third options parameter
+`{ idempotent?: boolean }` (default true). The 2-arg boolean form
+`registerHandler(iface, event, handler, unfiltered=true)` is still
+accepted for backward compat with the unfiltered flip. `dispatch`
+returns `{ handled, eventName, idempotent }`; the processor uses the
+`idempotent` flag to gate the batched `markLogProcessed` path
+(Security B1 fail-closed).
+
+### Processor changes
+
+- **`EventContext.dirtyDaoIds: Set<string>`** — new field accumulated
+  across all logs in a range.
+- End-of-range flush: loop over `dirtyDaoIds`, call
+  `db.recomputeDaoTotals(daoId)` once each. Errors are logged but don't
+  fail the range — member balances (the source of truth) are already
+  persisted by `ds_apply_transfer`, so the next range touching the DAO
+  will recompute again.
+- **`DatabaseService.markLogsProcessedBatch(rows[])`** — multi-row
+  upsert into `ds_processed_logs` chunked at 1000 rows per RPC
+  (Security B4). Idempotent via PK conflict.
+- `processLogs` accumulates handled-log marks into a per-range buffer
+  and flushes at end-of-range via `markLogsProcessedBatch`. Any
+  handler marked `idempotent: false` falls back to per-log
+  `markLogProcessed` and flips an `allIdempotent` flag that logs a
+  warning.
+
+### RTT arithmetic
+
+Before Option B (post-Option-A, post-Unfiltered):
+
+- Transfer: 1 applyTransfer (would-be) + 4 RTTs of client-side reads+writes + 1 markLogProcessed + amortized updateActiveMemberCount = 5–6 RTTs/log
+- Mint/Burn/Ragequit/Convert: 1 adjustDaoTotals + 1 markLogProcessed + updateActiveMemberCount = 2–3 RTTs/log
+- markLogProcessed: 1 RTT per handled log
+
+After Option B:
+
+- Transfer: 1 RTT (ds_apply_transfer) + amortized updateActiveMemberCount (only on zero-crossing)
+- Mint/Burn/Ragequit/Convert: 0 RTTs in the hot loop (just queue dirty DAO)
+- End-of-range: N dirty-DAO recomputes (bounded, usually ≤ dozens) + 1 batched markLogProcessed upsert
+
+Net: 4–7× RTT reduction on the hot path. Enables the 10k-DAO ceiling.
+
+### Security mitigations landed
+
+All Security Engineer mandatory mitigations from the pre-ship threat
+model:
+
+- **B1** — `HandlerDispatcher.isHandlerIdempotent` + dispatch-time
+  flag; processor refuses batched markLogProcessed for any dispatched
+  log flagged non-idempotent.
+- **B2** — handler write + dedup claim in one transaction
+  (`ds_apply_transfer`). No client-side sequencing of
+  `markLogProcessed` and balance updates.
+- **B3** — dirty-DAO set; recompute runs ONCE per DAO at
+  end-of-range, never per-log.
+- **B4** — `markLogsProcessedBatch` chunked at 1000 rows to stay under
+  Supabase's 30s statement timeout.
+- **B5** — no `SECURITY DEFINER` on new functions; all
+  `LANGUAGE plpgsql` matches existing convention. Service-role grant
+  via schema default.
+- **B6** — no caller-passed aggregate params; recompute always SUMs
+  from source tables.
+- **B7** — Transfer idempotency shipped BEFORE recompute is used for
+  totals. Recompute reads the authoritative ds_members data that
+  `ds_apply_transfer` maintains.
+
+### Tests
+
+- `test/unit/property/transfer-idempotency.property.test.ts` (4
+  fast-check properties): N-way dispatch yields N identical applyTransfer
+  payloads; already-processed never bumps dirtyDaoIds; not-processed
+  always does; mixed sequences reflect first real apply.
+- Handler unit tests rewritten to assert the new contract (applyTransfer
+  call shape; dirtyDaoIds accumulation; no per-log adjustDaoTotals).
+- Processor tests assert end-of-range batched markLogProcessed + fall-
+  back path for non-idempotent handlers.
+
+### Verification
+
+- `npm run typecheck` clean
+- `npm run test:run` — 346 unit tests pass
+- Schema migration required before deploy: `SELECT create_ds_schema('<env>')`
+  for each environment. New functions + unique index are additive;
+  existing tables/data are preserved.
+
+### Rollback
+
+- No rollback at the handler level — Option B code is the new baseline.
+- If `ds_apply_transfer` has a bug in production, `FETCH_MODE=scoped`
+  does NOT help (Option B changes write path, not read path).
+- Schema-level rollback: the old `ds_adjust_dao_totals` function is
+  preserved for reorg-recovery compatibility. A full rollback would
+  require git-revert on the handler diff.
+
+---
+
+## 0.4 Unfiltered topic0 fetching — SHIPPED (2026-04-18)
+
+Audit items A3 + SC1 + Security Engineer mandatory mitigations U1/U2/U4/U6.
+Shipped in the same cycle as Option A cache + pre-ship Option B scaffolding.
+
+**27 of 30 topics flipped to unfiltered**; `Transfer`, `Paused`, and
+`Unpaused` stay scoped because their topic0 hashes are universally
+common (every ERC-20 / every OZ Pausable on chain). Re-evaluate once
+Quai's ERC-20 ecosystem fills in.
+
+### Config surface
+`src/config.ts` adds a `fetch` block:
+
+| Var | Default | Purpose |
+|---|---|---|
+| `FETCH_MODE` | `hybrid` | `scoped` \| `unfiltered` \| `hybrid`. Hybrid respects per-handler flag. Scoped forces all scoped (rollback). Unfiltered forces all unfiltered (override for measurement) |
+| `UNFILTERED_TOPICS` | `` | Comma-sep topic0 hashes to force unfiltered regardless of mode |
+| `FETCH_MAX_LOGS_PER_CALL` | `100000` | U1 — hard cap per getLogs response; triggers bisect on breach |
+| `FETCH_MAX_BYTES_PER_CALL` | `52428800` (50 MB) | U1 — approx byte cap per getLogs response |
+| `FETCH_MIN_BISECT_RANGE` | `1` | Lower bound for bisect recursion; below this the oversize error surfaces |
+
+### Security mitigations landed
+- **U1/U6** (`src/services/blockchain.ts`): `getLogs` post-fetch size/count
+  check throws a tagged `oversize response` error on breach. Protects
+  against response-size DoS at chain-wide volume.
+- **U1/U6 bisect** (`src/services/processor.ts:fetchWithBisect`):
+  catches the oversize error, splits the block range in half, retries
+  both halves. Recurses until `minBisectRange` or until a leaf succeeds.
+  Non-oversize errors propagate unchanged.
+- **U2** (`src/handlers/launcher.ts`, `src/handlers/poster.ts`): emitter
+  address validated against `config.contracts` before any write. Spoofed
+  events from unauthorized emitters are silently dropped. DAOShip event
+  handlers are implicitly protected via the `ds_proposals.dao_id → ds_daos.id`
+  FK constraint chain — spoofed events fail the insert.
+- **U4**: documented design decision — no pre-filter in `fetchAllLogs`;
+  handlers perform their own registry check. Mid-range registrations
+  resolve naturally via the launcher-first log sort.
+- **Per-topic observability** (`src/services/processor.ts:recentRangeStats`):
+  tracks log count per topic0 per range; surfaced via `/health` so ops
+  see trend before hitting caps.
+
+### Ceiling update
+Before flip: ~1,000 DAOs (address-chunked getLogs = 400 RPC calls/range).
+After flip: expected ~5,000 DAOs (27 topics = flat 27 RPC calls/range,
+plus 3 scoped topics = DAO-count-proportional). Chain-wide log volume
+becomes the new ceiling; per-topic counters + U1/U6 bisect provide the
+guard rail. Option B (write-path batching) still needed for 10k.
+
+### Rollback
+`FETCH_MODE=scoped` env flip, restart. No schema change, no state drift.
+
+### Verification
+- `npm run typecheck` clean
+- `npm run test:run` — 344 unit tests pass (338 pre-flip + 6 bisect coverage)
+- `scripts/bench-filter.ts` budget: ≤100k logs/range at 280k logs/sec
+- `scripts/measure-log-volume.ts` run against mainnet + testnet: 0 logs
+  across all 24 topics (Quai + DAO Ships too new to extrapolate from —
+  flip is free today)
+
+---
+
+## 0.3 Measurement spike (Option B + unfiltered fetch)
+
+Option B and the unfiltered-topic0 scaling fetch are both gated on a
+measurement spike. Two tools land in `scripts/`:
+
+### `npm run measure:log-volume -- --from-block N --to-block M`
+
+Hits Quai RPC with an UNFILTERED `getLogs` per registered topic0 over a
+sample range. Reports per-topic log count, approximate bytes, distinct
+emitting addresses, and a provisional FLIP / NO-FLIP verdict against the
+default thresholds (50k logs, 50MB bytes per range).
+
+Reads only — safe against mainnet. Requires `RPC_URL` in env.
+
+**Run 2–3 sample ranges spanning different chain activity profiles**
+(quiet vs. busy). For each topic, decide:
+
+- **Flip to unfiltered** if logCount < 50,000 AND bytes < 50 MB across
+  all samples. Non-collision-prone topics (everything except `Transfer`,
+  `Paused`/`Unpaused`, `Approval`) usually clear this trivially because
+  only DAO Ships contracts emit them.
+- **Stay scoped** if either threshold is breached. Most critical for
+  `Transfer` (topic0 `0xddf252ad...` is every ERC20 on chain).
+- **Measure further** if borderline — sample more ranges before flipping.
+
+### `npm run bench:filter`
+
+Synthetic benchmark of the in-process registry filter at 10k-DAO scale.
+No RPC, no DB — pure CPU/memory. Budget guide per 5-second poll:
+
+| Filter wall-clock | Verdict |
+|---|---|
+| <50 ms | Free, noise-level |
+| 50–500 ms | Acceptable |
+| >500 ms | Redesign required (streaming filter, worker thread, or stay scoped) |
+
+**Observed (10k DAOs, 1% match rate, V8 with --expose-gc):**
+
+| Input logs | Kept | Filter wall | Heap delta |
+|---|---|---|---|
+| 10,000 | ~90 | ~50 ms | ~30 MB |
+| 100,000 | ~1,000 | ~350 ms | ~200 MB |
+| 1,000,000 | ~10,000 | ~3,400 ms | ~1.7 GB |
+
+**Takeaway:** filter CPU scales ~linearly (~280k logs/sec). At 1M
+logs/range we blow both the wall-clock budget (>3s) AND heap ceiling
+(~1.7 GB pressure on a 2 GB container). Hard cap per range must be
+enforced client-side — aligns with Security Engineer's U1 mandatory
+mitigation. Practical cap: **100k logs per range** for a 1 GB process.
+
+### Decision rule (combined)
+
+A topic flips to unfiltered only when ALL hold:
+
+1. Real-Quai `measure:log-volume` verdict is FLIP across 3 sample ranges.
+2. Synthetic filter cost at the observed logCount stays under 500 ms.
+3. Raw response size per range stays under the RPC provider's cap AND
+   under the client-side byte limit we set (proposal: 100 MB).
+
+Transfer will almost certainly fail (1) and possibly (2) at mainnet
+scale — plan to keep it scoped until a dedicated measurement says
+otherwise.
+
+---
+
+## 0.2 Decisions made
+
+1. **Cache scope: `processBlockRange`, not `processLogs`.** Lets the
+   discovery-pass loop share warm entries across passes within the same
+   range. Same reorg-safety guarantee because the cache dies with the
+   function frame.
+2. **Invalidate-on-write > `.select().single()` for partial writes.**
+   Changing `upsertMember` to return the row would require a
+   `.select().single()` on every write path, costing an RTT per write.
+   Invalidating is cheaper and removes the partial-shape caching risk
+   at the type boundary.
+3. **Write-after-success rule is load-bearing.** Any handler that
+   populates the cache before the DB write resolves would leave a
+   post-mutation row in cache if the write then fails deterministically
+   and the log is skipped. All `setMember`/`setDao` calls land AFTER
+   the corresponding `await ctx.db.upsertX(...)`.
+4. **Drop Proposal cache surface.** No hot-path consumers; API was
+   forward-looking dead code. Re-add when a consumer appears.
+5. **Invalidate after `incrementMemberVotes`.** The RPC updates
+   `votes`/`last_activity_at` server-side. Even though no current
+   handler reads those fields from a cached row, invalidating keeps the
+   "any write invalidates cache[X]" invariant intact.
+6. **E6 `Promise.all` race accepted.** Two concurrent `fetchMember`
+   calls on the same key both miss on the first Transfer of a range.
+   Tracked via `stats.concurrentMisses`; promotable to promise-
+   memoization if post-deploy data shows it as a hot path.
 
 ---
 

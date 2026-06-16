@@ -5,8 +5,13 @@ import { logger } from '../utils/logger.js';
 import { validateEventArgs, validateAndNormalizeAddress, validateContractAddress } from '../utils/validation.js';
 
 import OnboarderNavigatorAbi from '../abis/OnboarderNavigator.json' with { type: 'json' };
+import NFTGatedNavigatorAbi from '../abis/NFTGatedNavigator.json' with { type: 'json' };
 
 export const onboarderNavigatorIface = new Interface(OnboarderNavigatorAbi);
+// NFTGatedNavigator shares Onboard/NavigatorDeployed/Paused/Unpaused topic0s with the
+// other navigators (handled elsewhere); only its NFTClaimed signature is unique and
+// registered from this interface — see registerAllHandlers in index.ts.
+export const nftGatedNavigatorIface = new Interface(NFTGatedNavigatorAbi);
 
 // ── Navigator → DAO cache (LRU-bounded) ────────────────────────────
 // Avoids repeated on-chain calls to daoShip() for the same navigator address.
@@ -28,7 +33,7 @@ export function evictNavigatorFromCache(navigatorAddress: string): void {
   navigatorDaoCache.delete(navigatorAddress.toLowerCase());
 }
 
-async function getDaoFromNavigator(
+export async function getDaoFromNavigator(
   ctx: EventContext,
   navigatorAddress: string,
 ): Promise<string | null> {
@@ -79,6 +84,13 @@ async function getDaoFromNavigator(
 
 function makeNavigatorEventId(txHash: string, logIndex: number): string {
   return `${txHash}-${logIndex}`;
+}
+
+// A claim is unique per (navigator, tokenId): a token can be claimed exactly
+// once, ever. Keying the row on this — rather than txHash-logIndex — makes
+// replay/reorg idempotent and gives O(1) "is token #N claimed?" lookups.
+function makeNftClaimId(navigatorAddress: string, tokenId: string): string {
+  return `${navigatorAddress.toLowerCase()}-${tokenId}`;
 }
 
 // ── OnboarderNavigator.Onboard ─────────────────────────────────────
@@ -139,3 +151,64 @@ export async function handleOnboard(
 // (Solidity event hashes use types only, not parameter names). Both are handled by
 // handleOnboard above. Navigator type is determined via the navigator_type column
 // populated by handleNavigatorSet reading the contract's navigatorType() constant.
+
+// ── NFTGatedNavigator.NFTClaimed ───────────────────────────────────
+// NFTClaimed(address indexed daoShipAddress, address indexed holder, uint256 indexed tokenId, uint256 shares, uint256 loot)
+//
+// Fires alongside the generic Onboard event on every successful NFT-gated claim.
+// Onboard is the onboarding-activity / member-balance source (handled by
+// handleOnboard); NFTClaimed records the per-token claim dimension Onboard does
+// not carry: which tokenId was spent, by whom, when. A token can be claimed
+// exactly once, ever — so this is the canonical "is token #N still claimable?"
+// and provenance record. It is ADDITIVE to Onboard, never a replacement, and
+// must NOT mutate member balances (that would double-count with Onboard/Transfer).
+
+export async function handleNFTClaimed(
+  ctx: EventContext,
+  args: Record<string, unknown>,
+): Promise<void> {
+  validateEventArgs(args, ['daoShipAddress', 'holder', 'tokenId', 'shares', 'loot'], 'NFTClaimed');
+  const daoShipAddress = validateAndNormalizeAddress(args.daoShipAddress, 'daoShipAddress');
+  const holder = validateAndNormalizeAddress(args.holder, 'holder');
+  const tokenId = bigintToString(safeBigInt(args.tokenId));
+  const sharesMinted = bigintToString(safeBigInt(args.shares));
+  const lootMinted = bigintToString(safeBigInt(args.loot));
+
+  const navigatorAddress = ctx.log.address.toLowerCase();
+
+  // The event carries the DAO directly (like Onboard). Validate against the
+  // registry as defense-in-depth; fall back to on-chain resolution so a claim
+  // is never silently dropped when registry hydration lags.
+  if (!ctx.registry.getDaoByDaoShipAddress(daoShipAddress)) {
+    const resolvedDaoId = await getDaoFromNavigator(ctx, navigatorAddress);
+    if (!resolvedDaoId) {
+      logger.warn({ navigatorAddress, daoShipAddress, tokenId }, 'NFTClaimed: daoShipAddress not in registry and could not resolve DAO, skipping');
+      return;
+    }
+    if (resolvedDaoId !== daoShipAddress) {
+      logger.warn({ navigatorAddress, eventDaoShip: daoShipAddress, resolvedDaoShip: resolvedDaoId }, 'NFTClaimed: daoShipAddress mismatch between event and on-chain, using event value');
+    }
+  }
+
+  const now = new Date(ctx.blockTimestamp * 1000).toISOString();
+
+  // id keyed on (navigator, tokenId) → upsert is idempotent under replay/reorg,
+  // and reorg-safe via the `block_number > p_block_number` prune in schema.sql.
+  await ctx.db.upsert('ds_nft_claims', {
+    id: makeNftClaimId(navigatorAddress, tokenId),
+    dao_id: daoShipAddress,
+    navigator_address: navigatorAddress,
+    token_id: tokenId,
+    holder, // claimer at claim time; the NFT may move later but the claim is permanent
+    shares: sharesMinted,
+    loot: lootMinted,
+    tx_hash: ctx.log.transactionHash,
+    block_number: ctx.log.blockNumber,
+    created_at: now,
+  });
+
+  logger.info(
+    { daoId: daoShipAddress, navigatorAddress, holder, tokenId },
+    'NFTClaimed event indexed',
+  );
+}

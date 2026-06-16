@@ -78,6 +78,12 @@ The indexer uses a multi-environment schema pattern with `ds_` table prefixes:
 | `ds_votes` | Individual vote records |
 | `ds_navigators` | Registered navigators with permissions and type |
 | `ds_navigator_events` | Onboard events from navigators |
+| `ds_nft_claims` | NFTGatedNavigator per-token claims |
+| `ds_signal_polls`, `ds_signal_votes` | SignalNavigator polls + votes (derive-from-truth tally) |
+| `ds_timelock_changes`, `ds_governance_config_history` | TimelockNavigator change lifecycle + bypass flagging |
+| `ds_vesting_schedules`, `ds_vesting_claims` | VestingNavigator schedules + claims (derived `claimed`) |
+| `ds_budgets`, `ds_budget_disbursements`, `ds_vault_module_events` | BudgetNavigator budgets + payouts + vault-module trust feed |
+| `ds_subscription_members`, `ds_subscription_payments`, `ds_subscription_collections` | SubscriptionNavigator dues: membership + payment/collection feeds (derived `total_paid`) |
 | `ds_ragequits` | Member exit records with per-token amounts |
 | `ds_records` | Poster metadata (profiles, rationale, announcements) |
 | `ds_guild_tokens` | Registered ragequit tokens |
@@ -106,6 +112,12 @@ SELECT drop_ds_schema('dev');         -- Drop (full teardown)
 | Navigator | `Onboard` (OnboarderNavigator + ERC20TributeNavigator) |
 | Exit | `Ragequit` |
 | Poster | `NewPost` (14 recognized tags) |
+
+Beyond the 24 core events, per-navigator feature events are also indexed via `NavigatorDeployed`-bound
+discovery: `NFTClaimed` (NFTGated); `PollCreated`/`Voted`/`PollCancelled` (Signal);
+`ChangeQueued`/`ChangeExecuted`/`ChangeCancelled` (Timelock); `ScheduleCreated`/`TokensClaimed`/`ScheduleRevoked`
+(Vesting); `BudgetCreated`/`Disbursed`/`ManagerUpdated`/`BudgetCancelled` + vault `EnabledModule`/`DisabledModule`
+(Budget); and `MemberEnrolled`/`FeePaid`/`FeeCollected` (Subscription). See `docs/*_NAVIGATOR_SUPPORT.md`.
 
 ## Poster Trust Model
 

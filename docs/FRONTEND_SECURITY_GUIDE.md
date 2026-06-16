@@ -97,9 +97,18 @@ All columns are contract-derived. No user-supplied strings.
 | **`content`** | **UNTRUSTED** | Raw post body (max 16KB) | **Never render as HTML. Escape or ignore.** |
 | **`content_json`** | **UNTRUSTED** | Validated subset of parsed content | **See Section 5 for per-tag handling.** |
 
-#### ds_ragequits, ds_guild_tokens, ds_delegations, ds_event_transactions, ds_navigator_events
+#### ds_ragequits, ds_guild_tokens, ds_delegations, ds_event_transactions, ds_navigator_events, ds_nft_claims, ds_signal_votes, ds_timelock_changes, ds_vesting_schedules, ds_vesting_claims, ds_budgets, ds_budget_disbursements, ds_vault_module_events, ds_subscription_members, ds_subscription_payments, ds_subscription_collections
 
-All columns are contract-derived. No user-supplied strings except `ds_navigator_events.metadata` (JSONB from the indexer's event parsing -- treat as semi-trusted but still escape string values when rendering).
+All columns are contract-derived (addresses, amounts, booleans, block numbers). No user-supplied strings to escape, except `ds_navigator_events.metadata` (JSONB from the indexer's event parsing -- treat as semi-trusted but still escape string values when rendering). The BudgetNavigator tables (`ds_budgets`, `ds_budget_disbursements`, `ds_vault_module_events`) and the SubscriptionNavigator tables (`ds_subscription_members`, `ds_subscription_payments`, `ds_subscription_collections`) carry **no** user strings — render their addresses/amounts/booleans directly.
+
+> **Note:** `ds_signal_polls` carries several **creator-authored** free-text fields — escape them
+> like `ds_navigators.name`/`description` (they are not in the contract-derived set above):
+> `question`, `options[]` (the per-option labels), `description`, and `discussion_url`. All four
+> come from the poll creator via a `daoships.signal.poll` Poster post. `discussion_url` is validated
+> by the indexer against the `http`/`https`/`ipfs` scheme allowlist, but still treat it as
+> untrusted — render it as a link with `rel="noopener noreferrer"` and never reflect it into a
+> `javascript:`-capable sink. Everything else on `ds_signal_polls` (counts, timestamps, `tally`,
+> addresses) is contract-derived.
 
 ---
 
@@ -118,6 +127,10 @@ These are the only fields across all tables that can contain attacker-controlled
 | `ds_proposals` | `proposal_data` | Unbounded | Hex-encoded calldata |
 | `ds_navigators` | `name` | 100 | Short text |
 | `ds_navigators` | `description` | 1000 | Long text / potential Markdown |
+| `ds_signal_polls` | `question` | ~2000 | Short text / IPFS CID (poll headline) |
+| `ds_signal_polls` | `options[]` | 200/label | Short text (per-option labels) |
+| `ds_signal_polls` | `description` | 1000 | Short text (poll context) |
+| `ds_signal_polls` | `discussion_url` | 2048 | URL (scheme-validated, still untrusted) |
 | `ds_records` | `content` | 16KB | Raw post body |
 | `ds_records` | `content_json` | JSONB | Validated per-tag object |
 
@@ -136,7 +149,7 @@ React's JSX expressions auto-escape string values. This is your primary defense:
 <div dangerouslySetInnerHTML={{ __html: record.content }} />   // XSS
 ```
 
-**Rule: Never use `dangerouslySetInnerHTML` with any field from `ds_daos`, `ds_records`, `ds_navigators`, or `ds_proposals`.**
+**Rule: Never use `dangerouslySetInnerHTML` with any field from `ds_daos`, `ds_records`, `ds_navigators`, `ds_signal_polls`, or `ds_proposals`.**
 
 ### Markdown Rendering
 
@@ -197,13 +210,32 @@ const schema = {
 </ReactMarkdown>
 ```
 
-### Field-by-Field Rendering Guide
+### Theme colors (`content_json.theme`)
+
+A DAO profile may carry a `theme` color palette (schema 1.1+). Colors fed into CSS are a distinct
+injection vector from HTML: an unvalidated string like `#fff; } body { background: url(//evil) }`
+interpolated into a `style` attribute or stylesheet can inject arbitrary rules.
+
+**The indexer is the trust boundary here.** `validateDaoProfile`/`validateDaoProfileInitial` accept a
+theme color ONLY if it matches `^#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})$`, constrain `mode` to `light`/`dark`,
+and read from a fixed key allowlist — every other token is dropped before it reaches `content_json`. So:
+
+- **Safe:** apply `content_json.theme.*` directly to CSS variables / `style` (it is pre-validated hex).
+  ```tsx
+  <div style={{ '--dao-primary': theme.primary }} />   // theme.primary is guaranteed strict hex
+  ```
+- **Never** apply theme colors taken from the raw `ds_records.content` column (or any other unvalidated
+  source) to CSS — only `content_json.theme`, which passed the indexer's hex gate, is trusted.
+- **Contrast is still yours.** The indexer validates format, not legibility — check posted pairs against
+  WCAG AA and fall back to your defaults when a pair fails.
 
 | Field | Render As | Method |
 |-------|-----------|--------|
 | `dao.name` | Plain text | `{dao.name}` (JSX auto-escape) |
 | `dao.description` | Markdown | `renderMarkdown()` with DOMPurify |
 | `dao.avatar_img` | Image src | Validate URL first (Section 4) |
+| `content_json.theme.*` (colors) | CSS variable / `style` | Pre-validated strict hex by the indexer — safe to apply; still check WCAG contrast |
+| `content_json.banner` | Image src | Validate URL first (Section 4) |
 | `proposal.details` | Plain text | `{proposal.details}` (JSX auto-escape) |
 | `proposal.proposal_data` | Hex display | `{proposal.proposal_data}` or truncated |
 | `navigator.name` | Plain text | `{navigator.name}` (JSX auto-escape) |
@@ -452,15 +484,26 @@ The indexer validates `content_json` with per-tag schema validators that:
 ### Expected Shapes by Tag
 
 ```typescript
+// Brand color palette (schema 1.1+) on both dao.profile tags. Every color is indexer-validated
+// to STRICT hex (^#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})$) and `mode` to light|dark BEFORE storage —
+// non-conforming tokens are dropped. So a value present in content_json.theme is safe to assign to
+// a CSS variable / style. See "Theme colors" under XSS Prevention below.
+interface DaoThemeJson {
+  mode?: 'light' | 'dark';
+  primary?: string; secondary?: string; accent?: string;   // strict hex
+  background?: string; surface?: string; text?: string;     // strict hex
+}
+
 // daoships.dao.profile.initial (all fields required except optional ones)
 interface DaoProfileInitialJson {
   schemaVersion: string;   // required
   daoAddress: string;      // required, max 42
   name: string;            // required, max 100
   description: string;     // required, max 1000
-  avatar?: string;         // URL, max 2048
+  avatar?: string;         // URL, max 2048 (the DAO icon)
   banner?: string;         // URL, max 2048
   links?: Record<string, string>;  // max 20 keys, values are URLs
+  theme?: DaoThemeJson;    // strict-hex colors (schema 1.1+)
   tags?: string[];         // max 20 items, max 50 chars each
   chainId?: number;
 }
@@ -471,9 +514,10 @@ interface DaoProfileJson {
   daoAddress: string;      // required, max 42
   name?: string;           // max 100
   description?: string;    // max 1000
-  avatar?: string;         // URL, max 2048
+  avatar?: string;         // URL, max 2048 (the DAO icon)
   banner?: string;         // URL, max 2048
   links?: Record<string, string>;  // max 20 keys, values are URLs
+  theme?: DaoThemeJson;    // strict-hex colors (schema 1.1+)
   tags?: string[];         // max 20 items, max 50 chars each
   chainId?: number;
 }
@@ -513,6 +557,19 @@ interface NavigatorAllowlistJson {
   root: string;            // required, bytes32 Merkle root
   addresses: string[];     // required, non-empty array of hex addresses
   treeDump: object;        // required, StandardMerkleTree.dump() output
+}
+
+// daoships.signal.poll (creator-match trust: msg.sender == PollCreated.creator)
+// The validated labels are also written onto the ds_signal_polls row (options/description/
+// discussion_url); render from there. All string fields are creator-authored — escape them.
+interface SignalPollJson {
+  schemaVersion: string;   // required
+  daoAddress: string;      // required, hex address
+  navigatorAddress: string; // required, hex address
+  pollId: string;          // required, per-navigator id (NUMERIC as string)
+  options: string[];       // required, 2..10 labels; length must equal on-chain optionCount
+  description?: string;    // max 1000
+  discussionUrl?: string;  // URL (http/https/ipfs), max 2048 — still untrusted
 }
 ```
 

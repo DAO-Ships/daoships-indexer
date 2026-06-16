@@ -1,8 +1,7 @@
 import { Interface } from 'quais';
 import type { EventContext } from './index.js';
-import type { MemberRow } from '../types/index.js';
 import { makeMemberId } from '../utils/addresses.js';
-import { addNumericStrings, subtractNumericStringsFloored, wouldClamp, bigintToString, safeBigInt, strictBigInt } from '../utils/bigint.js';
+import { bigintToString, safeBigInt, strictBigInt } from '../utils/bigint.js';
 import { logger } from '../utils/logger.js';
 import { validateEventArgs, validateAndNormalizeAddress } from '../utils/validation.js';
 
@@ -23,6 +22,28 @@ const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 // balances are always tracked here since setUp() mints via sharesToken.mint()
 // directly without emitting MintShares.
 
+/**
+ * Option B — atomic, idempotent Transfer handler.
+ *
+ * All balance math + active-member-delta computation + log-dedup happens
+ * server-side inside `ds_apply_transfer`. The handler is strictly a
+ * dispatcher into the RPC — no client-side read-modify-write, no ordering
+ * races between debit and credit. Replay safety is guaranteed by the
+ * RPC's `INSERT INTO ds_processed_logs ON CONFLICT DO NOTHING` claim.
+ *
+ * Consequences of this design:
+ *   - The RangeCache no longer mirrors member balance writes from here —
+ *     the server-side math is the authoritative source. We invalidate on
+ *     touched members so any subsequent read in this range re-fetches
+ *     the fresh row.
+ *   - `updateActiveMemberCount` is no longer called directly; the RPC
+ *     returns `active_member_delta` and the handler queues the daoId for
+ *     the end-of-range `ds_recompute_dao_totals` flush (which also
+ *     derives active_member_count via `ds_update_active_member_count`
+ *     triggered implicitly, OR we can call updateActiveMemberCount
+ *     immediately since it's already idempotent — see below).
+ *   - The handler is marked `idempotent: true` in the dispatcher.
+ */
 export async function handleTransfer(
   ctx: EventContext,
   args: Record<string, unknown>,
@@ -40,103 +61,58 @@ export async function handleTransfer(
   }
 
   const isShares = ctx.registry.isSharesToken(tokenAddress);
-  const field = isShares ? 'shares' : 'loot';
-  const otherField = isShares ? 'loot' : 'shares';
   const valueStr = bigintToString(value);
-  const now = new Date(ctx.blockTimestamp * 1000).toISOString();
-  let activeMemberDelta = 0;
+  const timestamp = new Date(ctx.blockTimestamp * 1000);
 
+  const { alreadyProcessed, activeMemberDelta } = await ctx.db.applyTransfer({
+    txHash: ctx.log.transactionHash,
+    logIndex: ctx.log.index,
+    blockNumber: ctx.log.blockNumber,
+    daoId,
+    fromAddress: from,
+    toAddress: to,
+    value: valueStr,
+    isShares,
+    timestamp,
+  });
+
+  if (alreadyProcessed) {
+    logger.debug(
+      { txHash: ctx.log.transactionHash, logIndex: ctx.log.index },
+      'Transfer: already processed (idempotent replay short-circuit)',
+    );
+    return;
+  }
+
+  // Invalidate cache entries for touched members so the next same-range
+  // read sees the server's authoritative post-write row instead of our
+  // stale pre-RPC snapshot (which we never loaded under Option B).
   const hasSender = from !== ZERO_ADDRESS;
   const hasReceiver = to !== ZERO_ADDRESS;
-  const senderId = hasSender ? makeMemberId(daoId, from) : null;
-  const receiverId = hasReceiver ? makeMemberId(daoId, to) : null;
+  if (hasSender) ctx.cache.invalidateMember(makeMemberId(daoId, from));
+  if (hasReceiver && from !== to) ctx.cache.invalidateMember(makeMemberId(daoId, to));
 
-  // H5: Parallelize independent getMember reads when both sender and receiver
-  // exist and are different members. Self-transfers (from === to) must remain
-  // sequential to avoid reading stale data for the second operation.
-  let sender: MemberRow | null = null;
-  let receiver: MemberRow | null = null;
-  if (hasSender && hasReceiver && from !== to) {
-    [sender, receiver] = await Promise.all([
-      ctx.db.getMember(senderId!),
-      ctx.db.getMember(receiverId!),
-    ]);
-  } else {
-    if (hasSender) sender = await ctx.db.getMember(senderId!);
-    if (hasReceiver) receiver = await ctx.db.getMember(receiverId!);
-  }
-
-  // ── Debit sender (skip for mints where from is zero address) ──
-
-  const debitSender = async (): Promise<void> => {
-    const senderOldBalance = (sender?.[field] as string) || '0';
-    const senderOtherBalance = (sender?.[otherField] as string) || '0';
-    if (wouldClamp(senderOldBalance, valueStr)) {
-      logger.warn({ daoId, from, field, senderOldBalance, valueStr }, 'Transfer: sender balance would go negative — clamping to 0 (possible reorg or out-of-order event)');
-    }
-    const senderNewBalance = subtractNumericStringsFloored(senderOldBalance, valueStr);
-
-    const oldTotal = BigInt(senderOldBalance) + BigInt(senderOtherBalance);
-    const newTotal = BigInt(senderNewBalance) + BigInt(senderOtherBalance);
-    if (oldTotal > 0n && newTotal === 0n) activeMemberDelta -= 1;
-
-    await ctx.db.upsertMember({
-      id: senderId!,
-      dao_id: daoId,
-      member_address: from,
-      [field]: senderNewBalance,
-      created_at: sender ? (sender.created_at as string) : now,
-      updated_at: now,
-      last_activity_at: now,
-    });
-  };
-
-  // ── Credit receiver (skip for burns where to is zero address) ─
-
-  const creditReceiver = async (): Promise<void> => {
-    const receiverOldBalance = (receiver?.[field] as string) || '0';
-    const receiverOtherBalance = (receiver?.[otherField] as string) || '0';
-    const receiverNewBalance = addNumericStrings(receiverOldBalance, valueStr);
-
-    const oldTotal = BigInt(receiverOldBalance) + BigInt(receiverOtherBalance);
-    const newTotal = BigInt(receiverNewBalance) + BigInt(receiverOtherBalance);
-    if (oldTotal === 0n && newTotal > 0n) activeMemberDelta += 1;
-
-    await ctx.db.upsertMember({
-      id: receiverId!,
-      dao_id: daoId,
-      member_address: to,
-      [field]: receiverNewBalance,
-      created_at: receiver ? (receiver.created_at as string) : now,
-      updated_at: now,
-      last_activity_at: now,
-    });
-  };
-
-  // E6: Parallelize when both sides exist and are distinct members. The
-  // synchronous `activeMemberDelta` math in each body runs BEFORE its await,
-  // so Promise.all yields deterministic aggregate delta (both +/- increments
-  // apply regardless of promise completion order). Self-transfers
-  // (from === to) must stay sequential to avoid read-modify-write on the
-  // same row.
-  if (hasSender && hasReceiver && from !== to) {
-    await Promise.all([debitSender(), creditReceiver()]);
-  } else {
-    if (hasSender) await debitSender();
-    if (hasReceiver) await creditReceiver();
-  }
-
-  // Atomically update DAO active member count if transitions occurred (best-effort — non-critical counter).
+  // Apply the membership count delta via the existing idempotent
+  // (derive-from-truth) RPC. The delta value is only used as a hint for
+  // log output; the RPC itself recomputes from ds_members.
   if (activeMemberDelta !== 0) {
     try {
       await ctx.db.updateActiveMemberCount(daoId, activeMemberDelta);
+      ctx.cache.invalidateDao(daoId);
     } catch (err) {
       logger.warn({ daoId, activeMemberDelta, err }, 'Transfer - failed to update active member count');
     }
   }
 
+  // Queue for end-of-range total_shares / total_loot recompute. Cheap —
+  // deduped into a Set by the processor.
+  ctx.dirtyDaoIds.add(daoId);
+
   const kind = from === ZERO_ADDRESS ? 'mint' : to === ZERO_ADDRESS ? 'burn' : 'transfer';
-  logger.info({ daoId, from, to, value: valueStr, field, kind }, 'Token transfer');
+  logger.info(
+    { daoId, from, to, value: valueStr, field: isShares ? 'shares' : 'loot', kind, activeMemberDelta },
+    'Token transfer applied via ds_apply_transfer',
+  );
 }
 
 // ── DelegateChanged ─────────────────────────────────────────────
@@ -161,7 +137,11 @@ export async function handleDelegateChanged(
 
   const now = new Date(ctx.blockTimestamp * 1000).toISOString();
 
-  // Insert delegation record (SERIAL PK — always insert, never upsert)
+  // Option B: the ds_delegations table has a unique index on
+  // (tx_hash, delegator). A retry of this log after partial commit
+  // would otherwise insert a duplicate SERIAL-PK row; the index makes
+  // it fail with 23505, which `DatabaseService.insert` swallows as an
+  // idempotent no-op.
   await ctx.db.insert('ds_delegations', {
     dao_id: daoId,
     delegator,
@@ -184,6 +164,9 @@ export async function handleDelegateChanged(
     updated_at: now,
     last_activity_at: now,
   });
+  // Partial upsert — don't cache the partial shape. Invalidate so the next
+  // read re-fetches the merged row from DB.
+  ctx.cache.invalidateMember(memberId);
 
   logger.info(
     { daoId, delegator, fromDelegate, toDelegate },
@@ -222,6 +205,7 @@ export async function handleDelegateVotesChanged(
     updated_at: now,
     last_activity_at: now,
   });
+  ctx.cache.invalidateMember(memberId);
 
   logger.info(
     { daoId, delegate, newBalance: bigintToString(newBalance) },
@@ -240,6 +224,7 @@ async function handlePauseState(ctx: EventContext, paused: boolean): Promise<voi
   if (tokenDaoId) {
     const field = ctx.registry.isSharesToken(addr) ? 'shares_paused' : 'loot_paused';
     await ctx.db.updateDao(tokenDaoId, { [field]: paused });
+    ctx.cache.invalidateDao(tokenDaoId);
     logger.info({ daoId: tokenDaoId, field }, `Token ${label}`);
     return;
   }

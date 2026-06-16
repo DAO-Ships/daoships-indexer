@@ -1,5 +1,6 @@
 import type { EventContext, EventHandler } from './index.js';
 import type { DaoRow } from '../types/index.js';
+import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { Interface } from 'quais';
 import { validateEventArgs, validateAndNormalizeAddress } from '../utils/validation.js';
@@ -62,6 +63,17 @@ export const handleLaunchDAOShipAndVault: EventHandler = async (
   ctx: EventContext,
   args: Record<string, unknown>,
 ): Promise<void> => {
+  // U2: Under unfiltered topic0 mode, any contract on chain can emit a
+  // matching topic0. Writes to `ds_daos` have NO upstream FK protection,
+  // so we gate here: only our configured launcher contract is allowed to
+  // materialize a DAO row. Spoofed events from any other address are
+  // silently dropped.
+  const emitter = ctx.log.address.toLowerCase();
+  if (emitter !== config.contracts.daoShipAndVaultLauncher) {
+    logger.warn({ emitter }, 'LaunchDAOShipAndVault from unauthorized address — dropping');
+    return;
+  }
+
   const validated = validateEventArgs<{
     daoShip: string; vault: string; shares: string; loot: string;
     newVault: boolean; launcher: string;
@@ -83,7 +95,7 @@ export const handleLaunchDAOShipAndVault: EventHandler = async (
 
   ctx.registry.registerDao({ daoShipAddress, sharesAddress, lootAddress, avatar: vaultAddress });
 
-  await ctx.db.upsertDao(buildDaoSkeleton({
+  const skeleton = buildDaoSkeleton({
     id: daoShipAddress,
     sharesAddress,
     lootAddress,
@@ -93,7 +105,11 @@ export const handleLaunchDAOShipAndVault: EventHandler = async (
     newVault,
     txHash: ctx.log.transactionHash,
     createdAt: new Date(ctx.blockTimestamp * 1000).toISOString(),
-  }));
+  });
+  await ctx.db.upsertDao(skeleton);
+  // Cache-after-success: skeleton is a full DaoRow. Same-range SetupComplete
+  // or NewPost immediately after launch will hit cache instead of re-fetching.
+  ctx.cache.setDao(daoShipAddress, skeleton);
 };
 
 /**
@@ -108,6 +124,17 @@ export const handleLaunchDAOShip: EventHandler = async (
   ctx: EventContext,
   args: Record<string, unknown>,
 ): Promise<void> => {
+  // U2: See handleLaunchDAOShipAndVault. Same rationale.
+  const emitter = ctx.log.address.toLowerCase();
+  if (emitter !== config.contracts.daoShipLauncher &&
+      emitter !== config.contracts.daoShipAndVaultLauncher) {
+    // The DAOShipAndVaultLauncher internally calls DAOShipLauncher which
+    // re-emits LaunchDAOShip from the vault-launcher address, so both
+    // are legitimate emitters for this event.
+    logger.warn({ emitter }, 'LaunchDAOShip from unauthorized address — dropping');
+    return;
+  }
+
   const validated = validateEventArgs<{
     daoShip: string; shares: string; loot: string; avatar: string; launcher: string;
   }>(args, ['daoShip', 'shares', 'loot', 'avatar', 'launcher'], 'LaunchDAOShip');
@@ -133,7 +160,7 @@ export const handleLaunchDAOShip: EventHandler = async (
 
   ctx.registry.registerDao({ daoShipAddress, sharesAddress, lootAddress, avatar: avatarAddress });
 
-  await ctx.db.upsertDao(buildDaoSkeleton({
+  const skeleton = buildDaoSkeleton({
     id: daoShipAddress,
     sharesAddress,
     lootAddress,
@@ -143,5 +170,7 @@ export const handleLaunchDAOShip: EventHandler = async (
     newVault: false,
     txHash: ctx.log.transactionHash,
     createdAt: new Date(ctx.blockTimestamp * 1000).toISOString(),
-  }));
+  });
+  await ctx.db.upsertDao(skeleton);
+  ctx.cache.setDao(daoShipAddress, skeleton);
 };

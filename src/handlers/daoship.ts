@@ -18,7 +18,7 @@ import {
 } from '../utils/addresses.js';
 
 import { evictNavigatorFromCache } from './navigators.js';
-import { config } from '../config.js';
+import { config, READ_ONLY_NAVIGATOR_TYPES, MODULE_NAVIGATOR_TYPES } from '../config.js';
 
 import INavigatorAbi from '../abis/INavigator.json' with { type: 'json' };
 import DAOShipAbi from '../abis/DAOShip.json' with { type: 'json' };
@@ -83,16 +83,15 @@ async function handleMintOrBurn(
     return;
   }
 
-  const sign = operation === 'mint' ? 1n : -1n;
-  const daoTotalDelta = amounts.reduce((sum, amt) => sum + amt * sign, 0n);
-
-  // Atomic server-side adjustment — eliminates read-modify-write race window
-  // between handler completion and markLogProcessed (audit M20).
-  await ctx.db.adjustDaoTotals(
-    daoId,
-    tokenType === 'shares' ? daoTotalDelta.toString() : '0',
-    tokenType === 'loot' ? daoTotalDelta.toString() : '0',
-  );
+  // Option B: member balances are authoritative via the Transfer handler's
+  // `ds_apply_transfer` call. This handler only flags the DAO as dirty so
+  // `ds_recompute_dao_totals` runs once at end-of-range — derive-from-truth
+  // from ds_members, guaranteed idempotent under replay.
+  // (Unused but kept for parity with the event shape: `operation`,
+  // `tokenType`, `amounts` no longer drive any write path here.)
+  void operation; void tokenType; void amounts;
+  ctx.dirtyDaoIds.add(daoId);
+  ctx.cache.invalidateDao(daoId);
 }
 
 // ---------------------------------------------------------------------------
@@ -126,7 +125,14 @@ export const handleSetupComplete: EventHandler = async (
 
   logger.info({ daoId, name, symbol }, 'SetupComplete');
 
-  await ctx.db.updateDao(daoId, {
+  // The 15 fields this handler sets are a known merge onto the DAO row.
+  // In the common case the launcher's setDao populated the cache with
+  // the skeleton in the same range, so fetchDao is a hit; we merge the
+  // updates locally and setDao the full row so subsequent NewPost /
+  // SubmitProposal handlers in this range hit cache. On a cache miss
+  // (e.g., mid-life SetupComplete in a fresh range), fetchDao issues
+  // one DB read, still a net win vs. invalidate + re-fetch-later.
+  const updates = {
     share_token_name: name,
     share_token_symbol: symbol,
     loot_paused: lootPaused,
@@ -142,7 +148,17 @@ export const handleSetupComplete: EventHandler = async (
     total_loot: totalLoot,
     loot_token_name: lootTokenName,
     loot_token_symbol: lootTokenSymbol,
-  });
+  };
+  const existing = await ctx.cache.fetchDao(daoId, () => ctx.db.getDao(daoId));
+  await ctx.db.updateDao(daoId, updates);
+  if (existing) {
+    ctx.cache.setDao(daoId, { ...existing, ...updates });
+  } else {
+    // Row didn't exist before this handler (shouldn't happen post-launch
+    // but defensive); fall back to invalidate so the next reader fetches
+    // the freshly-updated row.
+    ctx.cache.invalidateDao(daoId);
+  }
 
   // Insert guild tokens.
   for (const tokenAddr of guildTokens) {
@@ -224,6 +240,7 @@ export const handleSubmitProposal: EventHandler = async (
   // Atomically increment DAO proposal count (best-effort — non-critical counter).
   try {
     await ctx.db.incrementProposalCount(daoId);
+    ctx.cache.invalidateDao(daoId);
   } catch (err) {
     logger.warn({ daoId, err }, 'SubmitProposal - failed to increment proposal count');
   }
@@ -268,6 +285,7 @@ export const handleSponsorProposal: EventHandler = async (
   await ctx.db.updateDao(daoId, {
     latest_sponsored_proposal_id: proposalIdNum,
   });
+  ctx.cache.invalidateDao(daoId);
 };
 
 // ---------------------------------------------------------------------------
@@ -337,6 +355,10 @@ export const handleSubmitVote: EventHandler = async (
     logger.error({ proposalId, daoId }, 'Proposal not found — created stub for orphaned vote (data gap detected)');
   }
   if (memberInserted) {
+    // Stub member written — invalidate so any subsequent getMember in this
+    // range re-fetches the materialized row. (No proposal cache consumers
+    // today, so skip proposal invalidation.)
+    ctx.cache.invalidateMember(memberId);
     logger.warn({ memberId, daoId }, 'Member not found — created stub for orphaned vote');
   }
 
@@ -355,8 +377,10 @@ export const handleSubmitVote: EventHandler = async (
   // Increment proposal vote tallies via RPC function.
   await ctx.db.incrementProposalVotes(proposalId, approved, balance);
 
-  // Increment member vote count.
+  // Increment member vote count. Invalidate the member in the cache so any
+  // later handler in the same range re-reads fresh `votes`/`last_activity_at`.
   await ctx.db.incrementMemberVotes(memberId, memberAddress, daoId, now);
+  ctx.cache.invalidateMember(memberId);
 };
 
 // ---------------------------------------------------------------------------
@@ -467,6 +491,7 @@ export const handleRagequit: EventHandler = async (
     updated_at: now,
   });
   if (memberStubInserted) {
+    ctx.cache.invalidateMember(memberId);
     logger.error({ memberId, daoId }, 'Member not found — created stub for orphaned ragequit (data gap detected)');
   }
 
@@ -485,25 +510,43 @@ export const handleRagequit: EventHandler = async (
     block_number: ctx.log.blockNumber,
   });
 
-  // Update DAO totals. ragequit() burns shares/loot directly via
-  // sharesToken.burn() / lootToken.burn() but does NOT emit BurnShares /
-  // BurnLoot events — only Transfer + Ragequit. So this handler is the
-  // sole owner of the DAO total adjustment for ragequit operations.
-  // Atomic server-side adjustment (audit M20).
+  // Option B: member balances for the burn go through the Transfer
+  // handler (ragequit emits Transfer(from=member, to=0) for both tokens).
+  // We only need to flag the DAO dirty so end-of-range recompute updates
+  // total_shares / total_loot from source-of-truth ds_members.
   if (sharesToBurn > 0n || lootToBurn > 0n) {
-    await ctx.db.adjustDaoTotals(
-      daoId,
-      sharesToBurn > 0n ? (-sharesToBurn).toString() : '0',
-      lootToBurn > 0n ? (-lootToBurn).toString() : '0',
-    );
+    ctx.dirtyDaoIds.add(daoId);
+    ctx.cache.invalidateDao(daoId);
   }
 };
 
 // ---------------------------------------------------------------------------
 // 7b. NavigatorDeployed (INavigator — emitted once in constructor)
-// Writes an orphan row (dao_id = NULL) into ds_navigators. Metadata is
-// provisional until a subsequent NavigatorSet from a registered DAOShip
-// promotes the row by setting dao_id and permission.
+//
+// Binds ds_navigators.dao_id from the event's self-asserted `daoShip` for EVERY
+// navigator — this is the canonical DAO association; NavigatorSet only ever
+// updates permission/is_active afterward (and never arrives for read-only
+// navigators). Type-routed:
+//   - Read-only type (SignalNavigator): RESOLUTION GATE — ignore entirely if the
+//     claimed DAO is unknown (permissionless self-assertion against a junk address
+//     is spam). Otherwise create the row complete: permission 0, is_active TRUE
+//     (read-only is functional at permission 0), trust_status 'self_asserted'
+//     (or 'sanctioned' if a vault sanction intent was already held), and register
+//     the navigator so getDaoFromNavigator resolves without RPC.
+//   - Module type (BudgetNavigator): a THIRD class — holds no DAOShip permission
+//     (no NavigatorSet) and is not read-only (no Poster sanctioning). Its authority
+//     is vault MODULE status. Bind dao_id (self-asserted; may be an as-yet-unknown
+//     DAO — budget navs can be deployed against a PREDICTED DAO address at launch, so
+//     unlike read-only we do NOT apply the resolution gate). Born is_active FALSE +
+//     trust_status 'self_asserted'; flipped to 'sanctioned'/is_active TRUE only when
+//     the DAO's vault emits EnabledModule (see handlers/vault-modules.ts). Events
+//     defer-and-backfill like read-only. A held EnabledModule intent (enable seen
+//     before this deploy) is consumed here.
+//   - Permissioned type (Onboarder/ERC20Tribute/NFTGated): bind dao_id (self-
+//     asserted; may be an as-yet-unknown DAO — dao_id has no FK), is_active FALSE
+//     (inert until a NavigatorSet grants permission), trust_status 'sanctioned'
+//     (it will be vouched by NavigatorSet; permissioned navs never enter the
+//     read-only trust machine).
 // ---------------------------------------------------------------------------
 
 export const handleNavigatorDeployed: EventHandler = async (
@@ -518,6 +561,22 @@ export const handleNavigatorDeployed: EventHandler = async (
   const navigatorType = sanitizeStr(String(args.navigatorType), 50);
   const navName = sanitizeStr(String(args.name), 255);
   const navDescription = sanitizeStr(String(args.description), 1000);
+
+  const isReadOnly = navigatorType !== null && READ_ONLY_NAVIGATOR_TYPES.has(navigatorType);
+  const isModule = navigatorType !== null && MODULE_NAVIGATOR_TYPES.has(navigatorType);
+  const daoKnown = ctx.registry.getDaoByDaoShipAddress(daoShip) !== undefined;
+
+  // Resolution gate: a read-only navigator's DAO binding is self-asserted and
+  // unauthenticated, so we refuse to even record one aimed at a DAO we don't index.
+  // (A permissioned navigator against an unknown DAO IS recorded — it stays inert
+  // and is prunable at chain head; its NavigatorSet will only ever come from a real DAO.)
+  if (isReadOnly && !daoKnown) {
+    logger.debug(
+      { navigatorAddress, daoShip, navigatorType },
+      'NavigatorDeployed: read-only navigator against unknown DAO — ignoring (resolution gate)',
+    );
+    return;
+  }
 
   const id = makeNavigatorId(daoShip, navigatorAddress);
   const now = new Date(ctx.blockTimestamp * 1000).toISOString();
@@ -540,25 +599,68 @@ export const handleNavigatorDeployed: EventHandler = async (
     );
   }
 
+  // Trust + active born-state, by class:
+  //   read-only → self_asserted, is_active TRUE  (functional at permission 0)
+  //   module    → self_asserted, is_active FALSE (powerless until vault enables it)
+  //   permissioned → sanctioned, is_active FALSE (inert until NavigatorSet grants)
+  // For read-only AND module navs a sanction may have been recorded BEFORE we saw the
+  // deploy (ordering): a vault daoships.dao.navigators post (read-only) or a vault
+  // EnabledModule (module). Both land a row in ds_navigator_sanction_intents keyed
+  // (dao, navigator) with the posting/enabling vault — consume + verify it here.
+  // (No event backfill is needed: a brand-new navigator has emitted nothing yet.)
+  let trustStatus = isReadOnly || isModule ? 'self_asserted' : 'sanctioned';
+  let isActive = isReadOnly; // module + permissioned start inert
+  if (isReadOnly || isModule) {
+    const heldVault = await ctx.db.consumeSanctionIntent(daoShip, navigatorAddress);
+    if (heldVault) {
+      const dao = ctx.registry.getDaoByDaoShipAddress(daoShip);
+      if (dao && heldVault.toLowerCase() === dao.avatar) {
+        trustStatus = 'sanctioned';
+        if (isModule) isActive = true; // vault enabled it → it can move treasury funds
+        logger.info({ navigatorAddress, daoShip, isModule }, 'NavigatorDeployed: applied held vault sanction → sanctioned');
+      } else {
+        logger.warn({ navigatorAddress, daoShip, heldVault }, 'NavigatorDeployed: held sanction vault mismatch — ignoring intent');
+      }
+    }
+  }
+
   logger.info(
-    { navigatorAddress, daoShip, navigatorType, deployer: deployerAddress, hasAllowlist: allowlistRoot !== null },
-    'NavigatorDeployed (orphan)',
+    { navigatorAddress, daoShip, navigatorType, deployer: deployerAddress, isReadOnly, trustStatus, hasAllowlist: allowlistRoot !== null },
+    'NavigatorDeployed',
   );
 
   await ctx.db.upsert('ds_navigators', {
     id,
-    dao_id: null,
+    dao_id: daoShip,
     navigator_address: navigatorAddress,
     deployer: deployerAddress,
     navigator_type: navigatorType,
     name: navName,
     description: navDescription,
-    is_active: false,
+    permission: 0,
+    permission_label: permissionToLabel(0),
+    permission_ever_granted: false,
+    trust_status: trustStatus,
+    // read-only is functional immediately; module is inert until EnabledModule (or a
+    // held enable intent flips isActive above); permissioned is inert until NavigatorSet.
+    is_active: isActive,
+    paused: false,
     allowlist_root: allowlistRoot,
+    deploy_block: ctx.log.blockNumber,
     created_at: now,
     tx_hash: ctx.log.transactionHash,
     updated_at: now,
   });
+
+  // Register read-only AND module navigators now: both are discovered exclusively via
+  // NavigatorDeployed (no NavigatorSet ever fires), so registering here lets
+  // getDaoFromNavigator resolve without an RPC and the vault-module watch resolve a
+  // module's DAO. Register module navs even against an unknown (predicted) DAO — the
+  // mapping is harmless and the materialization gate still defers until sanctioned.
+  // Permissioned navigators are registered on NavigatorSet (permission > 0).
+  if (isReadOnly || isModule) {
+    ctx.registry.registerNavigator(navigatorAddress, daoShip);
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -579,42 +681,21 @@ export const handleNavigatorSet: EventHandler = async (
     return;
   }
 
+  const daoKnown = ctx.registry.getDaoByDaoShipAddress(daoId) !== undefined;
   const id = makeNavigatorId(daoId, navigatorAddress);
+  const now = new Date(ctx.blockTimestamp * 1000).toISOString();
 
   logger.info(
     { daoId, navigator: navigatorAddress, permission },
     'NavigatorSet',
   );
 
-  // Promote orphan row from NavigatorDeployed (if one exists for this navigator).
-  // The orphan row was written by handleNavigatorDeployed with dao_id = NULL.
-  // We verify the orphan's claimed daoShip matches the DAOShip emitting this event.
-  let deployerAddress: string | null = null;
-  let navigatorType: string | null = null;
-  let navName: string | null = null;
-  let navDescription: string | null = null;
-
-  if (permission > 0) {
-    const orphan = await ctx.db.findOrphanNavigator(navigatorAddress);
-    if (orphan) {
-      // The orphan's id encodes the claimed daoShip — verify it matches
-      const expectedId = makeNavigatorId(daoId, navigatorAddress);
-      if (orphan.id === expectedId) {
-        deployerAddress = orphan.deployer as string | null;
-        navigatorType = orphan.navigator_type as string | null;
-        navName = orphan.name as string | null;
-        navDescription = orphan.description as string | null;
-        logger.info({ navigatorAddress, daoId }, 'Promoting orphan navigator metadata');
-      } else {
-        logger.warn({ navigatorAddress, orphanId: orphan.id, expectedId },
-          'NavigatorDeployed daoShip mismatch — discarding orphan metadata');
-      }
-    }
-  }
-
-  const now = new Date(ctx.blockTimestamp * 1000).toISOString();
-
-  const baseFields: Record<string, unknown> = {
+  // dao_id and metadata (deployer/type/name/description/deploy_block) were already
+  // bound by NavigatorDeployed under the same id (dao_id = daoShip = this daoId), so
+  // this upsert only moves permission/is_active. Unprovided columns are preserved by
+  // the partial upsert; created_at is included for insert-safety in the rare
+  // mid-history case where NavigatorSet is somehow seen before NavigatorDeployed.
+  const fields: Record<string, unknown> = {
     id,
     dao_id: daoId,
     navigator_address: navigatorAddress,
@@ -626,15 +707,21 @@ export const handleNavigatorSet: EventHandler = async (
     updated_at: now,
   };
 
-  if (deployerAddress !== null) baseFields.deployer = deployerAddress;
-  if (navigatorType !== null) baseFields.navigator_type = navigatorType;
-  if (navName !== null) baseFields.name = navName;
-  if (navDescription !== null) baseFields.description = navDescription;
+  if (permission > 0) {
+    // First (and every) grant from a KNOWN DAOShip flips the monotonic discriminator
+    // and vouches the navigator. Both are idempotent/monotonic, safe to re-set.
+    if (daoKnown) fields.permission_ever_granted = true;
+    fields.trust_status = 'sanctioned';
+  }
+  // On revoke (permission == 0) we deliberately OMIT permission_ever_granted and
+  // trust_status so their existing values survive. is_active=false + permission=0 +
+  // permission_ever_granted=true is exactly the "revoked, keep history" state the
+  // prune predicate must never delete — distinguished from a born-read-only nav (false).
 
-  await ctx.db.upsert('ds_navigators', baseFields);
+  await ctx.db.upsert('ds_navigators', fields);
 
   // Register navigator for log fetching — only if this NavigatorSet came from a known DAOShip
-  if (ctx.registry.getDaoByDaoShipAddress(daoId)) {
+  if (daoKnown) {
     if (permission > 0) {
       ctx.registry.registerNavigator(navigatorAddress, daoId);
       // Reparent orphaned allowlist records for this specific navigator+DAO pair
@@ -679,6 +766,29 @@ export const handleGovernanceConfigSet: EventHandler = async (
     min_retention_percent: minRetentionPercent,
     default_expiry_window: defaultExpiryWindow,
   });
+  ctx.cache.invalidateDao(daoId);
+
+  // Audit feed + timelock-bypass detection. Record every config change keyed by the
+  // canonical (tx, logIndex). `bypassed_timelock` is resolved at end-of-range
+  // (ds_resolve_timelock_bypass) once any paired TimelockNavigator.ChangeExecuted in the
+  // same tx has also been persisted — a ChangeExecuted may sort AFTER this log within the
+  // range, so the flag cannot be decided inline. Defaults false until resolved.
+  const now = new Date(ctx.blockTimestamp * 1000).toISOString();
+  await ctx.db.upsert('ds_governance_config_history', {
+    id: `${ctx.log.transactionHash}-${ctx.log.index}`,
+    dao_id: daoId,
+    voting_period: votingPeriod,
+    grace_period: gracePeriod,
+    proposal_offering: proposalOffering,
+    quorum_percent: quorumPercent,
+    sponsor_threshold: sponsorThreshold,
+    min_retention_percent: minRetentionPercent,
+    default_expiry_window: defaultExpiryWindow,
+    tx_hash: ctx.log.transactionHash,
+    block_number: ctx.log.blockNumber,
+    created_at: now,
+  });
+  ctx.dirtyTimelockBypassChecks.add(`${daoId}|${ctx.log.transactionHash}`);
 };
 
 // ---------------------------------------------------------------------------
@@ -774,6 +884,7 @@ function makeLockHandler(opts: {
 
     logger.info({ daoId, lock }, eventName);
     await ctx.db.updateDao(daoId, { [field]: lock });
+    ctx.cache.invalidateDao(daoId);
   };
 }
 
@@ -800,16 +911,11 @@ export const handleConvertSharesToLoot: EventHandler = async (
     'ConvertSharesToLoot',
   );
 
-  // Member balances are updated by the Transfer events that fire when
-  // sharesToken.burn() and lootToken.mint() are called internally by the
-  // contract. This handler only updates DAO-level totals — same ownership
-  // split as MintShares/BurnShares handlers.
-  //
-  // Note: convertSharesToLoot does NOT emit BurnShares or MintLoot, so
-  // handleMintOrBurn won't fire for these. This handler is the sole owner
-  // of the DAO total adjustment for this operation.
-  // Atomic server-side adjustment (audit M20).
-  await ctx.db.adjustDaoTotals(daoId, (-amount).toString(), amountStr);
+  // Option B: member balances go through Transfer events emitted by
+  // sharesToken.burn() + lootToken.mint(). This handler only flags the
+  // DAO dirty for end-of-range total recompute.
+  ctx.dirtyDaoIds.add(daoId);
+  ctx.cache.invalidateDao(daoId);
 };
 
 // ---------------------------------------------------------------------------
@@ -831,4 +937,5 @@ export const handleAdminConfigSet: EventHandler = async (
     shares_paused: sharesPaused,
     loot_paused: lootPaused,
   });
+  ctx.cache.invalidateDao(daoId);
 };

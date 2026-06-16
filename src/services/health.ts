@@ -4,6 +4,8 @@ import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import type { BlockchainService } from './blockchain.js';
 import type { DatabaseService } from './database.js';
+import type { BlockProcessor } from './processor.js';
+import type { RangeCacheSummary } from './range-cache.js';
 
 const RATE_LIMIT = {
   windowMs: 60000,
@@ -41,6 +43,20 @@ export interface HealthStatus {
     requiresFullReindex: boolean;
     reindexReason: string | null;
     reindexFlaggedAt: string | null;
+    /**
+     * Ring buffer of the last N processBlockRange summaries (most-recent
+     * last). Populated by `BlockProcessor.recentRangeStats`. Surfaces
+     * RangeCache hit-rate trends so operators can validate the cache is
+     * working without wiring up a metrics backend. Empty until at least
+     * one range has been processed.
+     */
+    recentRanges: Array<{
+      fromBlock: number;
+      toBlock: number;
+      logCount: number;
+      wallMs: number;
+      cache: RangeCacheSummary;
+    }>;
   };
 }
 
@@ -53,6 +69,7 @@ export class HealthService {
   private server: Server | null = null;
   private blockchain: BlockchainService | null = null;
   private db: DatabaseService | null = null;
+  private processor: BlockProcessor | null = null;
   private isIndexerRunning = false;
   private rpcCircuitBreakerOpen = false;
 
@@ -64,9 +81,10 @@ export class HealthService {
   private healthStatusCachedAt = 0;
   private static readonly HEALTH_CACHE_TTL_MS = 5000;
 
-  setServices(blockchain: BlockchainService, db: DatabaseService): void {
+  setServices(blockchain: BlockchainService, db: DatabaseService, processor?: BlockProcessor): void {
     this.blockchain = blockchain;
     this.db = db;
+    if (processor) this.processor = processor;
   }
 
   setIndexerRunning(running: boolean): void {
@@ -309,6 +327,11 @@ export class HealthService {
     const checks = { quaiRpc: quaiRpcCheck, supabase: supabaseCheck, indexer: indexerCheck };
     const allPassing = Object.values(checks).every((c) => c.status === 'pass');
 
+    // Snapshot the processor's ring buffer so subsequent mutations don't
+    // leak into the cached HealthStatus. Empty array when no processor is
+    // wired (startup window before processor is set, or for tests).
+    const recentRanges = this.processor ? [...this.processor.recentRangeStats] : [];
+
     return {
       status: allPassing ? 'healthy' : 'unhealthy',
       timestamp: new Date().toISOString(),
@@ -321,6 +344,7 @@ export class HealthService {
         requiresFullReindex,
         reindexReason,
         reindexFlaggedAt,
+        recentRanges,
       },
     };
   }
