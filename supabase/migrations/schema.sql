@@ -1531,6 +1531,9 @@ BEGIN
     EXECUTE format('ALTER TABLE %I.ds_vesting_claims ENABLE ROW LEVEL SECURITY', s);
     EXECUTE format('ALTER TABLE %I.ds_budgets ENABLE ROW LEVEL SECURITY', s);
     EXECUTE format('ALTER TABLE %I.ds_budget_disbursements ENABLE ROW LEVEL SECURITY', s);
+    EXECUTE format('ALTER TABLE %I.ds_subscription_members ENABLE ROW LEVEL SECURITY', s);
+    EXECUTE format('ALTER TABLE %I.ds_subscription_payments ENABLE ROW LEVEL SECURITY', s);
+    EXECUTE format('ALTER TABLE %I.ds_subscription_collections ENABLE ROW LEVEL SECURITY', s);
     EXECUTE format('ALTER TABLE %I.ds_vault_module_events ENABLE ROW LEVEL SECURITY', s);
     EXECUTE format('ALTER TABLE %I.ds_governance_config_history ENABLE ROW LEVEL SECURITY', s);
     EXECUTE format('ALTER TABLE %I.ds_navigator_sanction_intents ENABLE ROW LEVEL SECURITY', s);
@@ -1577,6 +1580,13 @@ BEGIN
     EXECUTE format('CREATE POLICY "Public read" ON %I.ds_budgets FOR SELECT USING (true)', s);
     EXECUTE format('DROP POLICY IF EXISTS "Public read" ON %I.ds_budget_disbursements', s);
     EXECUTE format('CREATE POLICY "Public read" ON %I.ds_budget_disbursements FOR SELECT USING (true)', s);
+    -- SubscriptionNavigator feeds: public blockchain data, read-only like the other feed tables.
+    EXECUTE format('DROP POLICY IF EXISTS "Public read" ON %I.ds_subscription_members', s);
+    EXECUTE format('CREATE POLICY "Public read" ON %I.ds_subscription_members FOR SELECT USING (true)', s);
+    EXECUTE format('DROP POLICY IF EXISTS "Public read" ON %I.ds_subscription_payments', s);
+    EXECUTE format('CREATE POLICY "Public read" ON %I.ds_subscription_payments FOR SELECT USING (true)', s);
+    EXECUTE format('DROP POLICY IF EXISTS "Public read" ON %I.ds_subscription_collections', s);
+    EXECUTE format('CREATE POLICY "Public read" ON %I.ds_subscription_collections FOR SELECT USING (true)', s);
     EXECUTE format('DROP POLICY IF EXISTS "Public read" ON %I.ds_vault_module_events', s);
     EXECUTE format('CREATE POLICY "Public read" ON %I.ds_vault_module_events FOR SELECT USING (true)', s);
     EXECUTE format('DROP POLICY IF EXISTS "Public read" ON %I.ds_governance_config_history', s);
