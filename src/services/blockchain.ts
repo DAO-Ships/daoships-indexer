@@ -110,6 +110,25 @@ export class BlockchainService {
     );
   }
 
+  /**
+   * The chain ID this indexer is actually connected to.
+   *
+   * Authoritative, unlike `config.chainId` — which comes from an optional
+   * CHAIN_ID env var that defaults to 15000 and drives no logic anywhere.
+   * Asking the node is the only way to know which chain the rows we write
+   * actually describe.
+   */
+  async getChainId(): Promise<number> {
+    await this.rateLimit();
+    return this.withTrackedRetry(
+      async () => {
+        const network = await this.provider.getNetwork();
+        return Number(network.chainId);
+      },
+      'getChainId',
+    );
+  }
+
   async getBlock(blockNumber: number): Promise<Block | null> {
     await this.rateLimit();
     return this.withTrackedRetry(

@@ -346,6 +346,33 @@ async function main(): Promise<void> {
     // first unguarded DB call below.
     await waitForDbConnection(db);
 
+    // ── Reconcile chain_id with the chain we are actually on (H8) ──
+    // ds_indexer_state.chain_id is NOT NULL DEFAULT 15000 and nothing ever wrote
+    // it, so every schema advertised 15000 — including mainnet, which indexes
+    // chain 9. Consumers are told to gate reads on this table (the app's health
+    // check, and now the published agent docs), so a confidently wrong value is
+    // worse than a missing one. Read the truth from the node, repair on boot.
+    try {
+      const actualChainId = await blockchain.getChainId();
+      if (actualChainId !== config.chainId) {
+        logger.warn(
+          { configured: config.chainId, actual: actualChainId, schema: config.supabaseSchema },
+          'CHAIN_ID env does not match the connected RPC — using the RPC value. Set CHAIN_ID to silence this.',
+        );
+      }
+      const { changed, previous } = await db.reconcileChainId(actualChainId);
+      if (changed) {
+        logger.warn(
+          { previous, corrected: actualChainId, schema: config.supabaseSchema },
+          'Repaired ds_indexer_state.chain_id',
+        );
+      }
+    } catch (err) {
+      // Never fatal. A wrong chain_id is a reporting defect, not a correctness
+      // problem for the rows we write — indexing must not stop over it.
+      logger.warn({ err }, 'Failed to reconcile chain_id at startup');
+    }
+
     // ── Clear stale is_syncing flag from previous crash (I5) ────
     // If the indexer crashed during backfill, is_syncing may still be true.
     // The crash handlers attempt to clear it but may not complete before exit.

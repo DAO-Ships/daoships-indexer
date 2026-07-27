@@ -81,6 +81,7 @@ export class DatabaseService {
   async getIndexerState(): Promise<{
     blockNumber: number;
     blockHash: string | null;
+    chainId: number | null;
     isSyncing: boolean;
     requiresFullReindex: boolean;
     reindexReason: string | null;
@@ -88,7 +89,7 @@ export class DatabaseService {
   }> {
     const { data, error } = await this.client
       .from('ds_indexer_state')
-      .select('last_block_number, last_block_hash, is_syncing, requires_full_reindex, reindex_reason, reindex_flagged_at')
+      .select('last_block_number, last_block_hash, chain_id, is_syncing, requires_full_reindex, reindex_reason, reindex_flagged_at')
       .eq('id', 1)
       .single();
 
@@ -96,11 +97,45 @@ export class DatabaseService {
     return {
       blockNumber: data?.last_block_number ?? 0,
       blockHash: data?.last_block_hash ?? null,
+      chainId: data?.chain_id ?? null,
       isSyncing: data?.is_syncing ?? false,
       requiresFullReindex: data?.requires_full_reindex ?? false,
       reindexReason: data?.reindex_reason ?? null,
       reindexFlaggedAt: data?.reindex_flagged_at ?? null,
     };
+  }
+
+  /**
+   * Persist the chain ID the indexer is actually connected to.
+   *
+   * `ds_indexer_state.chain_id` is `NOT NULL DEFAULT 15000` in schema.sql, and
+   * until now nothing ever wrote it — so every schema reported 15000 regardless
+   * of the chain it indexed. The mainnet schema (chain 9) advertised 15000 while
+   * indexing mainnet blocks, and consumers are told to gate reads on this table.
+   *
+   * Writing it from the live RPC rather than from config makes the value
+   * self-correcting on deploy and immune to a missing CHAIN_ID env var.
+   * Returns the previous value when it changed, so the caller can log the repair.
+   */
+  async reconcileChainId(actualChainId: number): Promise<{ changed: boolean; previous: number | null }> {
+    const { data: before, error: readErr } = await this.client
+      .from('ds_indexer_state')
+      .select('chain_id')
+      .eq('id', 1)
+      .single();
+
+    if (readErr) throw new Error(`Failed to read chain_id: ${readErr.message}`);
+
+    const previous: number | null = before?.chain_id ?? null;
+    if (previous === actualChainId) return { changed: false, previous };
+
+    const { error } = await this.client
+      .from('ds_indexer_state')
+      .update({ chain_id: actualChainId })
+      .eq('id', 1);
+
+    if (error) throw new Error(`Failed to update chain_id: ${error.message}`);
+    return { changed: true, previous };
   }
 
   // M2: Flag the indexer state as requiring a full reindex. Set by the reorg
