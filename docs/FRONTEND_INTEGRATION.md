@@ -19,10 +19,18 @@ The indexer uses **PostgreSQL schema isolation** -- each network (testnet, mainn
 ```typescript
 import { createClient } from '@supabase/supabase-js';
 
-const SUPABASE_URL = 'https://your-project.supabase.co';
-const SUPABASE_ANON_KEY = 'your-anon-key';
+const SUPABASE_URL = 'https://anpmmwvxzchumfclhvmr.supabase.co';
 
-// Schema corresponds to the network: 'testnet', 'mainnet', or 'dev'
+// Publishable key for AI agents, SDK consumers, and third-party integrations.
+// Published deliberately: RLS makes the database read-only and every row is already
+// public on-chain, so this is the same class of value as a Firebase web config. It is
+// deliberately NOT the key the DAO Ships web client ships -- the two are separate so
+// that integration traffic and application traffic have separate quotas.
+const SUPABASE_ANON_KEY = 'sb_publishable_BdCkzZNKGhfs1AJUWFsgWw_yh3OhLi2';
+
+// Schema corresponds to the network: 'testnet' (Orchard, chainId 15000),
+// 'mainnet' (Quai, chainId 9), or 'dev'. There is no usable default -- the `public`
+// schema holds no ds_* tables, so an unset schema fails with PGRST205.
 const NETWORK_SCHEMA = 'testnet';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
