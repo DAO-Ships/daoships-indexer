@@ -10,6 +10,7 @@
     "dev": "tsx watch src/index.ts",
     "backfill": "tsx src/backfill.ts",
     "backfill:default-expiry-window": "tsx scripts/backfill-default-expiry-window.ts",
+    "backfill:record-event-order": "tsx scripts/backfill-record-event-order.ts",
     "measure:log-volume": "tsx scripts/measure-log-volume.ts",
     "bench:filter": "tsx scripts/bench-filter.ts",
     "lint": "eslint src/",

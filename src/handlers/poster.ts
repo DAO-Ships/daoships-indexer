@@ -720,6 +720,10 @@ export async function handleNewPost(
 
   const daoAddress = parsed?.daoAddress ? String(parsed.daoAddress).toLowerCase() : daoId;
   const recordId = `${daoAddress}-${ctx.log.transactionHash}-${ctx.log.index}`;
+  // The Quai Log carries actual transaction/block-log positions. Do not invent
+  // zero for incomplete historical provider data; both coordinates stay unknown.
+  const ordered = Number.isInteger(ctx.log.transactionIndex) && ctx.log.transactionIndex >= 0 && ctx.log.transactionIndex <= 0x7fffffff
+    && Number.isInteger(ctx.log.index) && ctx.log.index >= 0 && ctx.log.index <= 0x7fffffff;
 
   await ctx.db.upsert('ds_records', {
     id: recordId,
@@ -733,6 +737,8 @@ export async function handleNewPost(
     content_json: validatedJson,
     trust_level: trustLevel,
     block_number: ctx.log.blockNumber,
+    transaction_index: ordered ? ctx.log.transactionIndex : null,
+    log_index: ordered ? ctx.log.index : null,
   });
 
   // ── Tag-specific routing ──────────────────────────────────────

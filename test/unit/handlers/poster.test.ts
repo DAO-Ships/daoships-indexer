@@ -71,6 +71,17 @@ describe('handleNewPost', () => {
     expect(db.upsert).not.toHaveBeenCalled();
   });
 
+  it('persists real transaction/log positions and leaves incomplete provider positions unknown', async () => {
+    const { id } = await import('quais');
+    for (const [transactionIndex, index, expected] of [[3, 11, [3, 11]], [0, 0, [0, 0]], [undefined, 9, [null, null]], [-1, 9, [null, null]]] as const) {
+      const db = makeMockDb();
+      db.getDao.mockResolvedValue({ id: DAOSHIP, avatar: AVATAR, deployer: LAUNCHER });
+      const ctx = makeCtx({ db, log: { transactionIndex, index, transactionHash: TX_HASH } });
+      await handleNewPost(ctx, { user: AVATAR, content: JSON.stringify({ schemaVersion: '1.0', daoAddress: DAOSHIP, banner: 'https://example.test/banner' }), tag: id('daoships.dao.profile') });
+      expect(db.upsert).toHaveBeenCalledWith('ds_records', expect.objectContaining({ transaction_index: expected[0], log_index: expected[1] }));
+    }
+  });
+
   it('skips when daoAddress absent in content', async () => {
     const db = makeMockDb();
     const ctx = makeCtx({ db });

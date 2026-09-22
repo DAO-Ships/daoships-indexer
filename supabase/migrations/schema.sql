@@ -305,8 +305,15 @@ BEGIN
             content TEXT NOT NULL,              -- M6: Raw on-chain data. UNTRUSTED. Frontends MUST escape before rendering. Use content_json for sanitized data.
             content_json JSONB,
             trust_level VARCHAR(20),
-            block_number BIGINT
+            block_number BIGINT,
+            transaction_index INTEGER,
+            log_index INTEGER,
+            CONSTRAINT ds_records_event_order_check CHECK ((transaction_index IS NULL AND log_index IS NULL) OR (transaction_index IS NOT NULL AND log_index IS NOT NULL AND transaction_index >= 0 AND log_index >= 0))
         )', s, s);
+
+    -- Additive only: legacy records retain unknown ordering until verified backfill.
+    EXECUTE format('ALTER TABLE %I.ds_records ADD COLUMN IF NOT EXISTS transaction_index INTEGER', s);
+    EXECUTE format('ALTER TABLE %I.ds_records ADD COLUMN IF NOT EXISTS log_index INTEGER', s);
 
     -- DS_GUILD_TOKENS
     EXECUTE format('

@@ -219,6 +219,8 @@ export interface RecordRow {
   content_json?: Record<string, unknown>;
   trust_level?: string;
   block_number?: number;
+  transaction_index?: number | null;
+  log_index?: number | null;
 }
 
 export interface GuildTokenRow {
