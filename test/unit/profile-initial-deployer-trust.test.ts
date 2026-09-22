@@ -98,6 +98,43 @@ describe('deployer daoships.dao.profile.initial — trust path', () => {
     expect(db.updateDao).toHaveBeenCalledWith(DAOSHIP, expect.objectContaining({ profile_source: 'launcher' }));
   });
 
+  it.each([
+    ['banner', { banner: 'https://example.test/dao-banner.png' }],
+    ['theme', { theme: { mode: 'dark', primary: '#123456' } }],
+  ])('%s-only vault profile blocks a later deployer initial profile within the same cached range', async (_field, patch) => {
+    const { db, daos } = statefulDb();
+    await handleLaunchDAOShip(
+      makeCtx({ db, log: { address: DAOSHIP_LAUNCHER_ADDR, transactionHash: TX_HASH, blockNumber: 10 } }),
+      { daoShip: DAOSHIP, shares: SHARES, loot: LOOT, avatar: VAULT, launcher: DEPLOYER_EOA },
+    );
+    const ctx = makeCtx({ db, log: { address: POSTER_ADDR, index: 0, transactionHash: TX_HASH } });
+    const initialTag = await profileInitialTag();
+    await handleNewPost(ctx, { user: DEPLOYER_EOA, content: profileContent, tag: initialTag });
+    expect(daos.get(DAOSHIP)!.profile_source).toBe('launcher');
+
+    const vaultTag = (await import('quais')).id('daoships.dao.profile');
+    await handleNewPost({ ...ctx, log: { ...ctx.log, index: 1 } }, {
+      user: VAULT, tag: vaultTag,
+      content: JSON.stringify({ schemaVersion: '1.1', daoAddress: DAOSHIP, ...patch }),
+    });
+    expect(db.upsert).toHaveBeenLastCalledWith('ds_records', expect.objectContaining({
+      tag: 'daoships.dao.profile', trust_level: 'VERIFIED', content_json: expect.objectContaining(patch),
+    }));
+    expect(db.updateDao).toHaveBeenLastCalledWith(DAOSHIP, { profile_source: 'vault' });
+    expect(daos.get(DAOSHIP)).toMatchObject({ name: 'My DAO', description: 'A community treasury', profile_source: 'vault' });
+    expect(ctx.cache.peekDao(DAOSHIP)).toBeUndefined();
+    const writes = db.updateDao.mock.calls.length;
+    const reads = db.getDao.mock.calls.length;
+
+    await handleNewPost({ ...ctx, log: { ...ctx.log, index: 2 } }, {
+      user: DEPLOYER_EOA, tag: initialTag,
+      content: JSON.stringify({ schemaVersion: '1.1', daoAddress: DAOSHIP, name: 'Late overwrite', description: 'Must not replace the DAO profile' }),
+    });
+    expect(db.getDao).toHaveBeenCalledTimes(reads + 1);
+    expect(db.updateDao).toHaveBeenCalledTimes(writes);
+    expect(daos.get(DAOSHIP)).toMatchObject({ name: 'My DAO', description: 'A community treasury', profile_source: 'vault' });
+  });
+
   // ── The conditions under which a post IS legitimately dropped ──
 
   it('DROPPED when the DAO is not indexed yet (post processed before launch)', async () => {

@@ -768,12 +768,12 @@ export async function handleNewPost(
         if (!daoId) break;
         // Merge semantics: null removes, omitted unchanged, value sets
         const updates = extractDaoMetadataUpdates(validatedJson as Record<string, unknown>, parsed!);
-        if (Object.keys(updates).length > 0) {
-          updates.profile_source = 'vault';
-          await ctx.db.updateDao(daoId, updates);
-          ctx.cache.invalidateDao(daoId);
-          logger.info({ daoId, updates }, 'DAO profile updated from vault');
-        }
+        // Banner/theme-only posts still establish vault authority. Otherwise a
+        // later deployer initial profile could overwrite DAO-controlled metadata.
+        updates.profile_source = 'vault';
+        await ctx.db.updateDao(daoId, updates);
+        ctx.cache.invalidateDao(daoId);
+        logger.info({ daoId, updates }, 'DAO profile updated from vault');
         break;
       }
 
