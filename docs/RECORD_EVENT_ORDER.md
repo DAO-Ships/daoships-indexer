@@ -1,6 +1,11 @@
 # Record event ordering rollout
 
-Prepared on 2026-09-10. The migration and backfill have **not** been applied to a live database, and the indexer service has not been restarted or deployed as part of this work.
+Prepared on 2026-09-10. **Rolled out 2026-09-22/23** to the `testnet` and `mainnet` schemas, in the sequence below:
+
+- Migration `20260910000100` applied with `supabase db push` and recorded in the migration history. It reached every existing schema, including `dev`.
+- Handler deployed to the testnet indexer first, with the mainnet indexer held back; confirmed on Orchard by a test member-profile post (tx `0x004d0012…`, stored as `transaction_index` 2, `log_index` 0, matching the receipt). Then deployed to mainnet.
+- Backfill applied after the handler: testnet 8 of 8 legacy rows, mainnet 3 of 3, none unavailable; re-runs scan 0, and stored coordinates match receipts read directly from the node. Neither schema has a record with unknown order.
+- `dev` was not backfilled; it is not maintained.
 
 `ds_records.transaction_index` and `log_index` are nullable INTEGER columns. New Poster records use the actual `quais.Log.transactionIndex` and block-wide `Log.index`; the processor already dispatches logs in that order. Missing or invalid coordinates remain NULL together. Legacy rows receive no defaults or ordering inferred from timestamps, transaction hashes or primary-key suffixes.
 
@@ -51,6 +56,17 @@ the reconstruction separately before applying any repair; do not bypass processe
 deduplication or replay business handlers against the running database. No historical
 profile repair has been performed by this work.
 
+**None is needed on the hosted schemas** (checked 2026-09-23). The overwrite requires a
+vault profile post that changes only nonmaterialized fields, followed by a deployer initial
+profile for the same DAO. Neither schema has that sequence: mainnet's one DAO has only an
+initial profile (`profile_source` `launcher`), and testnet's one vault profile post set
+name, description and avatar, leaving that DAO correctly `vault`.
+
 ## Validation
 
-Indexer source typechecking and separate backfill-script typechecking pass. Focused tests cover new record positions, legacy NULL behavior, canonical receipt/block and transaction-position verification, duplicates, malformed/missing receipt data, emitter/author/tag/content mismatches and removed logs. SQL was reviewed and supplied as an idempotent executable migration; no live migration, backfill or service operation was performed.
+Indexer source typechecking and separate backfill-script typechecking pass. Focused tests cover new record positions, legacy NULL behavior, canonical receipt/block and transaction-position verification, duplicates, malformed/missing receipt data, emitter/author/tag/content mismatches and removed logs. SQL was reviewed and supplied as an idempotent executable migration.
+
+The first live runs found two quais defects that typechecking could not, both still present in 1.0.0-alpha.57:
+
+- With `usePathing`, a provider built from a `FetchRequest` never resolves `getNetwork()`. The backfill now passes the URL string, as the indexer does, and bounds each call itself.
+- `provider.getBlock()` throws `BAD_DATA` for mainnet blocks more than a few hundred thousand behind the head, whose `totalEntropy` the node returns as null. This affected the indexer too: its mainnet `START_BLOCK` is in that range, so a resync would have failed. Block reads in the indexer and the backfill now go through `src/utils/chain-block.ts`, a raw `quai_getBlockByNumber` read that validates only the fields used. On blocks quais can parse it returns identical hash, height, timestamp and transaction hashes.

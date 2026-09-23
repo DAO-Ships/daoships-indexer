@@ -38,3 +38,6 @@ warn.txt
 
 # Coverage
 coverage/
+
+# Supabase CLI link state (project ref, pooler URL, versions)
+supabase/.temp/
