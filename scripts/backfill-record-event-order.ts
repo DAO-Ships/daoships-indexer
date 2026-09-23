@@ -1,7 +1,7 @@
 /** Explicit, bounded maintenance. Preview by default; --apply writes only verified
  * still-unknown coordinates. Does not replay handlers, rewind or alter checkpoints. */
 import { createClient } from '@supabase/supabase-js';
-import { FetchRequest, JsonRpcProvider, Shard, isQuaiAddress } from 'quais';
+import { JsonRpcProvider, Shard, isQuaiAddress } from 'quais';
 import { verifyHistoricalRecordOrder, type HistoricalRecord } from '../src/utils/record-event-order.js';
 
 function required(name: string): string { const value = process.env[name]; if (!value) throw new Error(`Missing ${name}.`); return value; }
@@ -27,12 +27,14 @@ async function main() {
   let cursor = process.env.BACKFILL_AFTER_ID ?? '';
   if (cursor && !/^0x[0-9a-fA-F]{40}-0x[0-9a-fA-F]{64}-(0|[1-9]\d{0,9})$/.test(cursor)) throw new Error('Invalid BACKFILL_AFTER_ID.');
   const db = createClient(url.href, key, { db: { schema }, auth: { persistSession: false, autoRefreshToken: false }, global: { fetch: (input, init) => fetch(input, { ...init, signal: AbortSignal.timeout(15_000) }) } });
-  const request = new FetchRequest(rpcUrl.href); request.timeout = 15_000;
-  const provider = new JsonRpcProvider(request, undefined, { usePathing: true });
+  // A string URL, as the indexer uses: with usePathing, quais (1.0.0-alpha.53) never
+  // resolves getNetwork() for a FetchRequest, so the 15s bound is applied per call.
+  const provider = new JsonRpcProvider(rpcUrl.href, undefined, { usePathing: true });
+  const rpc = <T>(call: Promise<T>) => Promise.race([call, new Promise<never>((_, reject) => { setTimeout(() => reject(new Error('RPC request timed out.')), 15_000).unref(); })]);
   let scanned = 0, verified = 0, updated = 0, unavailable = 0, exhausted = false;
   try {
-    if ((await provider.getNetwork()).chainId !== BigInt(chainId)) throw new Error('RPC chain mismatch.');
-    if (to > (await provider.getBlockNumber(Shard.Cyprus1)) - confirmations) throw new Error('Backfill range has insufficient confirmations.');
+    if ((await rpc(provider.getNetwork())).chainId !== BigInt(chainId)) throw new Error('RPC chain mismatch.');
+    if (to > (await rpc(provider.getBlockNumber(Shard.Cyprus1))) - confirmations) throw new Error('Backfill range has insufficient confirmations.');
     const state = await db.from('ds_indexer_state').select('chain_id,requires_full_reindex').eq('id', 1).single();
     if (state.error || state.data.chain_id !== chainId || state.data.requires_full_reindex) throw new Error('Indexer checkpoint unavailable, wrong-chain or requires reindex.');
     while (scanned < maxRows) {
@@ -43,11 +45,11 @@ async function main() {
       if (!page.data.length) { exhausted = true; break; }
       for (const record of page.data as unknown as HistoricalRecord[]) {
         scanned++; cursor = record.id;
-        const receipt = await provider.getTransactionReceipt(record.tx_hash);
+        const receipt = await rpc(provider.getTransactionReceipt(record.tx_hash));
         if (!receipt) { unavailable++; continue; }
-        const block = await provider.getBlock(Shard.Cyprus1, receipt.blockNumber, false);
+        const block = await rpc(provider.getBlock(Shard.Cyprus1, receipt.blockNumber, false));
         const positions = verifyHistoricalRecordOrder(record, receipt, block, poster);
-        if ((await provider.getNetwork()).chainId !== BigInt(chainId)) throw new Error('RPC chain changed.');
+        if ((await rpc(provider.getNetwork())).chainId !== BigInt(chainId)) throw new Error('RPC chain changed.');
         verified++;
         if (apply) {
           const result = await db.from('ds_records').update(positions).eq('id', record.id).eq('tx_hash', record.tx_hash)
