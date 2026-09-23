@@ -1,5 +1,6 @@
-import { quais, Shard, type Block, type Log, type TransactionResponse, Interface } from 'quais';
+import { quais, Shard, type Log, type TransactionResponse, Interface } from 'quais';
 import { config } from '../config.js';
+import { blockTag, parseChainBlock, type ChainBlock } from '../utils/chain-block.js';
 import { withRetry } from '../utils/retry.js';
 import { logger } from '../utils/logger.js';
 
@@ -129,10 +130,18 @@ export class BlockchainService {
     );
   }
 
-  async getBlock(blockNumber: number): Promise<Block | null> {
+  /**
+   * Raw read rather than provider.getBlock(), which throws on older mainnet
+   * blocks (see utils/chain-block.ts). Returns null for a block the node does
+   * not have, as provider.getBlock() does.
+   */
+  async getBlock(blockNumber: number): Promise<ChainBlock | null> {
     await this.rateLimit();
     return this.withTrackedRetry(
-      () => this.provider.getBlock(this.shard, blockNumber, false),
+      async () => {
+        const raw: unknown = await this.provider.send('quai_getBlockByNumber', [blockTag(blockNumber), false], this.shard);
+        return raw === null ? null : parseChainBlock(raw, blockNumber);
+      },
       `getBlock(${blockNumber})`,
     );
   }
