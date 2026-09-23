@@ -43,6 +43,7 @@ const VALID_TABLES = new Set([
 
 export class DatabaseService {
   // Type uses `any` for schema because the schema name is dynamic (testnet, mainnet, dev)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- no generated types for a runtime-selected schema
   readonly client: SupabaseClient<any, string>;
 
   // SC7: Highest cutoff we've successfully pruned processed_logs at, in memory.

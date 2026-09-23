@@ -1,4 +1,4 @@
-import { quais, Shard, type Log, type TransactionResponse, Interface } from 'quais';
+import { quais, Shard, type Filter, type Log, type TransactionResponse, Interface } from 'quais';
 import { config } from '../config.js';
 import { blockTag, parseChainBlock, type ChainBlock } from '../utils/chain-block.js';
 import { withRetry } from '../utils/retry.js';
@@ -153,15 +153,15 @@ export class BlockchainService {
     topics?: Array<string | string[] | null>,
   ): Promise<Log[]> {
     await this.rateLimit();
-    const filter: Record<string, unknown> = {
+    const filter: Filter = {
       fromBlock,
       toBlock,
-      topics: topics as any,
+      topics,
       nodeLocation: [0, 0],
     };
     if (address !== null) filter.address = address;
     const logs = await this.withTrackedRetry(
-      () => this.provider.getLogs(filter as any),
+      () => this.provider.getLogs(filter),
       `getLogs(${fromBlock}-${toBlock})`,
     );
 
@@ -215,7 +215,7 @@ export class BlockchainService {
       throw new Error(`Method "${method}" not found on contract at ${address}`);
     }
     return this.withTrackedRetry(
-      () => (fn as Function).call(contract, ...args) as Promise<unknown>,
+      () => (fn as (...params: unknown[]) => Promise<unknown>).call(contract, ...args),
       `call ${method} on ${address.slice(0, 10)}`,
     );
   }

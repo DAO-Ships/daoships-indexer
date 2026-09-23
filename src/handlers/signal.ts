@@ -38,6 +38,7 @@ function makeVoteId(navigatorAddress: string, pollId: string, voter: string): st
 
 /** Strip null bytes + control chars and truncate — question is untrusted free text. */
 function sanitizeQuestion(v: unknown): string {
+  // eslint-disable-next-line no-control-regex -- stripping control characters from untrusted text is the point
   return String(v).replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g, '').slice(0, QUESTION_MAX_LEN);
 }
 

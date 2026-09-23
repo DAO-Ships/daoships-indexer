@@ -18,7 +18,7 @@ import {
 } from '../utils/addresses.js';
 
 import { evictNavigatorFromCache } from './navigators.js';
-import { config, READ_ONLY_NAVIGATOR_TYPES, MODULE_NAVIGATOR_TYPES } from '../config.js';
+import { READ_ONLY_NAVIGATOR_TYPES, MODULE_NAVIGATOR_TYPES } from '../config.js';
 
 import INavigatorAbi from '../abis/INavigator.json' with { type: 'json' };
 import DAOShipAbi from '../abis/DAOShip.json' with { type: 'json' };
@@ -37,6 +37,7 @@ const MAX_DETAILS_SIZE = 65536; // 64KB — matches poster content limit
 
 /** M5: Strip null bytes + C0/C1 control chars, truncate. Matches poster.ts str(). */
 function sanitizeStr(v: string, maxLen: number): string | null {
+  // eslint-disable-next-line no-control-regex -- stripping control characters from untrusted text is the point
   const s = v.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g, '').slice(0, maxLen);
   return s.length > 0 ? s : null;
 }

@@ -106,6 +106,7 @@ function isValidUrl(url: string): boolean {
 /** Strip null bytes + C0/C1 control chars (except tab/newline/CR), truncate. */
 function str(v: unknown, maxLen: number): string | undefined {
   if (typeof v !== 'string') return undefined;
+  // eslint-disable-next-line no-control-regex -- stripping control characters from untrusted text is the point
   let s = v.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g, '');
   s = s.slice(0, maxLen);
   return s.length > 0 ? s : undefined;
