@@ -15,7 +15,7 @@ Prepared on 2026-09-10. The migration and backfill have **not** been applied to 
 
 From the indexer workspace, set these explicit environment variables through the operator's existing secret-management process; the script does not load `.env` files or infer a target:
 
-- `SUPABASE_URL`, `SUPABASE_SCHEMA` and `QUAI_RPC_URL` (explicit HTTPS endpoints).
+- `SUPABASE_URL`, `SUPABASE_SCHEMA` and `QUAI_RPC_URL` (explicit HTTPS endpoints). `QUAI_RPC_URL` is the bare host (`https://rpc.quai.network`, `https://orchard.rpc.quai.network`); the provider adds the `/cyprus1` shard path itself.
 - `SUPABASE_PUBLISHABLE_KEY` for preview; `SUPABASE_SERVICE_KEY` for `--apply`.
 - `CHAIN_ID`, `POSTER_ADDRESS`, `BACKFILL_FROM`, `BACKFILL_TO`.
 - Optional `BACKFILL_MAX_ROWS` (default 1,000, maximum 10,000), `BACKFILL_CONFIRMATIONS` (default 64, minimum 1), and `BACKFILL_AFTER_ID` for continuation.

@@ -31,6 +31,17 @@ async function main() {
   // resolves getNetwork() for a FetchRequest, so the 15s bound is applied per call.
   const provider = new JsonRpcProvider(rpcUrl.href, undefined, { usePathing: true });
   const rpc = <T>(call: Promise<T>) => Promise.race([call, new Promise<never>((_, reject) => { setTimeout(() => reject(new Error('RPC request timed out.')), 15_000).unref(); })]);
+  // Read the block raw: verification needs only hash, woHeader.number and transactions,
+  // and quais (1.0.0-alpha.53) rejects mainnet blocks whose totalEntropy is null.
+  const zoneUrl = new URL('cyprus1', rpcUrl).href;
+  async function getBlock(number: number) {
+    const response = await fetch(zoneUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(15_000),
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'quai_getBlockByNumber', params: [`0x${number.toString(16)}`, false] }) });
+    const block = response.ok ? ((await response.json()) as { result?: { hash?: unknown; woHeader?: { number?: unknown }; transactions?: unknown } }).result : undefined;
+    if (!block || typeof block.hash !== 'string' || typeof block.woHeader?.number !== 'string' || !/^0x[0-9a-fA-F]+$/.test(block.woHeader.number)
+      || !Array.isArray(block.transactions) || !block.transactions.every((tx): tx is string => typeof tx === 'string')) return null;
+    return { hash: block.hash, woHeader: { number: Number(block.woHeader.number) }, transactions: block.transactions };
+  }
   let scanned = 0, verified = 0, updated = 0, unavailable = 0, exhausted = false;
   try {
     if ((await rpc(provider.getNetwork())).chainId !== BigInt(chainId)) throw new Error('RPC chain mismatch.');
@@ -47,7 +58,7 @@ async function main() {
         scanned++; cursor = record.id;
         const receipt = await rpc(provider.getTransactionReceipt(record.tx_hash));
         if (!receipt) { unavailable++; continue; }
-        const block = await rpc(provider.getBlock(Shard.Cyprus1, receipt.blockNumber, false));
+        const block = await getBlock(receipt.blockNumber);
         const positions = verifyHistoricalRecordOrder(record, receipt, block, poster);
         if ((await rpc(provider.getNetwork())).chainId !== BigInt(chainId)) throw new Error('RPC chain changed.');
         verified++;
